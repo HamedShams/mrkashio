@@ -1,6 +1,6 @@
 # Kashio — Telegram expense notes to Google Sheets
 
-Revision 6 (8 Sep 2026). Status: **tested end to end locally; unit tests, health endpoint, sheet discovery, eight categories; being pushed to GitHub, Railway deploys on push.** See README.md for setup and the to-do list at the end of this document.
+Revision 6 (8 Sep 2026). Status: **deployed on Railway from GitHub and verified end to end there; unit tests green in CI.** See README.md for setup and the to-do list at the end of this document.
 
 Bot: `@mrkashio_bot` · Repo: `https://github.com/hamed-grantonomy/mrkashio` (linked to Railway) · Target tab: `Transactions_Trip#2` (env `SHEET_TAB`)
 
@@ -157,7 +157,7 @@ python bot.py                 run the bot (what Railway runs)
 | Command | Where | Who | Effect |
 |---|---|---|---|
 | `/setup` | group | group admin | pair the bot with the group and the admin |
-| `/sync` | group or private | group members | process everything pending; summary in the group, full report in private |
+| `/sync` (also `@botname /sync`) | group or private | group members | process everything pending; summary in the group, full report in private |
 | `/backfill` … (`/done` / `/cancel`) | private | group members | paste older messages; Telegram splits long pastes into several messages, so the import starts 20 s after the last part or at once on `/done`; the reply lists every dismissed message; then a sync runs |
 | `/start`, `/help` | anywhere | anyone | state and command list |
 
@@ -336,11 +336,13 @@ Dependencies: `python-telegram-bot[job-queue]` (Telegram + scheduler), `gspread`
 
 **Unit tests (`pytest`, offline, run in CI):** configuration defaults and every validation message, prompt rendering and the exact output schema (dynamic category enum, `merged_into`), date rollover, the cutoff rule, message pairing and inbox statuses, all report texts, the paste parser on the real samples and its tolerant variants, the JSON export parser, import filters with their explanations, `_as_date`, `last_used_row`, and the append-only guardrail.
 
-**Not exercised live:** `/setup`, `/backfill`, `/sync` typed in Telegram, the cron trigger, a Telegram delivery failure, the guardrail's refusal path, the health endpoint under Railway. The first Railway deploy is the place to try them.
+**Live on Railway, 8 Sep 2026 15:50, first deploy:** the deployed bot consumed the nine updates queued at Telegram; three earlier `/sync` commands with nothing pending were answered "Nothing new to process" and logged as `skipped_threshold`; a fourth `/sync` processed "UBER 2 / 1,000.5 یورو" into row 154 (08/09/2026, 1000.5, EUR, Transport), so Persian currency words and comma-formatted amounts work end to end on the deployed code; a message edited after its sync was marked `edited_after_sync` with a warning, and the sheet left untouched. CI (GitHub Actions) green on the pushed commit.
+
+**Not exercised live:** `/setup` and `/backfill` typed in Telegram, the cron trigger, a Telegram delivery failure, the guardrail's refusal path, and the health endpoint under Railway.
 
 ## 11. Deploy to-do
 
-1. Push: remote switched to HTTPS with the `gh` credential helper; the local commits are rebased onto GitHub's initial commit and pushed. Railway builds on push; the healthcheck path is `/health`. Leave Railway's cron schedule empty.
+1. Done: pushed over HTTPS with the `gh` credential helper, rebased onto GitHub's initial commit; Railway built and the bot is live. The healthcheck path is `/health`. Leave Railway's cron schedule empty.
 2. Railway → Variables are already set (chat ids included), so `/setup` is not needed here; it exists for anyone else who deploys the project.
-3. After the deploy, type `/sync` in the group (the two earlier `/sync` messages are still queued and will be answered too), then post a test expense and `/sync` again. Check the row, your private-chat report and the group summary.
+3. Done on first deploy: the queued `/sync` commands were answered and a test expense became row 154.
 4. Optional: fill 30 Jul – 7 Sep by copying those messages from the Telegram chat and, in your private chat with the bot, `/backfill`, paste, wait 20 s or `/done`.

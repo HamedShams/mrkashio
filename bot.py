@@ -431,6 +431,8 @@ def build_application(app: Kashio) -> Application:
     application.add_handler(CommandHandler("backfill", on_backfill))
     application.add_handler(CommandHandler("done", on_done))
     application.add_handler(CommandHandler("cancel", on_cancel))
+    # "@botname /sync" is not a Telegram command (commands start with "/"), but people type it; treat it as /sync.
+    application.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.Regex(r"(?i)^@\w+\s*/sync\b"), on_sync))
     text = (filters.TEXT | filters.CAPTION) & ~filters.COMMAND
     application.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.UpdateType.EDITED_MESSAGE & text, on_group_edit))
     application.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.UpdateType.MESSAGE & text, on_group_message))

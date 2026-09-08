@@ -144,7 +144,7 @@ In Telegram:
 | Command | Where | What it does |
 |---|---|---|
 | `/setup` | in the group, by a group admin | Pairs the bot with that group and with you. Once. |
-| `/sync` | group or private chat | Processes everything pending now. In the group you get the one-line summary; in the private chat the full report. |
+| `/sync` (or `@botname /sync`) | group or private chat | Processes everything pending now. In the group you get the one-line summary; in the private chat the full report. |
 | `/backfill` | private chat | Start pasting older messages. The import starts 20 s after the last part, or at once on `/done`; `/cancel` discards. Members of the paired group only. |
 | `/start`, `/help` | anywhere | Who the bot is talking to, and this list. |
 
