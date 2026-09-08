@@ -26,7 +26,7 @@ Telegram group ──► Kashio (Python, always on) ──► Bot_Inbox tab     
 
 | File | Purpose |
 |---|---|
-| `bot.py` | Telegram handlers (`/setup`, `/sync`, `/backfill`…), the schedule, and the command line (`run`, `check`, `sync`, `backfill`). |
+| `bot.py` | Telegram handlers (`/setup`, `/sync`, `/backfill`…), the schedule, the `/health` endpoint, and the command line (`run`, `check`, `sync`, `backfill`). |
 | `backfill.py` | Parses pasted Telegram messages or a Telegram Desktop JSON export and queues them. |
 | `sync.py` | One sync run: thresholds, dates, rows, sheet writes, and the report text. |
 | `extractor.py` | The Claude call: output schema (Pydantic), categories, currencies, prompt loading. |
@@ -35,6 +35,7 @@ Telegram group ──► Kashio (Python, always on) ──► Bot_Inbox tab     
 | `prompt.md` | The system prompt. Edit rules, store names and examples here, no code needed. |
 | `requirements.txt`, `railway.json`, `.python-version` | Dependencies and Railway start command. |
 | `.env.example` | Every variable, documented. Copy to `.env` for local runs. |
+| `tests/` | Offline unit tests (`pytest`); `requirements-dev.txt` installs them; `.github/workflows/tests.yml` runs them on every push. |
 
 ## Setup
 
@@ -49,12 +50,12 @@ Telegram group ──► Kashio (Python, always on) ──► Bot_Inbox tab     
 A service account is a robot identity with its own e-mail address. No extra Gmail account is needed.
 
 1. [console.cloud.google.com](https://console.cloud.google.com): create a project (any name).
-2. APIs & Services → Library → **Google Sheets API** → Enable.
+2. APIs & Services → Library → **Google Sheets API** → Enable. Enable the **Google Drive API** too if you want the bot to find your spreadsheet by itself instead of you pasting its id.
 3. IAM & Admin → Service Accounts → Create → name it → Done.
 4. Open it → Keys → Add key → Create new key → JSON. Download the file.
 5. Open your spreadsheet → Share → paste the service account's e-mail (ends in `.iam.gserviceaccount.com`) → **Editor**.
 
-The target tab must have these columns: **B** date, **C** amount, **D** currency, **E** description, **G** category (a dropdown; its values become the allowed categories). Columns A and F are never written.
+The bot creates what it needs: the transactions tab (with a header row) if `SHEET_TAB` does not exist yet, and its three hidden tabs (`Bot_Inbox`, `Bot_Runs`, `Bot_Config`). An existing tab must have these columns: **B** date, **C** amount, **D** currency, **E** description, **G** category (a dropdown; its values become the allowed categories). Columns A and F are never written.
 
 ### 3. Anthropic API key
 
@@ -62,8 +63,8 @@ Create a key at [console.anthropic.com](https://console.anthropic.com). Setting 
 
 ### 4. Deploy on Railway
 
-1. Push this repository to GitHub and create a Railway service from it. Railway detects Python and runs `python bot.py` (from `railway.json`).
-2. In the service's **Variables**, add the four required ones: `TELEGRAM_BOT_TOKEN`, `ANTHROPIC_API_KEY`, `GOOGLE_SERVICE_ACCOUNT_JSON` (paste the key file as a single line) and `GOOGLE_SHEET_ID`. Set `SHEET_TAB` if your tab is not called `Transactions_Trip#2`. Everything else has a default. Secrets live only here, never in the repo.
+1. Push this repository to GitHub and create a Railway service from it. Railway detects Python and runs `python bot.py` (from `railway.json`, which also sets the healthcheck path `/health`). Do **not** set a Railway cron schedule: the bot is an always-on service with its own scheduler (`SYNC_CRON`).
+2. In the service's **Variables**, add the three secrets: `TELEGRAM_BOT_TOKEN`, `ANTHROPIC_API_KEY` and `GOOGLE_SERVICE_ACCOUNT_JSON` (paste the key file as a single line). Everything else has a default. Add `GOOGLE_SHEET_ID` if you did not enable the Drive API (or if several spreadsheets are shared with the service account), and `SHEET_TAB` if your tab is not called `Transactions_Trip#2`. Secrets live only here, never in the repo.
 
 ### 5. Pair the bot with your group (one minute, no redeploy)
 
@@ -76,12 +77,12 @@ From now on every message in the group is stored. Type `/sync` to process what i
 
 Telegram bots never receive messages sent before they joined, even when the group's history is visible to new members. Two ways to bring older notes in, both free until the sync runs:
 
-- **Paste them to the bot.** In a private chat with the bot, send `/backfill`, then paste the messages copied from the Telegram chat (select messages → Copy; Telegram splits long pastes into several messages by itself), then send `/done`. The bot queues them and runs a sync immediately. Or put the paste right after the command in one message.
+- **Paste them to the bot.** In a private chat with the bot, send `/backfill`, then paste the messages copied from the Telegram chat (select messages → Copy). Telegram splits a long paste into several messages by itself, so the bot cannot know when the last part has arrived: it waits 20 seconds after the last part, or starts at once when you send `/done`. `/cancel` discards. You can also put the paste right after `/backfill` in one message. The bot queues the messages and runs a sync immediately.
 - **From a file.** `python bot.py backfill result.json` for a Telegram Desktop export (chat menu → Export chat history → JSON), or a `.txt` with the copied messages. Then `python bot.py sync --dry-run` and `python bot.py sync`.
 
-Both skip everything dated on or before the sheet's last recorded date (those rows were entered by hand already) and anything already stored, so repeating an import is harmless. `--from 2026-07-29` starts from an earlier day if the last recorded day was only partly entered. Imported messages are processed 150 per Claude call.
+Both skip everything dated on or before the sheet's last recorded date (those rows were entered by hand already) and anything already stored, so repeating an import is harmless. The reply lists every dismissed message with its date and text, so nothing disappears silently. `--from 2026-07-29` starts from an earlier day if the last recorded day was only partly entered. Imported messages are processed 150 per Claude call.
 
-The recognised paste format is what Telegram produces when you copy messages:
+The recognised paste format is what Telegram produces when you copy messages; a missing comma or colon, a 12-hour clock, and the Desktop variant (`Name, [01.09.2026 21:14]`) are all accepted:
 
 ```
 Shiva ❤️, [1 Sep 2026 at 21:14:10]:
@@ -107,8 +108,8 @@ All settings are environment variables. Defaults in **bold**.
 | `ANTHROPIC_EFFORT` | Thinking effort, `low`…`max`. **`high`** |
 | `ANTHROPIC_PRICE_INPUT_PER_MILLION`, `ANTHROPIC_PRICE_OUTPUT_PER_MILLION` | USD prices used to estimate cost in the run log. **2.0 / 10.0** |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | The whole key file as one line (single-quoted in a `.env` file). Or `GOOGLE_SERVICE_ACCOUNT_FILE`, a path to the file, for local runs. One of the two is required. |
-| `GOOGLE_SHEET_ID` | From the spreadsheet URL. Required. |
-| `SHEET_TAB` | Tab that receives transactions. **`Transactions_Trip#2`** |
+| `GOOGLE_SHEET_ID` | Optional. From the spreadsheet URL. When empty, the bot finds the spreadsheet shared with the service account through the Drive API (the one containing `SHEET_TAB` if several are shared). |
+| `SHEET_TAB` | Tab that receives transactions; created with a header row if missing. **`Transactions_Trip#2`** |
 | `INBOX_TAB`, `RUNS_TAB`, `CONFIG_TAB` | Hidden tabs the bot creates: raw messages, run log, pairing. **`Bot_Inbox`, `Bot_Runs`, `Bot_Config`** |
 | `SYNC_CRON` | Crontab schedule in `TIMEZONE`. **`0 9 1,15 * *`** (09:00 on the 1st and 15th). Weekly Mondays: `0 9 * * 1` |
 | `TIMEZONE` | **`Europe/Istanbul`** |
@@ -117,12 +118,24 @@ All settings are environment variables. Defaults in **bold**.
 | `DAY_ROLLOVER_HOUR` | Messages before this hour count for the previous day. **4** |
 | `DEFAULT_CURRENCY` | Used when no currency is written. **`TRY`** |
 | `POST_SUMMARY` | Post a one-line summary in the group after each sync. **`true`** |
+| `PORT` | Set by Railway. The `/health` endpoint listens here. **8080** |
 
 ### Categories and currencies
 
-Column G receives a category. The allowed names are read from **the sheet itself** at every sync: the bot looks at the dropdown on column G of the target tab and uses exactly those values, so the dropdown, your Summary formulas and the bot can never disagree. In Google's budget template that dropdown is fed from the category table in the Summary tab (`Summary!B28:B38`), so editing that table is all it takes to change categories. The list in use is: Groceries, Eating Out, Health, Housing & Utilities, Transport, Personal Care, Shopping, Leisure, Travel, Fees & Services, Other. Placeholders such as "Custom category 1" are ignored; if the column has no dropdown, the same eleven names are the built-in fallback (`DEFAULT_CATEGORIES` in `extractor.py`). Short hints for common names live in `CATEGORY_HINTS`.
+Column G receives a category. The allowed names are read from **the sheet itself** at every sync: the bot looks at the dropdown on column G of the target tab and uses exactly those values, so the dropdown, your Summary formulas and the bot can never disagree. In Google's budget template that dropdown is fed from the category table in the Summary tab (`Summary!B28:B35`), so editing that table is all it takes to change categories. Placeholders such as "Custom category 1" are ignored; if the column has no dropdown, the same eight names below are the built-in fallback (`DEFAULT_CATEGORIES` in `extractor.py`). Short hints for common names live in `CATEGORY_HINTS` in the same file.
 
-Column D receives one of TRY, TOMAN, EUR, USD, GBP (`Currency` in `extractor.py`). Wording rules, currency words, store names and examples live in `prompt.md`.
+| Category | Covers |
+|---|---|
+| Groceries | supermarkets, markets, bakeries, water and other food for home |
+| Eating Out | restaurants, cafes, coffee, bars, takeaway, delivery |
+| Transport | taxi, Uber, Istanbulkart and public transport, fuel, parking |
+| Housing & Utilities | rent, electricity, water, gas, internet, phone bills, home supplies, furniture (an IKEA desk), repairs |
+| Health & Personal Care | pharmacy, doctor, dentist, hospital, tests, insurance, barber, cosmetics, hygiene, gym |
+| Shopping | clothes, shoes, electronics, gifts, malls and general retail not covered elsewhere |
+| Leisure & Travel | entertainment, cinema, concerts, subscriptions, hobbies, hotels, flights, tours, trips |
+| Other | fees, bank and government charges, documents, services, anything that fits nowhere else |
+
+Column D receives one of TRY, TOMAN, EUR, USD, GBP (`Currency` in `extractor.py`); Turkish, English, German and Persian currency words and Persian digits are understood. Wording rules, store names and examples live in `prompt.md`.
 
 ## Commands
 
@@ -132,7 +145,7 @@ In Telegram:
 |---|---|---|
 | `/setup` | in the group, by a group admin | Pairs the bot with that group and with you. Once. |
 | `/sync` | group or private chat | Processes everything pending now. In the group you get the one-line summary; in the private chat the full report. |
-| `/backfill` | private chat | Start pasting older messages; finish with `/done`, or `/cancel`. Members of the paired group only. |
+| `/backfill` | private chat | Start pasting older messages. The import starts 20 s after the last part, or at once on `/done`; `/cancel` discards. Members of the paired group only. |
 | `/start`, `/help` | anywhere | Who the bot is talking to, and this list. |
 
 From a terminal with a `.env` file (`pip install -r requirements.txt` first):
@@ -152,6 +165,20 @@ python bot.py                 # run the bot locally (stop it before deploying: t
 - Rows dated before the sheet's last recorded date are never written; they are flagged for you instead.
 - Only one sync runs at a time, and a message is inserted at most once (status column plus de-duplication by id).
 - The bot updates cells only in its own hidden tabs (`Bot_Inbox`, `Bot_Runs`, `Bot_Config`). Share the spreadsheet with the service account and nothing else.
+- Every failure is reported in words: a missing variable names the variable, an unreadable key file says how to fix it, a spreadsheet that cannot be opened says which e-mail address to share it with, and a sync that fails posts the error to you while the messages stay pending.
+
+## Health and monitoring
+
+`GET /health` on `$PORT` answers `200` with a small JSON (`status`, `uptime_seconds`, `paired`, `syncing`, `spreadsheet`). `railway.json` points Railway's healthcheck at it. Every sync also leaves a row in `Bot_Runs` and a report in your private chat.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The tests run offline and cover configuration validation, prompt rendering and the exact output schema, date rollover and the cutoff rule, message pairing and inbox statuses, report texts, the paste and JSON parsers, the import filters, and the append-only guardrail. GitHub Actions runs them on every push.
 
 ### Reading the inbox tab
 

@@ -18,12 +18,16 @@ from sheets import SheetStore
 from sync import rollover_date
 
 # "Hamed Shams, [24 Jul 2026 at 21:46:10 (24 Jul 2026 at 23:45:01)]:"  (the part in parentheses is the edit time)
-HEADER = re.compile(r"^(?P<sender>[^\[\]\n]+?), \[(?P<sent>[^\[\]()]+?)(?: \((?P<edited>[^()]+?)\))?\]:?\s*$")
+# Tolerant on purpose: the comma, the spaces and the trailing colon are all optional.
+HEADER = re.compile(r"^(?P<sender>[^\[\]\n]+?)\s*,?\s*\[(?P<sent>[^\[\]()]+?)(?:\s*\((?P<edited>[^()]+?)\))?\]\s*:?\s*$")
 TIME_FORMATS = (
-    "%d %b %Y at %H:%M:%S", "%d %b %Y at %H:%M",  # Telegram for macOS / iOS copy
+    "%d %b %Y at %H:%M:%S", "%d %b %Y at %H:%M",  # Telegram for macOS / iOS copy, 24-hour
+    "%d %b %Y at %I:%M:%S %p", "%d %b %Y at %I:%M %p",  # same, 12-hour clock
+    "%d %B %Y at %H:%M:%S", "%d %B %Y at %H:%M", "%b %d, %Y at %I:%M:%S %p", "%b %d, %Y at %I:%M %p",
     "%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M",  # Telegram Desktop copy
-    "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M",
+    "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y, %H:%M",
 )
+MAX_LISTED = 8  # how many dismissed messages a report lists in full
 
 
 @dataclass
@@ -36,36 +40,53 @@ class DumpMessage:
 
 
 @dataclass
+class Parsed:
+    messages: list[DumpMessage]
+    unparsed: list[str]  # non-empty lines that appeared before any recognisable header
+
+    def problems(self) -> str | None:
+        if not self.unparsed:
+            return None
+        shown = "; ".join(line[:60] for line in self.unparsed[:3])
+        return f"{len(self.unparsed)} line(s) came before the first message header and were ignored: {shown}"
+
+
+@dataclass
 class ImportResult:
     found: int
     imported: int
     before_start: int
     duplicates: int
     start: date | None
+    dismissed: list[str]  # human-readable lines for the messages skipped as already covered by the sheet
 
     def describe(self) -> str:
         lines = [f"Found {self.found} message(s); queued {self.imported} for the next sync."]
         if self.before_start:
-            lines.append(f"Skipped {self.before_start} dated before {self.start:%d/%m/%Y} (the sheet already covers them).")
+            lines.append(f"Dismissed {self.before_start} dated before {self.start:%d/%m/%Y}, the day after the sheet's last entry:")
+            lines.extend(f"  • {item}" for item in self.dismissed[:MAX_LISTED])
+            if self.before_start > MAX_LISTED:
+                lines.append(f"  • … and {self.before_start - MAX_LISTED} more")
         if self.duplicates:
-            lines.append(f"Skipped {self.duplicates} already queued or processed.")
+            lines.append(f"Skipped {self.duplicates} already queued or processed earlier (same sender, time and text).")
         return "\n".join(lines)
 
 
-def parse(content: str, settings: Settings) -> list[DumpMessage]:
+def parse(content: str, settings: Settings) -> Parsed:
     """Auto-detect a Telegram Desktop JSON export or a pasted dump."""
     stripped = content.strip()
     if stripped.startswith("{"):
         try:
-            return parse_export(json.loads(stripped), settings)
-        except (json.JSONDecodeError, KeyError, TypeError):
+            return Parsed(parse_export(json.loads(stripped), settings), [])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
             pass
     return parse_dump(content, settings)
 
 
-def parse_dump(content: str, settings: Settings) -> list[DumpMessage]:
+def parse_dump(content: str, settings: Settings) -> Parsed:
     """Text copied out of a Telegram chat: a header line per message, then the message body."""
     messages: list[DumpMessage] = []
+    unparsed: list[str] = []
     header: tuple[str, datetime, datetime | None] | None = None
     body: list[str] = []
 
@@ -88,8 +109,10 @@ def parse_dump(content: str, settings: Settings) -> list[DumpMessage]:
                 continue
         if header is not None:
             body.append(line)
+        elif line.strip():
+            unparsed.append(line.strip())
     flush()
-    return messages
+    return Parsed(messages, unparsed)
 
 
 def parse_export(export: dict, settings: Settings) -> list[DumpMessage]:
@@ -116,10 +139,12 @@ def import_messages(
     start = since or (last + timedelta(days=1) if last else None)
     known = store.stored_message_ids()
     rows: list[tuple[int, str, datetime, datetime | None, str]] = []
-    before_start = duplicates = 0
+    dismissed: list[str] = []
+    duplicates = 0
     for message in messages:
         if start and rollover_date(message.sent_at, settings.day_rollover_hour) < start:
-            before_start += 1
+            excerpt = " | ".join(part.strip() for part in message.text.splitlines() if part.strip())[:60]
+            dismissed.append(f"{message.sent_at:%d/%m/%Y %H:%M} {message.sender}: {excerpt}")
             continue
         if message.message_id in known:
             duplicates += 1
@@ -128,7 +153,7 @@ def import_messages(
         rows.append((message.message_id, message.sender, message.sent_at, message.edited_at, message.text))
     if rows:
         store.add_messages(rows)
-    return ImportResult(len(messages), len(rows), before_start, duplicates, start)
+    return ImportResult(len(messages), len(rows), len(dismissed), duplicates, start, dismissed)
 
 
 def _dump_message(sender: str, sent_at: datetime, edited_at: datetime | None, text: str) -> DumpMessage:
@@ -144,9 +169,10 @@ def _first_name(full_name: str) -> str:
 def _parse_time(value: str | None, settings: Settings) -> datetime | None:
     if not value:
         return None
+    cleaned = " ".join(value.replace("\u202f", " ").replace("\u00a0", " ").split())  # iOS uses narrow spaces before AM/PM
     for pattern in TIME_FORMATS:
         try:
-            return datetime.strptime(value.strip(), pattern).replace(tzinfo=settings.timezone)
+            return datetime.strptime(cleaned, pattern).replace(tzinfo=settings.timezone)
         except ValueError:
             continue
     return None

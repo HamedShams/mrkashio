@@ -28,24 +28,28 @@ CURRENCIES: tuple[str, ...] = get_args(Currency)
 # Categories come from the spreadsheet's own dropdown on column G (SheetStore.category_options), so the
 # sheet stays the single source of truth. This list is used only when the sheet defines none.
 DEFAULT_CATEGORIES: tuple[str, ...] = (
-    "Groceries", "Eating Out", "Transport", "Housing & Utilities", "Health", "Personal Care",
-    "Shopping", "Leisure", "Travel", "Fees & Services", "Other",
+    "Groceries", "Eating Out", "Transport", "Housing & Utilities",
+    "Health & Personal Care", "Shopping", "Leisure & Travel", "Other",
 )
 
 # One-line hints shown to Claude next to a category name, keyed by lower-case name. Covers the defaults
 # above and the names in Google's budget template; a name without a hint is shown bare.
 CATEGORY_HINTS: dict[str, str] = {
+    # the eight defaults
     "groceries": "supermarkets, markets, bakeries, water and other food for home (A101, Migros, Şok, BİM)",
     "eating out": "restaurants, cafes, coffee, bars, takeaway, food delivery",
     "transport": "taxi, Uber, Istanbulkart and public transport, fuel, parking",
     "housing & utilities": "rent, electricity, water, gas, internet, phone bills, home supplies, furniture, repairs",
-    "health": "pharmacy, doctor, dentist, hospital, health insurance",
-    "personal care": "barber, hairdresser, cosmetics and hygiene products (Gratis), spa",
+    "health & personal care": "pharmacy, doctor, dentist, hospital, tests, health insurance, barber, hairdresser, cosmetics, hygiene, gym",
     "shopping": "clothes, shoes, electronics, gifts, malls and general retail not covered elsewhere",
-    "leisure": "entertainment, cinema, subscriptions, hobbies, gym, sports, books, games",
-    "leisure & travel": "entertainment, cinema, subscriptions, hobbies, gym, sports, hotels, flights, tours",
-    "fees & services": "bank and card fees, government fees, visas, documents, postage, education, professional services",
-    "other": "anything that fits none of the above",
+    "leisure & travel": "entertainment, cinema, concerts, subscriptions, hobbies, hotels, flights, tours, trips",
+    "other": "fees, bank and government charges, documents, services, anything that fits nowhere else",
+    # finer names some sheets use
+    "health": "pharmacy, doctor, dentist, hospital, tests, health insurance",
+    "personal care": "barber, hairdresser, cosmetics and hygiene products, spa, gym",
+    "leisure": "entertainment, cinema, concerts, subscriptions, hobbies, books, games",
+    "travel": "flights, hotels, tours, trips away from home",
+    "fees & services": "bank and card fees, government fees, visas and permits, documents, postage, education, professional services",
     # Google Sheets budget template
     "food": "groceries, supermarkets, restaurants, cafes, coffee, delivery",
     "gifts": "presents, flowers, donations",
@@ -55,7 +59,6 @@ CATEGORY_HINTS: dict[str, str] = {
     "personal": "barber, cosmetics and hygiene, clothes, hobbies, subscriptions",
     "pets": "pet food, vet, pet supplies",
     "utilities": "electricity, water, gas, internet, phone bills",
-    "travel": "flights, hotels, tours, trips away from home",
     "debt": "loan and credit-card repayments",
 }
 PLACEHOLDER_CATEGORY = re.compile(r"^custom category \d+$", re.IGNORECASE)

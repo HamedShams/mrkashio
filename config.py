@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
-REQUIRED = ("TELEGRAM_BOT_TOKEN", "ANTHROPIC_API_KEY", "GOOGLE_SHEET_ID")
+REQUIRED = ("TELEGRAM_BOT_TOKEN", "ANTHROPIC_API_KEY")
 
 
 class ConfigError(RuntimeError):
@@ -93,7 +93,7 @@ class Settings:
     price_output_per_million: float
     # Google Sheets
     google_service_account: dict
-    google_sheet_id: str
+    google_sheet_id: str | None  # optional: found through the Drive API when empty
     sheet_tab: str
     inbox_tab: str
     runs_tab: str
@@ -141,7 +141,7 @@ class Settings:
             price_input_per_million=_number("ANTHROPIC_PRICE_INPUT_PER_MILLION", 2.0),
             price_output_per_million=_number("ANTHROPIC_PRICE_OUTPUT_PER_MILLION", 10.0),
             google_service_account=service_account,
-            google_sheet_id=_text("GOOGLE_SHEET_ID"),
+            google_sheet_id=_text("GOOGLE_SHEET_ID"),  # None → discovered at startup
             sheet_tab=_text("SHEET_TAB", "Transactions_Trip#2"),
             inbox_tab=_text("INBOX_TAB", "Bot_Inbox"),
             runs_tab=_text("RUNS_TAB", "Bot_Runs"),

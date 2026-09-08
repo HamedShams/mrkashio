@@ -1,0 +1,346 @@
+# Kashio — Telegram expense notes to Google Sheets
+
+Revision 6 (8 Sep 2026). Status: **tested end to end locally; unit tests, health endpoint, sheet discovery, eight categories; being pushed to GitHub, Railway deploys on push.** See README.md for setup and the to-do list at the end of this document.
+
+Bot: `@mrkashio_bot` · Repo: `https://github.com/hamed-grantonomy/mrkashio` (linked to Railway) · Target tab: `Transactions_Trip#2` (env `SHEET_TAB`)
+
+---
+
+## 1. What it does, in one paragraph
+
+Kashio is a small always-on Python service on Railway. It sits in your Telegram group and saves every message it sees into a hidden `Bot_Inbox` tab of your spreadsheet the moment it arrives. This costs nothing: the Google Sheets API is free and no AI is involved. Twice a month (1st and 15th at 09:00 Istanbul, one env var to change), or when one of you types `/sync`, it takes every unprocessed message, sends the whole batch to Claude Sonnet 5 in **one API call**, and appends the resulting rows (date, amount, currency, description, category) under the last row of the target tab. It then posts a one-line summary in the group, sends the full run report to your private chat with the bot, records the same report in a `Bot_Runs` tab, and marks the inbox rows processed. Setup is one command: a group admin types `/setup` in the group and the bot stores the pairing in a hidden `Bot_Config` tab. Non-expense messages are skipped; anything ambiguous is flagged, not guessed.
+
+**The invariant you care about:** the Anthropic API is called from exactly one place, the sync.
+- A **scheduled** sync calls Claude only if at least `SCHEDULED_MIN_MESSAGES` (default 5) messages are pending. Below that it skips, logs the skip, and tells you.
+- **`/sync`** calls Claude if at least `MANUAL_MIN_MESSAGES` (default 1) is pending. Otherwise it answers "Nothing new to process" and makes no call.
+- Writing in the group never triggers an AI call.
+
+---
+
+## 2. Architecture
+
+```
+Telegram group (you + Shiva)                  Your private chat with the bot
+        │  long polling                                ▲ full run report, every run
+        ▼                                              │
+┌──────────────────────────────────────────────────────┴───────┐
+│  Kashio · one Python process on Railway (~60 MB RAM)         │
+│                                                              │
+│  on every message / edit ──► upsert raw text into            │
+│  (free, no AI)               "Bot_Inbox" tab  (pending)      │
+│                                                              │
+│  on SYNC_CRON (≥5 pending)                                   │
+│  or /sync (≥1 pending) ────► read pending inbox rows         │
+│  (the only AI call)          ONE call to Claude Sonnet 5     │
+│                              (structured JSON output)        │
+│                              append rows to target tab B:E,G │
+│                              mark inbox rows processed       │
+│                              log the run in "Bot_Runs"       │
+│                              summary in the group            │
+└──────────────────────────────────────────────────────────────┘
+        ▲                                         ▲
+   Telegram Bot API                        Google Sheets API
+   (bot token, Railway variable)           (service account, Railway variable)
+```
+
+### Why always-on, and why that does not cost you AI money
+
+Telegram bots cannot read chat history, and Telegram discards undelivered updates after 24 hours. Something must listen continuously or messages are lost. The listener only copies text into the sheet. The expensive part, Claude, runs on the schedule.
+
+### Storage: three sheet tabs plus Telegram, no database, no file
+
+| Need | Where it lives | Why |
+|---|---|---|
+| Unprocessed and processed messages | `Bot_Inbox` tab (hidden) with a status column | Survives redeploys, visible, free |
+| The transactions tab itself, when missing | Created with a header row (Date, Amount, Currency, Description, By, Category) | A fresh spreadsheet works on first run |
+| Run history: when, trigger, messages, rows added, sheet range, skipped, flagged, tokens, estimated cost, error | `Bot_Runs` tab (hidden) **and** a Telegram message to you | The sheet is a third party and can be down; the Telegram copy is built in memory first and is sent even when every sheet write failed |
+| Which group to record, who gets reports | `Bot_Config` tab (hidden), written by `/setup`; env vars override | Pair from Telegram, no redeploy |
+| Settings | Railway environment variables, all with defaults except the three secrets | Change one, redeploy |
+| Which spreadsheet | `GOOGLE_SHEET_ID`, or found through the Drive API among the spreadsheets shared with the service account | One less id to hunt for |
+| Debug logs | Railway's log viewer (stdout) | Kept for days, searchable |
+| Telegram's "which updates have I seen" pointer | Telegram's own servers | Re-delivered after a restart; the inbox de-duplicates by message id |
+
+A file "as a mini database" is the one option that fails on Railway: the filesystem is wiped on every deploy and restart unless you add a paid volume. If a real need appears later, a Railway volume or Postgres can be added without changing the design.
+
+### Who decides what
+
+| Claude (fuzzy judgement) | Code (deterministic) |
+|---|---|
+| Is this message an expense at all? | Date, from the message timestamp |
+| How many expenses are in it? | Day rollover before 04:00 |
+| Amount as a number, currency, category (from the sheet's own list) | Which row to write to, formatting, formula-safe text |
+| Light typo fix, emoji removal, "Groceries - A101" prefix | Never insert the same message twice; thresholds; one sync at a time |
+| Flag anything ambiguous | Retries, logging, the summary, the run log, the report |
+
+---
+
+## 3. Model, thinking effort and cost
+
+### Model: Claude Sonnet 5 (`claude-sonnet-5`), $2 per million input tokens, $10 per million output tokens
+
+Haiku 4.5 ($1 / $5) would handle most messages, but its failure mode is a silent wrong row in a finance sheet, and the price difference is a few cents a month. Opus 5 ($5 / $25) is overkill. `ANTHROPIC_MODEL` is an env var.
+
+### Thinking effort: `high` (decided)
+
+Sonnet 5 thinks adaptively; `effort` caps how much. The published gains of `xhigh` over `high` are on coding and multi-step agentic benchmarks, where the model plans across many tool calls. Our task is short-text extraction against explicit rules, where `high` already has room to reason on the traps (recaps, corrections, Turkish number formats). Estimated cost: `high` about $0.18 a month, `xhigh` about $0.30. The difference is not the money; it is that there is no evidence it changes a single row here. `ANTHROPIC_EFFORT` is an env var, and `Bot_Runs` records tokens per run, so trying `xhigh` for a month and comparing is a one-variable experiment.
+
+### Your traffic, priced
+
+Assumptions from your numbers: 50 transactions and 4 noise messages per 10 days, so per month **150 transactions in about 120 messages, plus 12 noise messages, 132 messages total**. Token estimates: system prompt plus schema about 1,700 tokens per call; about 45 input tokens per message; about 35 output tokens per message plus 30 per transaction; thinking about 20 tokens per message at `medium`, 50 at `high`, 120 at `xhigh`.
+
+| Schedule | Calls / month | Input tokens | Output tokens incl. thinking | `medium` | `high` | `xhigh` | Pessimistic (×3 of high) |
+|---|---|---|---|---|---|---|---|
+| **Twice a month (1st, 15th) — default** | 2 | ~9,300 | ~11,800 – 25,000 | ~$0.14 | **~$0.18** | ~$0.30 | ~$0.55 |
+| Weekly (Monday) | 4 | ~12,700 | ~11,800 – 25,000 | ~$0.14 | ~$0.18 | ~$0.30 | ~$0.55 |
+
+Per run: about 7 cents twice a month, or about 3.5 cents weekly. A `/sync` with nothing pending makes no API call. Roughly **$2 a year**. Weekly costs almost the same as twice-monthly because output tokens scale with your transactions, not with the number of runs. No prompt caching and no Batches API: both would save fractions of a cent per call in exchange for code.
+
+Safety net: set a monthly spend limit of $5 in the Anthropic console (Settings → Limits).
+
+### The call (as implemented in `extractor.py`)
+
+```python
+response = client.messages.parse(
+    model=settings.anthropic_model,           # claude-sonnet-5
+    max_tokens=16000,
+    system=system_prompt,                     # prompt.md with categories and currencies filled in
+    messages=[{"role": "user", "content": build_batch(chunk)}],
+    output_format=SyncResult,                 # Pydantic model → JSON schema enforced by the API
+    output_config={"effort": settings.anthropic_effort},
+)
+```
+
+Chunks of at most 150 messages per call. Token usage from `response.usage` goes into the run log.
+
+---
+
+## 4. Behaviour spec (as implemented)
+
+### Pairing (`/setup`)
+
+- A group admin types `/setup` in the group. The bot checks the admin role via Telegram, stores `group_id`, `admin_id` (the admin's user id, which is also their private chat id) and names in `Bot_Config`, replies, and tries to message the admin privately; if Telegram refuses (Start never pressed), it says so in the group.
+- `TELEGRAM_CHAT_ID` / `TELEGRAM_ADMIN_CHAT_ID` environment variables override the stored pairing. A second group cannot take over an existing pairing without clearing `Bot_Config`.
+
+### Ingest (continuous, free)
+
+- Accept messages only from the paired group. Everything else is ignored.
+- Until paired, the bot logs group messages with a hint to run `/setup` and records nothing. `/start` explains the state in any chat.
+- New message (text or photo caption): append a row to `Bot_Inbox` with `message_id, sender, sent_at, edited_at, text, status=pending`.
+- Edited message: find the row by `message_id`, replace text and `edited_at`. If already processed, set status `edited_after_sync` and warn in the chat so you fix the sheet by hand. If the message was never stored (for example sent while the bot was offline), store it as new.
+- Sheets write fails: retry 3 times with backoff, then reply "couldn't save this message; edit it to retry".
+
+### Sync (on `SYNC_CRON` or `/sync`)
+
+1. One sync at a time. `/sync` during a run replies "already running".
+2. Read all `pending` rows from `Bot_Inbox`. Compare with the threshold for the trigger. Below it: status `skipped_threshold`, logged and reported, no API call.
+3. One call to Claude with `prompt.md` as system prompt and the schema in §5. Messages folded into another message's transaction (an amount sent separately, a correction) come back with `merged_into` set and get status `merged` in the inbox.
+4. For every returned transaction: `date = transaction.date or rollover(message.sent_at)`; `rollover` moves anything before `DAY_ROLLOVER_HOUR` (04:00) to the previous day. Descriptions that start with `=`, `+`, `-` or `@` get a leading apostrophe so the spreadsheet never reads them as formulas.
+5. Find the last used row of the target tab: the highest row with any value in B, C or E (pre-filled "TRY" cells in D do not count).
+6. **Guardrail:** re-read the destination rows and refuse to write if any of B, C, E, F or G already holds data (only the pre-filled default currency in D is tolerated). Then copy the formatting of the last row onto the new rows (borders, ₺ and date formats, the column-F dropdown) and write B:E and G in one batch with `USER_ENTERED`; dates are written as ISO strings, which every sheet locale parses as a date. Column F is never written.
+7. Mark inbox rows `processed`, `merged`, `skipped` or `needs_review` with a timestamp and rows added.
+8. Append one row to `Bot_Runs`: time, trigger, requested by, status, pending, processed, rows added, sheet range, skipped, needs review, input tokens, output tokens, cost, model, effort, error.
+9. Send the full report to `TELEGRAM_ADMIN_CHAT_ID` (or the group if unset). If `POST_SUMMARY=true`, post a one-line summary in the group.
+10. Any failure: status `failed`, rows stay `pending`, the report still goes out with the error, and if even the run log could not be written the report says so.
+
+### Command line
+
+```
+python bot.py check           verify Telegram, Sheets, Anthropic and the schedule; no paid call
+python bot.py sync --dry-run  call Claude, print the rows, write nothing, message nobody
+python bot.py sync            one real sync from the terminal
+python bot.py backfill FILE   queue older messages from a paste (.txt) or a Telegram Desktop export (.json)
+python bot.py                 run the bot (what Railway runs)
+```
+
+### Telegram commands
+
+| Command | Where | Who | Effect |
+|---|---|---|---|
+| `/setup` | group | group admin | pair the bot with the group and the admin |
+| `/sync` | group or private | group members | process everything pending; summary in the group, full report in private |
+| `/backfill` … (`/done` / `/cancel`) | private | group members | paste older messages; Telegram splits long pastes into several messages, so the import starts 20 s after the last part or at once on `/done`; the reply lists every dismissed message; then a sync runs |
+| `/start`, `/help` | anywhere | anyone | state and command list |
+
+### Messy input the prompt handles
+
+- A description and its amount in two consecutive messages from the same sender ("UBER", then "10 TL") are one transaction, attached to the description message; the amount-only message is skipped with the reason "amount for message <id>". Verified live.
+- Currency words in Turkish, German, English and Persian (TL, ₺, lira, لیر, تومان, euro, dollar, یورو, دلار, پوند) and Persian digits.
+- Corrections to an earlier message in the same batch are applied to that message.
+
+### Cold start and history
+
+Telegram bots never receive messages sent before they joined, even when the group's history is visible to new members (that setting only affects human accounts). So the bot cannot re-process old messages by itself, and there is no risk of a giant first call. Two rules cover history anyway:
+
+- **Live safety rule.** At each sync the bot reads the latest date in column B. A transaction dated before that date is not written; its message is flagged `needs_review` with the note "dated …, before the sheet's last entry". Same-day and later rows are written normally, so steady-state operation is unaffected.
+- **Backfill by pasting or from a file.** In a private chat, `/backfill` then the messages copied from the Telegram chat (format `Name, [1 Sep 2026 at 21:14:10]:` followed by the text; the Desktop variant `Name, [01.09.2026 21:14]` and an edit time in parentheses are understood), then `/done`; or `python bot.py backfill FILE` with a `.txt` paste or a Telegram Desktop JSON export. `backfill.py` parses both, skips everything whose effective date (after the 04:00 rollover) is on or before the sheet's last recorded date and anything already stored, and queues the rest as pending. Imported ids are negative (a hash of sender, time and text for pastes; the export id for JSON) so they can never collide with live message ids and re-imports are harmless. The Telegram path then runs a sync immediately; the CLI path leaves it to `sync --dry-run` / `sync`. 150 messages per Claude call.
+
+### Health endpoint
+
+`GET /health` on `$PORT` (Railway sets it) answers 200 with `status`, `uptime_seconds`, `paired`, `syncing`, `spreadsheet`. `railway.json` sets `healthcheckPath` to it. Railway's own cron feature must stay empty: the bot is always-on and schedules itself.
+
+### Guarantees and limits
+
+- A message is inserted at most once (status column plus de-duplication by message id).
+- Messages sent before the bot joined the group are invisible to it.
+- Telegram does not tell bots about deleted messages. To retract an expense before a sync, edit the message to say "ignore" or "cancelled".
+- If Telegram upgrades your group to a supergroup, the chat id changes. Update the env var.
+
+---
+
+## 5. Data contract
+
+Input to Claude (one per pending message):
+
+```xml
+<message id="1041" sender="Hamed" sent="2026-07-24 21:46" edited="true">
+Gratis
+266 TL
+
+Cafe 
+385 TL
+</message>
+```
+
+Output schema (enforced by the API; Pydantic on our side, all fields required):
+
+```python
+Currency = Literal["TRY", "TOMAN", "EUR", "USD", "GBP"]
+Category = Literal["Groceries", "Eating Out", "Transport", "Housing & Utilities", "Health",
+                   "Personal Care", "Shopping", "Leisure & Travel", "Fees & Services", "Other"]
+
+class Transaction(BaseModel):
+    description: str
+    amount: float
+    currency: Currency
+    category: Category
+    date: str | None              # YYYY-MM-DD only if the message names another day
+
+class MessageResult(BaseModel):
+    message_id: int
+    transactions: list[Transaction]   # empty = not an expense
+    skip_reason: str | None
+    needs_review: bool
+    note: str | None
+
+class SyncResult(BaseModel):
+    results: list[MessageResult]
+```
+
+Sheet columns written: **B** date, **C** amount (number), **D** currency, **E** description, **G** category. **A and F are untouched.**
+
+### Categories (column G): read from the sheet at every sync
+
+Column G carries a dropdown fed from the category table in `Summary!B28:B35`, which the Summary's SUMIF formulas also use. The bot imposes no list: at each sync it reads the dropdown's allowed values, drops template placeholders, builds the output schema with exactly those names, and lists them in the prompt with a one-line hint where one is known. Editing the Summary table is all it takes to change categories. On 8 Sep 2026 the list was reduced, with Hamed's approval, to eight MECE names (the planned £750 stays on the housing row):
+
+| Category | Covers |
+|---|---|
+| Groceries | supermarkets, markets, bakeries, water and other food for home |
+| Eating Out | restaurants, cafes, coffee, bars, takeaway, delivery |
+| Transport | taxi, Uber, Istanbulkart and public transport, fuel, parking |
+| Housing & Utilities | rent, electricity, water, gas, internet, phone bills, home supplies, furniture (an IKEA desk), repairs |
+| Health & Personal Care | pharmacy, doctor, dentist, hospital, tests, insurance, barber, cosmetics, hygiene, gym |
+| Shopping | clothes, shoes, electronics, gifts, malls and general retail not covered elsewhere |
+| Leisure & Travel | entertainment, cinema, concerts, subscriptions, hobbies, hotels, flights, tours, trips |
+| Other | fees, bank and government charges, documents, services, anything that fits nowhere else |
+
+If column G ever has no dropdown, this same list is the built-in fallback (`DEFAULT_CATEGORIES` in `extractor.py`). Adding a ninth row to the Summary table (for example "Fees & Services") is all it takes to split one out again.
+
+---
+
+## 6. What the bot would write for your sample
+
+12 rows and 2 skips, the same 12 rows you produced by hand, now with a category. Four descriptions differ only where you added details by hand that are not in the Telegram message.
+
+| Telegram message | Bot writes (B / C / D / E / G) | Your manual entry (E) | Difference |
+|---|---|---|---|
+| Gratis 266 TL (24 Jul 21:46) | 24/07/2026 · 266 · TRY · Gratis · Personal Care | same | — |
+| Cafe 385 TL (same message, edited in) | 24/07/2026 · 385 · TRY · Cafe · Eating Out | Cafe (Turk Kahvesi) | detail added by hand |
+| Avm 810 (Shiva) | 24/07/2026 · 810 · TRY · Avm · Shopping | avm (random stuffs for the hause) | detail added by hand |
+| Cafe IKEA 350 TL | 25/07/2026 · 350 · TRY · Cafe IKEA · Eating Out | same | — |
+| UBER 452 TL | 25/07/2026 · 452 · TRY · UBER · Transport | UBER nach hause (with luggages from Meka) | detail added by hand |
+| A101 300 (26 Jul 01:28) | **25/07/2026** · 300 · TRY · Groceries - A101 · Groceries | Groceries - A101 (oil) | date via 04:00 rollover ✓; "(oil)" by hand |
+| A101 851 TL | 26/07/2026 · 851 · TRY · Groceries - A101 · Groceries | same | — |
+| Cafe 320 TL | 26/07/2026 · 320 · TRY · Cafe · Eating Out | Cafe (Turk Kahvesi) | detail added by hand |
+| "…TOTAL of $10,871 USD…" | skipped: spending recap | skipped | ✓ |
+| Cafe 435 TL | 28/07/2026 · 435 · TRY · Cafe · Eating Out | same | — |
+| istanbul card charge 414 TL | 28/07/2026 · 414 · TRY · istanbul card charge · Transport | same | — |
+| A101 100 TL | 28/07/2026 · 100 · TRY · Groceries - A101 · Groceries | same | — |
+| 📅 @Shiva | skipped: no expense | skipped | ✓ |
+| Barbershop 💈 (arash) 604 TL | 29/07/2026 · 604 · TRY · Barbershop · Personal Care | Barbershop | ✓ emoji and name dropped |
+
+If you want those extra details in the sheet, write them in the Telegram message ("Cafe (Turk Kahvesi) 385") and the bot keeps them verbatim.
+
+---
+
+## 7. Decisions (all settled)
+
+- Name **Kashio**, bot `@mrkashio_bot`, privacy mode disabled.
+- Scheduled sync twice a month (`SYNC_CRON=0 9 1,15 * *`), only when ≥ `SCHEDULED_MIN_MESSAGES` (5) are pending.
+- `/sync` processes everything pending when ≥ `MANUAL_MIN_MESSAGES` (1); otherwise "nothing new".
+- Thinking effort `high`.
+- Messages stored in `Bot_Inbox`; runs in `Bot_Runs`; every run report also sent to your private chat with the bot. No database, no file.
+- Column F (the "By" dropdown: Hamed / Shiva) left empty as asked; column G gets a category read from the sheet's own dropdown, now the eight names above; column D one of TRY, TOMAN, EUR, USD, GBP.
+- History: rows dated before the sheet's last entry are flagged, never written; older messages come in through `/backfill` (paste) or `backfill FILE`, strictly after the last recorded day by default.
+- Guardrail: the bot only appends; it verifies the destination cells are empty right before writing and never edits or deletes an existing row of the target tab.
+- Pairing via `/setup`, stored in the sheet; env vars are optional overrides.
+- Day rollover at 04:00. Grocery prefix list and name-dropping rule in `prompt.md`. Formatting copied from the previous row.
+- Backfill: built, by paste in Telegram or from a file, because the bot cannot see history.
+
+---
+
+## 8. Files (flat, no subfolders)
+
+```
+mrkashio/
+├── bot.py            Telegram handlers (/setup, /sync, /backfill…), schedule, command line
+├── backfill.py       Parses pasted Telegram messages or a Desktop JSON export; queues them
+├── tests/            Offline pytest suite (config, extractor, sync, sheets guardrail, backfill)
+├── .github/workflows/tests.yml   runs the tests on every push
+├── requirements-dev.txt          requirements + pytest
+├── sync.py           One sync run: thresholds, dates, rows, sheet writes, report text
+├── extractor.py      The Claude call: schema, categories, currencies, prompt loading
+├── sheets.py         Google Sheets: inbox, run log, appending rows, copying formats
+├── config.py         Reads and validates every environment variable
+├── prompt.md         The system prompt; edit rules, store names and examples here
+├── requirements.txt  5 dependencies
+├── railway.json      Start command and single replica for Railway
+├── .python-version   3.12
+├── .env.example      Every variable, documented
+├── .gitignore        Keeps .env and key files out of GitHub
+├── README.md         Setup, configuration, commands
+└── SPEC.md           This document
+```
+
+Dependencies: `python-telegram-bot[job-queue]` (Telegram + scheduler), `gspread` (Sheets), `anthropic` (Claude), `pydantic` (schema), `python-dotenv` (local `.env`).
+
+---
+
+## 9. Security notes
+
+- Secrets (bot token, Anthropic key, Google key) live only in Railway Variables. The repo has `.env.example` with placeholders and a `.gitignore` that excludes `.env` and `*.json` key files. Anyone with the repo cannot reach your sheet or your bot.
+- The bot token was pasted into a chat. Rotating it is a 10-second job: BotFather → `/revoke` → choose the bot → copy the new token into Railway. Recommended before the first deploy.
+- The service account can only edit spreadsheets you explicitly share with it.
+- Descriptions are written formula-safe; the bot never writes outside columns B–E and G of the target tab and its own three hidden tabs.
+- Append-only guardrail: destination rows are verified empty immediately before every write; no update or delete request is ever issued against existing rows of the target tab.
+- `/backfill` is restricted to private chats and to members of the paired group; `/setup` to group admins.
+
+---
+
+## 10. Testing status
+
+**Live, 8 Sep 2026, from Hamed's machine with the real credentials:**
+- `python bot.py check`: Telegram token, group and admin (from env), Sheets access, categories from the dropdown, Anthropic key and schedule all pass. Hidden tabs created; run-log header extended with `merged`.
+- Ingest: the bot ran locally for 45 s and stored three pending group messages, including an edit ("test" → "UBER"); migration service messages were ignored.
+- One sync (the only paid call): 3 pending → 1 row at `Transactions_Trip#2!B153:G153` as a real date 07/09/2026 (02:30 rolled back a day), numeric ₺10.0, TRY, "UBER", F empty, G "Transport"; "10 TL" folded into that row; the greeting skipped; inbox statuses and run log correct; report delivered. 4,600 input / 234 output tokens, $0.0115.
+- Sheet discovery without `GOOGLE_SHEET_ID`: exercised; see the README for the Drive API requirement.
+
+**Unit tests (`pytest`, offline, run in CI):** configuration defaults and every validation message, prompt rendering and the exact output schema (dynamic category enum, `merged_into`), date rollover, the cutoff rule, message pairing and inbox statuses, all report texts, the paste parser on the real samples and its tolerant variants, the JSON export parser, import filters with their explanations, `_as_date`, `last_used_row`, and the append-only guardrail.
+
+**Not exercised live:** `/setup`, `/backfill`, `/sync` typed in Telegram, the cron trigger, a Telegram delivery failure, the guardrail's refusal path, the health endpoint under Railway. The first Railway deploy is the place to try them.
+
+## 11. Deploy to-do
+
+1. Push: remote switched to HTTPS with the `gh` credential helper; the local commits are rebased onto GitHub's initial commit and pushed. Railway builds on push; the healthcheck path is `/health`. Leave Railway's cron schedule empty.
+2. Railway → Variables are already set (chat ids included), so `/setup` is not needed here; it exists for anyone else who deploys the project.
+3. After the deploy, type `/sync` in the group (the two earlier `/sync` messages are still queued and will be answered too), then post a test expense and `/sync` again. Check the row, your private-chat report and the group summary.
+4. Optional: fill 30 Jul – 7 Sep by copying those messages from the Telegram chat and, in your private chat with the bot, `/backfill`, paste, wait 20 s or `/done`.

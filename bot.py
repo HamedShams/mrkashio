@@ -9,17 +9,25 @@
 Telegram commands:
     /setup     in the group, once, by a group admin: pairs the bot with that group and with you
     /sync      process everything pending now
-    /backfill  in a private chat with the bot: paste copied messages, then /done (or /cancel)
+    /backfill  in a private chat with the bot: paste copied messages; the import starts by itself after a short
+               pause, or immediately on /done (/cancel discards)
     /start     who am I talking to, and the commands
+
+A tiny HTTP endpoint answers GET /health on $PORT for Railway's healthcheck.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
+import os
 import sys
+import threading
+import time
 from datetime import date, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import anthropic
 from apscheduler.triggers.cron import CronTrigger
@@ -27,7 +35,7 @@ from telegram import Bot, Chat, Update, User
 from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-from backfill import ImportResult, import_messages, parse
+from backfill import import_messages, parse
 from config import ConfigError, Settings
 from extractor import MAX_MESSAGES_PER_CALL, clean_categories, load_prompt
 from sheets import STATUS_PENDING, SheetStore
@@ -46,12 +54,13 @@ from sync import (
 log = logging.getLogger("kashio")
 
 TELEGRAM_MESSAGE_LIMIT = 4000  # Telegram allows 4096 characters per message
+BACKFILL_QUIET_SECONDS = 20  # a paste split into several messages is imported once nothing new arrives for this long
 GROUP_ROLES = ("member", "administrator", "creator")
 ADMIN_ROLES = ("administrator", "creator")
 HELP = (
     "Commands:\n"
     "/sync — process everything pending now\n"
-    "/backfill — paste older messages (private chat), then /done\n"
+    "/backfill — paste older messages (private chat); import starts after a short pause or on /done\n"
     "/setup — in the group, once, to pair me with it\n"
     "/start — this message"
 )
@@ -277,7 +286,11 @@ async def on_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat, message, user = update.effective_chat, update.effective_message, update.effective_user
     if chat is None or message is None:
         return
-    if chat.id != app.group_id and not (chat.type == Chat.PRIVATE and await app.is_household_member(context.bot, user)):
+    if chat.type == Chat.PRIVATE:
+        if not await app.is_household_member(context.bot, user):
+            await message.reply_text("I only work for members of my paired group." if app.group_id else "I'm not paired with a group yet: a group admin has to type /setup in the group first.")
+            return
+    elif chat.id != app.group_id:
         return
     report = await app.sync(TRIGGER_MANUAL, _name(user))
     if report is None:
@@ -306,7 +319,7 @@ async def on_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     context.chat_data["capture"] = []
     await message.reply_text(
         "Paste the copied messages now, in as many messages as you need (Telegram splits long pastes itself).\n"
-        "Send /done when finished, or /cancel to discard.\n\n"
+        f"I start the import {BACKFILL_QUIET_SECONDS} seconds after the last part arrives, or right away on /done. /cancel discards.\n\n"
         "Expected format, as copied from a Telegram chat:\n"
         "Shiva ❤️, [1 Sep 2026 at 21:14:10]:\nA101\n2045"
     )
@@ -321,7 +334,27 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text("I only read the group. " + HELP)
         return
     capture.append(message.text)
-    await message.reply_text(f"Got it ({len(capture)} part(s)). Send /done to import, or /cancel.")
+    _schedule_auto_finish(context, message.chat_id)
+    await message.reply_text(f"Got it ({len(capture)} part(s)). Importing in {BACKFILL_QUIET_SECONDS} s unless more arrives; /done starts now, /cancel discards.")
+
+
+def _schedule_auto_finish(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    name = f"backfill-{chat_id}"
+    for job in context.job_queue.get_jobs_by_name(name):
+        job.schedule_removal()
+    context.job_queue.run_once(_auto_finish, when=BACKFILL_QUIET_SECONDS, chat_id=chat_id, name=name)
+
+
+def _cancel_auto_finish(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    for job in context.job_queue.get_jobs_by_name(f"backfill-{chat_id}"):
+        job.schedule_removal()
+
+
+async def _auto_finish(context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = context.job.chat_id
+    capture = context.application.chat_data[chat_id].pop("capture", None)
+    if capture:
+        await process_backfill(kashio_of(context), context.bot, chat_id, "paste", "\n".join(capture))
 
 
 async def on_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -329,6 +362,7 @@ async def on_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat, message, user = update.effective_chat, update.effective_message, update.effective_user
     if chat is None or message is None:
         return
+    _cancel_auto_finish(context, chat.id)
     capture = context.chat_data.pop("capture", None)
     if not capture:
         await message.reply_text("Nothing to import. Send /backfill first, then paste the messages.")
@@ -340,19 +374,25 @@ async def on_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if message is None:
         return
+    _cancel_auto_finish(context, message.chat_id)
     had = context.chat_data.pop("capture", None) is not None
     await message.reply_text("Discarded." if had else "Nothing to cancel.")
 
 
 async def process_backfill(app: Kashio, bot: Bot, chat_id: int, requested_by: str, content: str) -> None:
     """Parse pasted history, queue it, and run a sync right away."""
-    messages = parse(content, app.settings)
-    if not messages:
-        await deliver(bot, chat_id, "I couldn't recognise any messages. Copy them from the Telegram chat so each starts with a line like:\nHamed Shams, [3 Sep 2026 at 09:59:44]:")
+    parsed = parse(content, app.settings)
+    if not parsed.messages:
+        await deliver(bot, chat_id, "I couldn't recognise any messages. Copy them from the Telegram chat so each starts with a line like:\n"
+                                    "Hamed Shams, [3 Sep 2026 at 09:59:44]:\nfollowed by the message text. Nothing was imported.")
         return
-    result: ImportResult = await asyncio.to_thread(import_messages, app.store, app.settings, messages)
-    await deliver(bot, chat_id, result.describe())
+    result = await asyncio.to_thread(import_messages, app.store, app.settings, parsed.messages)
+    text = result.describe()
+    if parsed.problems():
+        text += "\n" + parsed.problems()
+    await deliver(bot, chat_id, text)
     if not result.imported:
+        await deliver(bot, chat_id, "Nothing new to process, so no sync was run.")
         return
     report = await app.sync(TRIGGER_MANUAL, f"{requested_by} (backfill)")
     if report is None:
@@ -399,14 +439,50 @@ def build_application(app: Kashio) -> Application:
     return application
 
 
+def start_health_server(app: Kashio, port: int) -> None:
+    """GET /health → 200 with a little JSON. Lets Railway (or anyone) see that the process is alive."""
+    started = time.time()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+            if self.path.rstrip("/") not in ("", "/health"):
+                self.send_response(404)
+                self.end_headers()
+                return
+            body = json.dumps({
+                "status": "ok",
+                "uptime_seconds": int(time.time() - started),
+                "paired": app.group_id is not None,
+                "syncing": app.lock.locked(),
+                "spreadsheet": app.store.spreadsheet.title,
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args: object) -> None:  # keep the Railway log for real events
+            return
+
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    except OSError as exc:
+        log.warning("Health endpoint not started on port %s: %s", port, exc)
+        return
+    threading.Thread(target=server.serve_forever, name="health", daemon=True).start()
+    log.info("Health endpoint listening on port %s (GET /health)", port)
+
+
 def run_bot(settings: Settings) -> None:
     app = Kashio(settings)  # connects to the sheet now, so a bad key fails fast
     application = build_application(app)
+    start_health_server(app, int(os.environ.get("PORT", "8080")))
     next_run = cron_trigger(settings).get_next_fire_time(None, datetime.now(settings.timezone))
     if app.group_id is None:
         log.warning("Not paired with a group yet: add me to the group and type /setup there as a group admin.")
-    log.info("Kashio is running. Group: %s · admin: %s · schedule: %s (%s) · next sync: %s",
-             app.group_id, app.admin_id, settings.sync_cron, settings.timezone.key, next_run)
+    log.info("Kashio is running. Spreadsheet: %r · tab: %r · group: %s · admin: %s · schedule: %s (%s) · next sync: %s",
+             app.store.spreadsheet.title, settings.sheet_tab, app.group_id, app.admin_id, settings.sync_cron, settings.timezone.key, next_run)
     application.run_polling(allowed_updates=[Update.MESSAGE, Update.EDITED_MESSAGE])
 
 
@@ -428,8 +504,9 @@ def check(settings: Settings) -> int:
     app: Kashio | None = None
     try:
         app = Kashio(settings)
-        report("Google Sheets", f"target tab {settings.sheet_tab!r}, last used row {app.store.last_used_row()}, "
-                                f"{len(app.store.pending_messages())} pending")
+        source = "GOOGLE_SHEET_ID" if settings.google_sheet_id else "found via the Drive API"
+        report("Google Sheets", f"spreadsheet {app.store.spreadsheet.title!r} ({source}), tab {settings.sheet_tab!r}, "
+                                f"last used row {app.store.last_used_row()}, {len(app.store.pending_messages())} pending")
         categories = clean_categories(app.store.category_options())
         report("Categories", f"{len(categories)} from the column-G dropdown: {', '.join(categories)}")
     except Exception as exc:  # noqa: BLE001
@@ -471,13 +548,15 @@ def cli_backfill(settings: Settings, path: str, since: date | None) -> int:
     """Queue older messages from a file: a pasted dump saved as text, or a Telegram Desktop result.json."""
     with open(path, encoding="utf-8") as handle:
         content = handle.read()
-    messages = parse(content, settings)
-    if not messages:
+    parsed = parse(content, settings)
+    if not parsed.messages:
         print("No messages recognised. Expected lines like:  Hamed Shams, [3 Sep 2026 at 09:59:44]:  followed by the message text,"
               " or a Telegram Desktop JSON export.")
         return 1
-    result = import_messages(SheetStore(settings), settings, messages, since)
+    result = import_messages(SheetStore(settings), settings, parsed.messages, since)
     print(result.describe())
+    if parsed.problems():
+        print(parsed.problems())
     if result.imported:
         calls = -(-result.imported // MAX_MESSAGES_PER_CALL)
         print(f"Next: `python bot.py sync --dry-run` to preview, then `python bot.py sync` ({calls} Claude call(s)).")

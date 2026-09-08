@@ -16,5 +16,3 @@ venv/
 .idea/
 .DS_Store
 
-# internal notes with personal identifiers (chat ids, sheet id); publish a sanitised copy if you want it in the repo
-SPEC.md

@@ -79,7 +79,7 @@ Gratis
 
 Cafe 
 385 TL
-Result: two transactions. {"description": "Gratis", "amount": 266, "currency": "TRY", "category": "Personal Care", "date": null} and {"description": "Cafe", "amount": 385, "currency": "TRY", "category": "Eating Out", "date": null}
+Result: two transactions. {"description": "Gratis", "amount": 266, "currency": "TRY", "category": "Health & Personal Care", "date": null} and {"description": "Cafe", "amount": 385, "currency": "TRY", "category": "Eating Out", "date": null}
 
 Message (id 2): "Avm
 810"
@@ -97,7 +97,7 @@ Result: no transactions. skip_reason: "no expense in message"
 
 Message (id 6): "Barbershop 💈 (arash)
 604 TL"
-Result: {"description": "Barbershop", "amount": 604, "currency": "TRY", "category": "Personal Care", "date": null}
+Result: {"description": "Barbershop", "amount": 604, "currency": "TRY", "category": "Health & Personal Care", "date": null}
 
 Message (id 7): "istanbul card charge
 414 TL"
@@ -124,4 +124,4 @@ Message (id 14): "Cafe"
 Result (no amount follows from this sender): no transactions. needs_review: true. note: "no amount given"
 
 Message (id 15, sent 2026-07-29 10:00): "yesterday pharmacy 320 tl"
-Result: {"description": "pharmacy", "amount": 320, "currency": "TRY", "category": "Health", "date": "2026-07-28"}
+Result: {"description": "pharmacy", "amount": 320, "currency": "TRY", "category": "Health & Personal Care", "date": "2026-07-28"}

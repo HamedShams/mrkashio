@@ -14,9 +14,9 @@ from datetime import date, datetime, timedelta
 from typing import TypeVar
 
 import gspread
-from gspread.exceptions import APIError, WorksheetNotFound
+from gspread.exceptions import APIError, SpreadsheetNotFound, WorksheetNotFound
 
-from config import Settings
+from config import ConfigError, Settings
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +35,7 @@ STATUS_NEEDS_REVIEW = "needs_review"
 STATUS_MERGED = "merged"  # folded into another message's transaction (an amount sent separately, a correction)
 STATUS_EDITED_AFTER_SYNC = "edited_after_sync"
 CONFIG_HEADERS = ("key", "value", "updated_at", "updated_by")
+TARGET_HEADERS = ("", "Date", "Amount", "Currency", "Description", "By", "Category")  # A is left free
 
 # Zero-based column bounds of the block we format on the transactions tab: B (1) through G (7, exclusive).
 FIRST_COLUMN_INDEX, END_COLUMN_INDEX = 1, 7
@@ -101,11 +102,66 @@ class SheetStore:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         client = gspread.service_account_from_dict(settings.google_service_account)
-        self.spreadsheet = client.open_by_key(settings.google_sheet_id)
-        self.target = self.spreadsheet.worksheet(settings.sheet_tab)
+        self.service_account_email = settings.google_service_account.get("client_email", "the service account")
+        self.spreadsheet = self._open_spreadsheet(client)
+        self.target = self._ensure_target(settings.sheet_tab)
         self.inbox = self._ensure_tab(settings.inbox_tab, INBOX_HEADERS)
         self.runs = self._ensure_tab(settings.runs_tab, RUNS_HEADERS)
         self.config = self._ensure_tab(settings.config_tab, CONFIG_HEADERS)
+
+    def _open_spreadsheet(self, client: gspread.Client) -> gspread.Spreadsheet:
+        """Open GOOGLE_SHEET_ID, or find the spreadsheet shared with the service account when the id is not set."""
+        wanted = self.settings.google_sheet_id
+        if wanted:
+            try:
+                return client.open_by_key(wanted)
+            except (SpreadsheetNotFound, APIError) as exc:
+                raise ConfigError(
+                    f"GOOGLE_SHEET_ID {wanted!r} could not be opened ({exc.__class__.__name__}). Check the id in the "
+                    f"spreadsheet URL and share the spreadsheet with {self.service_account_email} as Editor."
+                ) from exc
+        try:
+            files = client.list_spreadsheet_files()
+        except APIError as exc:
+            raise ConfigError(
+                "GOOGLE_SHEET_ID is not set and the spreadsheet could not be listed. Either set GOOGLE_SHEET_ID, or enable "
+                f"the Google Drive API in the Cloud project of {self.service_account_email} so it can be found automatically. "
+                f"({exc})"
+            ) from exc
+        if not files:
+            raise ConfigError(f"No spreadsheet is shared with {self.service_account_email}. Share yours with it as Editor, or set GOOGLE_SHEET_ID.")
+        candidates = [client.open_by_key(f["id"]) for f in files]
+        if len(candidates) > 1:
+            with_tab = [sp for sp in candidates if any(ws.title == self.settings.sheet_tab for ws in sp.worksheets())]
+            if len(with_tab) == 1:
+                candidates = with_tab
+        if len(candidates) != 1:
+            names = "; ".join(f"{sp.title} ({sp.id})" for sp in candidates)
+            raise ConfigError(f"{len(candidates)} spreadsheets are shared with {self.service_account_email} and none or several have a "
+                              f"tab called {self.settings.sheet_tab!r}: {names}. Set GOOGLE_SHEET_ID to the one you want.")
+        log.info("Using spreadsheet %r (%s), found through the Drive API", candidates[0].title, candidates[0].id)
+        return candidates[0]
+
+    def _ensure_target(self, title: str) -> gspread.Worksheet:
+        """The transactions tab. Created with a header row when missing, so a fresh spreadsheet works too."""
+        try:
+            return self.spreadsheet.worksheet(title)
+        except WorksheetNotFound:
+            existing = ", ".join(ws.title for ws in self.spreadsheet.worksheets())
+            log.warning("Tab %r not found (existing tabs: %s); creating it with a header row", title, existing)
+            sheet = self.spreadsheet.add_worksheet(title=title, rows=1000, cols=len(TARGET_HEADERS))
+            _retry(lambda: sheet.update([list(TARGET_HEADERS)], "A1"))
+            self._format_new_target(sheet)
+            return sheet
+
+    def _format_new_target(self, sheet: gspread.Worksheet) -> None:
+        """Date and number formats for a tab the bot created; cosmetic, never blocks."""
+        try:
+            _retry(lambda: sheet.format("B2:B", {"numberFormat": {"type": "DATE", "pattern": "dd/mm/yyyy"}}))
+            _retry(lambda: sheet.format("C2:C", {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}}))
+            _retry(lambda: sheet.format("A1:G1", {"textFormat": {"bold": True}}))
+        except APIError as exc:
+            log.warning("Could not format the new tab: %s", exc)
 
     def _ensure_tab(self, title: str, headers: Sequence[str]) -> gspread.Worksheet:
         """Return the tab, creating it if needed. A tab made by hand gets its header row and is hidden too."""
