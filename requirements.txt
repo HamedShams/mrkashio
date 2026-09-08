@@ -1,0 +1,5 @@
+python-telegram-bot[job-queue]~=22.8
+gspread~=6.2
+anthropic~=1.4
+pydantic~=2.13
+python-dotenv~=1.2

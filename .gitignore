@@ -1,0 +1,20 @@
+# secrets and local configuration
+.env
+.env.*
+!.env.example
+*.json
+!railway.json
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# editors and OS
+.vscode/
+.idea/
+.DS_Store
+
+# internal notes with personal identifiers (chat ids, sheet id); publish a sanitised copy if you want it in the repo
+SPEC.md
