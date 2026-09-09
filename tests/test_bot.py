@@ -18,7 +18,7 @@ def update_for(text: str, chat_type: str = Chat.SUPERGROUP, edited: bool = False
         entities = (MessageEntity(type=MessageEntity.BOT_COMMAND, offset=0, length=len(text.split()[0])),)
     message = Message(
         message_id=1, date=datetime.now(timezone.utc), chat=Chat(id=-1, type=chat_type),
-        from_user=User(id=7, first_name="Hamed", is_bot=False), text=text, entities=entities,
+        from_user=User(id=7, first_name="Alex", is_bot=False), text=text, entities=entities,
     )
     message.set_bot(BOT)  # CommandHandler compares "/sync@botname" against the bot's username
     return Update(update_id=1, edited_message=message) if edited else Update(update_id=1, message=message)

@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
-REQUIRED = ("TELEGRAM_BOT_TOKEN", "ANTHROPIC_API_KEY")
+REQUIRED = ("TELEGRAM_BOT_TOKEN",)  # everything else is reported by the bot with instructions
 
 
 class ConfigError(RuntimeError):
@@ -59,12 +59,12 @@ def _flag(name: str, default: bool) -> bool:
     raise ConfigError(f"{name} must be true or false, got {raw!r}")
 
 
-def _service_account() -> dict:
-    """The Google key: either the JSON itself (GOOGLE_SERVICE_ACCOUNT_JSON) or a path to the downloaded file."""
+def _service_account() -> dict | None:
+    """The Google key: the JSON itself (GOOGLE_SERVICE_ACCOUNT_JSON) or a path to the downloaded file. None when unset."""
     raw = _text("GOOGLE_SERVICE_ACCOUNT_JSON")
     path = _text("GOOGLE_SERVICE_ACCOUNT_FILE")
     if raw is None and path is None:
-        raise ConfigError("set GOOGLE_SERVICE_ACCOUNT_JSON (the key file as one line) or GOOGLE_SERVICE_ACCOUNT_FILE (path to it)")
+        return None
     try:
         if raw is None:
             with open(path, encoding="utf-8") as handle:
@@ -86,13 +86,13 @@ class Settings:
     telegram_chat_id: int | None  # the group to record; optional, /setup in the group stores it in the sheet
     telegram_admin_chat_id: int | None  # where run reports go; optional, /setup stores it too; falls back to the group
     # Anthropic
-    anthropic_api_key: str
+    anthropic_api_key: str | None  # optional at startup; the bot explains what is missing
     anthropic_model: str
     anthropic_effort: str
     price_input_per_million: float  # USD, used only to estimate cost in the run log
     price_output_per_million: float
     # Google Sheets
-    google_service_account: dict
+    google_service_account: dict | None  # optional at startup; the bot explains what is missing
     google_sheet_id: str | None  # optional: found through the Drive API when empty
     sheet_tab: str
     inbox_tab: str
@@ -114,8 +114,8 @@ class Settings:
             raise ConfigError("missing required variables: " + ", ".join(missing))
 
         service_account = _service_account()
-        if "client_email" not in service_account or "private_key" not in service_account:
-            raise ConfigError("GOOGLE_SERVICE_ACCOUNT_JSON does not look like a service-account key file")
+        if service_account is not None and ("client_email" not in service_account or "private_key" not in service_account):
+            raise ConfigError("GOOGLE_SERVICE_ACCOUNT_JSON does not look like a service-account key file (no client_email / private_key)")
 
         tz_name = _text("TIMEZONE", "Europe/Istanbul")
         try:
@@ -135,7 +135,7 @@ class Settings:
             telegram_bot_token=_text("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id=_integer("TELEGRAM_CHAT_ID", None),
             telegram_admin_chat_id=_integer("TELEGRAM_ADMIN_CHAT_ID", None),
-            anthropic_api_key=_text("ANTHROPIC_API_KEY"),
+            anthropic_api_key=_text("ANTHROPIC_API_KEY"),  # None → the bot says so
             anthropic_model=_text("ANTHROPIC_MODEL", "claude-sonnet-5"),
             anthropic_effort=effort,
             price_input_per_million=_number("ANTHROPIC_PRICE_INPUT_PER_MILLION", 2.0),

@@ -21,6 +21,8 @@ Telegram group ──► Kashio (Python, always on) ──► Bot_Inbox tab     
 - **Nothing is guessed.** Messages Claude cannot resolve (no amount, unknown currency, a correction to an older message) are flagged `needs_review` in the inbox and listed in the report.
 - **Hand-entered history is never duplicated.** A row dated before the sheet's last recorded date is not written; the message is flagged for review instead.
 - **It only ever appends.** The bot writes below the last used row, checks that the destination cells are empty a moment before writing, and never edits or deletes an existing row of your transactions tab. See Guardrails.
+- **It tells you what is missing.** The bot starts with nothing but a Telegram token. Whatever else is absent or broken (the Google key, a spreadsheet that is not shared, the Anthropic key, the group pairing) is reported in plain words to whoever talks to it, with the fix, by `/status`, `/start` and any command that cannot run. No model is involved in that: plain checks and prewritten sentences.
+- **Photos, voice messages and files are never touched.** Only text is read. A photo without a caption is acknowledged in the inbox as “[photo]”, skipped, and never downloaded, uploaded or sent to Claude. A caption is treated as text.
 
 ## Project layout
 
@@ -85,7 +87,7 @@ Both skip everything dated on or before the sheet's last recorded date (those ro
 The recognised paste format is what Telegram produces when you copy messages; a missing comma or colon, a 12-hour clock, and the Desktop variant (`Name, [01.09.2026 21:14]`) are all accepted:
 
 ```
-Shiva ❤️, [1 Sep 2026 at 21:14:10]:
+Shiva, [1 Sep 2026 at 21:14:10]:
 A101
 2045
 
@@ -100,14 +102,14 @@ All settings are environment variables. Defaults in **bold**.
 
 | Variable | Meaning |
 |---|---|
-| `TELEGRAM_BOT_TOKEN` | From BotFather. Required. |
+| `TELEGRAM_BOT_TOKEN` | From BotFather. The only variable required to start. |
 | `TELEGRAM_CHAT_ID` | Optional. The **group's** chat id (negative number); overrides what `/setup` stored. Every message anyone posts there is recorded. |
 | `TELEGRAM_ADMIN_CHAT_ID` | Optional. Your private chat with the bot for full reports, which is your own Telegram user id; overrides `/setup`. Press Start in that chat once. |
-| `ANTHROPIC_API_KEY` | Required. |
+| `ANTHROPIC_API_KEY` | Needed to sync. Until set, the bot records messages and reports the missing key. |
 | `ANTHROPIC_MODEL` | **`claude-sonnet-5`** |
 | `ANTHROPIC_EFFORT` | Thinking effort, `low`…`max`. **`high`** |
 | `ANTHROPIC_PRICE_INPUT_PER_MILLION`, `ANTHROPIC_PRICE_OUTPUT_PER_MILLION` | USD prices used to estimate cost in the run log. **2.0 / 10.0** |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | The whole key file as one line (single-quoted in a `.env` file). Or `GOOGLE_SERVICE_ACCOUNT_FILE`, a path to the file, for local runs. One of the two is required. |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | The whole key file as one line (single-quoted in a `.env` file). Or `GOOGLE_SERVICE_ACCOUNT_FILE`, a path to the file, for local runs. Needed to store anything; the bot reports it when missing. |
 | `GOOGLE_SHEET_ID` | Optional. From the spreadsheet URL. When empty, the bot finds the spreadsheet shared with the service account through the Drive API (the one containing `SHEET_TAB` if several are shared). |
 | `SHEET_TAB` | Tab that receives transactions; created with a header row if missing. **`Transactions_Trip#2`** |
 | `INBOX_TAB`, `RUNS_TAB`, `CONFIG_TAB` | Hidden tabs the bot creates: raw messages, run log, pairing. **`Bot_Inbox`, `Bot_Runs`, `Bot_Config`** |
@@ -146,7 +148,8 @@ In Telegram:
 | `/setup` | in the group, by a group admin | Pairs the bot with that group and with you. Once. |
 | `/sync` (or `@botname /sync`) | group or private chat | Processes everything pending now. In the group you get the one-line summary; in the private chat the full report. |
 | `/backfill` | private chat | Start pasting older messages. The import starts 20 s after the last part, or at once on `/done`; `/cancel` discards. Members of the paired group only. |
-| `/start`, `/help` | anywhere | Who the bot is talking to, and this list. |
+| `/status` | anywhere | What is connected and what still needs setting up. |
+| `/start`, `/help` | anywhere | Who the bot is talking to, the same status, and this list. |
 
 From a terminal with a `.env` file (`pip install -r requirements.txt` first):
 
@@ -162,6 +165,7 @@ python bot.py                 # run the bot locally (stop it before deploying: t
 
 - The bot only appends to the transactions tab. It finds the last row that holds a date, amount or description, verifies that the destination cells below it are empty immediately before writing, and refuses to write otherwise. It never issues an edit or delete against an existing row, and it never touches columns A and F.
 - Descriptions are written formula-safe: a leading `=`, `+`, `-` or `@` is neutralised.
+- Column C gets the number format of its own currency (₺, €, $, £, or a TOMAN suffix), so the symbol always matches column D.
 - Rows dated before the sheet's last recorded date are never written; they are flagged for you instead.
 - Only one sync runs at a time, and a message is inserted at most once (status column plus de-duplication by id).
 - The bot updates cells only in its own hidden tabs (`Bot_Inbox`, `Bot_Runs`, `Bot_Config`). Share the spreadsheet with the service account and nothing else.
@@ -195,6 +199,10 @@ The tests run offline and cover configuration validation, prompt rendering and t
 
 With Claude Sonnet 5 at $2 per million input tokens and $10 per million output tokens, a household logging about 150 expenses a month costs roughly **$0.15–0.25 a month** in API usage at two syncs a month, and about the same at four. The prompt and schema are about 4,500 tokens per call; output grows with the number of expenses, not with the number of syncs. A measured run with three messages used 4,600 input and 234 output tokens: $0.0115. Each run's token counts and estimated cost are written to `Bot_Runs`.
 
+## Setting up piece by piece
+
+Only `TELEGRAM_BOT_TOKEN` is needed to start the bot. Add the rest in any order and ask it `/status`: it lists each integration with ✅ or ❌ and, for a ❌, the exact fix (which e-mail address to share the spreadsheet with, which variable to set, which command to type). It retries a missing integration every minute, so nothing needs a redeploy once fixed. `python bot.py check` prints the same checklist in the terminal.
+
 ## Limits worth knowing
 
 - Bots cannot read chat history: messages sent before the bot joined are not seen. Use `backfill` with a Telegram Desktop export for those.
@@ -202,3 +210,9 @@ With Claude Sonnet 5 at $2 per million input tokens and $10 per million output t
 - If a message is edited after it was synced, the bot records the edit, warns in the chat, and leaves the sheet unchanged for you to fix by hand.
 - If Telegram upgrades your group to a supergroup, its id changes; update `TELEGRAM_CHAT_ID`.
 - Two people writing a few notes a day stay far below Google Sheets API quotas.
+
+## Author and license
+
+Made by **Hamed Shams** · [www.HamedShams.com](https://www.HamedShams.com)
+
+Released under the [MIT License](LICENSE).

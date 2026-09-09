@@ -1,6 +1,6 @@
 # Kashio — Telegram expense notes to Google Sheets
 
-Revision 6 (8 Sep 2026). Status: **deployed on Railway from GitHub and verified end to end there; unit tests green in CI.** See README.md for setup and the to-do list at the end of this document.
+Revision 7 (9 Sep 2026). Status: **live on Railway; setup guidance, media handling, per-row currency formats, MIT license.** See README.md for setup and the to-do list at the end of this document.
 
 Bot: `@mrkashio_bot` · Repo: `https://github.com/hamed-grantonomy/mrkashio` (linked to Railway) · Target tab: `Transactions_Trip#2` (env `SHEET_TAB`)
 
@@ -20,7 +20,7 @@ Kashio is a small always-on Python service on Railway. It sits in your Telegram 
 ## 2. Architecture
 
 ```
-Telegram group (you + Shiva)                  Your private chat with the bot
+Telegram group (you + partner)                  Your private chat with the bot
         │  long polling                                ▲ full run report, every run
         ▼                                              │
 ┌──────────────────────────────────────────────────────┴───────┐
@@ -159,7 +159,7 @@ python bot.py                 run the bot (what Railway runs)
 | `/setup` | group | group admin | pair the bot with the group and the admin |
 | `/sync` (also `@botname /sync`) | group or private | group members | process everything pending; summary in the group, full report in private |
 | `/backfill` … (`/done` / `/cancel`) | private | group members | paste older messages; Telegram splits long pastes into several messages, so the import starts 20 s after the last part or at once on `/done`; the reply lists every dismissed message; then a sync runs |
-| `/start`, `/help` | anywhere | anyone | state and command list |
+| `/status`, `/start`, `/help` | anywhere | anyone | integration checklist with fixes, and the command list |
 
 ### Messy input the prompt handles
 
@@ -173,6 +173,18 @@ Telegram bots never receive messages sent before they joined, even when the grou
 
 - **Live safety rule.** At each sync the bot reads the latest date in column B. A transaction dated before that date is not written; its message is flagged `needs_review` with the note "dated …, before the sheet's last entry". Same-day and later rows are written normally, so steady-state operation is unaffected.
 - **Backfill by pasting or from a file.** In a private chat, `/backfill` then the messages copied from the Telegram chat (format `Name, [1 Sep 2026 at 21:14:10]:` followed by the text; the Desktop variant `Name, [01.09.2026 21:14]` and an edit time in parentheses are understood), then `/done`; or `python bot.py backfill FILE` with a `.txt` paste or a Telegram Desktop JSON export. `backfill.py` parses both, skips everything whose effective date (after the 04:00 rollover) is on or before the sheet's last recorded date and anything already stored, and queues the rest as pending. Imported ids are negative (a hash of sender, time and text for pastes; the export id for JSON) so they can never collide with live message ids and re-imports are harmless. The Telegram path then runs a sync immediately; the CLI path leaves it to `sync --dry-run` / `sync`. 150 messages per Claude call.
+
+### Setup guidance (no model involved)
+
+Only `TELEGRAM_BOT_TOKEN` is required to start. `Kashio.connect()` tries Google Sheets and Anthropic, remembers each failure as a plain sentence with its fix (which e-mail to share the spreadsheet with, which variable to set, which command to type), retries every minute, and `status_lines()` renders a ✅/❌ checklist. `/status`, `/start` and `/help` show it; `/sync`, `/backfill` and `/setup` show it instead of running when something is missing; a scheduled sync that cannot run sends it to the admin; group messages that cannot be stored trigger the hint at most once an hour. `python bot.py check` prints the same checklist. `GET /health` reports `status: degraded` with the open problems.
+
+### Photos, voice messages and files
+
+Only text is ever read. A non-text message in the group (photo, video, voice, audio, file, sticker, GIF, location, contact, poll) is acknowledged in the inbox with `[kind]`, status `skipped` and the note "not an expense note; the file was not downloaded, uploaded or sent to Claude". Nothing is downloaded, uploaded or forwarded anywhere. A photo with a caption is treated as the caption text. Service messages (joins, pins) are ignored.
+
+### Currency symbols in column C
+
+After writing rows, the bot sets column C's number format per row from column D: `[$₺]#,##0.0`, `[$€]#,##0.0`, `[$$]#,##0.0`, `[$£]#,##0.0`, or `#,##0 "TOMAN"`. Copying the previous row's format alone would show the previous row's symbol. Cosmetic: a failure is logged and never blocks the data write.
 
 ### Health endpoint
 
@@ -192,7 +204,7 @@ Telegram bots never receive messages sent before they joined, even when the grou
 Input to Claude (one per pending message):
 
 ```xml
-<message id="1041" sender="Hamed" sent="2026-07-24 21:46" edited="true">
+<message id="1041" sender="the owner" sent="2026-07-24 21:46" edited="true">
 Gratis
 266 TL
 
@@ -230,7 +242,7 @@ Sheet columns written: **B** date, **C** amount (number), **D** currency, **E** 
 
 ### Categories (column G): read from the sheet at every sync
 
-Column G carries a dropdown fed from the category table in `Summary!B28:B35`, which the Summary's SUMIF formulas also use. The bot imposes no list: at each sync it reads the dropdown's allowed values, drops template placeholders, builds the output schema with exactly those names, and lists them in the prompt with a one-line hint where one is known. Editing the Summary table is all it takes to change categories. On 8 Sep 2026 the list was reduced, with Hamed's approval, to eight MECE names (the planned £750 stays on the housing row):
+Column G carries a dropdown fed from the category table in `Summary!B28:B35`, which the Summary's SUMIF formulas also use. The bot imposes no list: at each sync it reads the dropdown's allowed values, drops template placeholders, builds the output schema with exactly those names, and lists them in the prompt with a one-line hint where one is known. Editing the Summary table is all it takes to change categories. On 8 Sep 2026 the list was reduced, with the owner's approval, to eight MECE names (the planned £750 stays on the housing row):
 
 | Category | Covers |
 |---|---|
@@ -255,7 +267,7 @@ If column G ever has no dropdown, this same list is the built-in fallback (`DEFA
 |---|---|---|---|
 | Gratis 266 TL (24 Jul 21:46) | 24/07/2026 · 266 · TRY · Gratis · Personal Care | same | — |
 | Cafe 385 TL (same message, edited in) | 24/07/2026 · 385 · TRY · Cafe · Eating Out | Cafe (Turk Kahvesi) | detail added by hand |
-| Avm 810 (Shiva) | 24/07/2026 · 810 · TRY · Avm · Shopping | avm (random stuffs for the hause) | detail added by hand |
+| Avm 810 (partner) | 24/07/2026 · 810 · TRY · Avm · Shopping | avm (random stuffs for the hause) | detail added by hand |
 | Cafe IKEA 350 TL | 25/07/2026 · 350 · TRY · Cafe IKEA · Eating Out | same | — |
 | UBER 452 TL | 25/07/2026 · 452 · TRY · UBER · Transport | UBER nach hause (with luggages from Meka) | detail added by hand |
 | A101 300 (26 Jul 01:28) | **25/07/2026** · 300 · TRY · Groceries - A101 · Groceries | Groceries - A101 (oil) | date via 04:00 rollover ✓; "(oil)" by hand |
@@ -265,7 +277,7 @@ If column G ever has no dropdown, this same list is the built-in fallback (`DEFA
 | Cafe 435 TL | 28/07/2026 · 435 · TRY · Cafe · Eating Out | same | — |
 | istanbul card charge 414 TL | 28/07/2026 · 414 · TRY · istanbul card charge · Transport | same | — |
 | A101 100 TL | 28/07/2026 · 100 · TRY · Groceries - A101 · Groceries | same | — |
-| 📅 @Shiva | skipped: no expense | skipped | ✓ |
+| 📅 @partner | skipped: no expense | skipped | ✓ |
 | Barbershop 💈 (arash) 604 TL | 29/07/2026 · 604 · TRY · Barbershop · Personal Care | Barbershop | ✓ emoji and name dropped |
 
 If you want those extra details in the sheet, write them in the Telegram message ("Cafe (Turk Kahvesi) 385") and the bot keeps them verbatim.
@@ -279,7 +291,7 @@ If you want those extra details in the sheet, write them in the Telegram message
 - `/sync` processes everything pending when ≥ `MANUAL_MIN_MESSAGES` (1); otherwise "nothing new".
 - Thinking effort `high`.
 - Messages stored in `Bot_Inbox`; runs in `Bot_Runs`; every run report also sent to your private chat with the bot. No database, no file.
-- Column F (the "By" dropdown: Hamed / Shiva) left empty as asked; column G gets a category read from the sheet's own dropdown, now the eight names above; column D one of TRY, TOMAN, EUR, USD, GBP.
+- Column F (the "By" dropdown: member names) left empty as asked; column G gets a category read from the sheet's own dropdown, now the eight names above; column D one of TRY, TOMAN, EUR, USD, GBP.
 - History: rows dated before the sheet's last entry are flagged, never written; older messages come in through `/backfill` (paste) or `backfill FILE`, strictly after the last recorded day by default.
 - Guardrail: the bot only appends; it verifies the destination cells are empty right before writing and never edits or deletes an existing row of the target tab.
 - Pairing via `/setup`, stored in the sheet; env vars are optional overrides.
@@ -294,7 +306,8 @@ If you want those extra details in the sheet, write them in the Telegram message
 mrkashio/
 ├── bot.py            Telegram handlers (/setup, /sync, /backfill…), schedule, command line
 ├── backfill.py       Parses pasted Telegram messages or a Desktop JSON export; queues them
-├── tests/            Offline pytest suite (config, extractor, sync, sheets guardrail, backfill)
+├── tests/            Offline pytest suite (config, extractor, sync, sheets, backfill, bot routing)
+├── LICENSE           MIT
 ├── .github/workflows/tests.yml   runs the tests on every push
 ├── requirements-dev.txt          requirements + pytest
 ├── sync.py           One sync run: thresholds, dates, rows, sheet writes, report text
@@ -328,7 +341,7 @@ Dependencies: `python-telegram-bot[job-queue]` (Telegram + scheduler), `gspread`
 
 ## 10. Testing status
 
-**Live, 8 Sep 2026, from Hamed's machine with the real credentials:**
+**Live, 8 Sep 2026, from the owner's machine with the real credentials:**
 - `python bot.py check`: Telegram token, group and admin (from env), Sheets access, categories from the dropdown, Anthropic key and schedule all pass. Hidden tabs created; run-log header extended with `merged`.
 - Ingest: the bot ran locally for 45 s and stored three pending group messages, including an edit ("test" → "UBER"); migration service messages were ignored.
 - One sync (the only paid call): 3 pending → 1 row at `Transactions_Trip#2!B153:G153` as a real date 07/09/2026 (02:30 rolled back a day), numeric ₺10.0, TRY, "UBER", F empty, G "Transport"; "10 TL" folded into that row; the greeting skipped; inbox statuses and run log correct; report delivered. 4,600 input / 234 output tokens, $0.0115.
@@ -338,7 +351,7 @@ Dependencies: `python-telegram-bot[job-queue]` (Telegram + scheduler), `gspread`
 
 **Live on Railway, 8 Sep 2026 15:50, first deploy:** the deployed bot consumed the nine updates queued at Telegram; three earlier `/sync` commands with nothing pending were answered "Nothing new to process" and logged as `skipped_threshold`; a fourth `/sync` processed "UBER 2 / 1,000.5 یورو" into row 154 (08/09/2026, 1000.5, EUR, Transport), so Persian currency words and comma-formatted amounts work end to end on the deployed code; a message edited after its sync was marked `edited_after_sync` with a warning, and the sheet left untouched. CI (GitHub Actions) green on the pushed commit.
 
-**Not exercised live:** `/setup` and `/backfill` typed in Telegram, the cron trigger, a Telegram delivery failure, the guardrail's refusal path, and the health endpoint under Railway.
+**Not exercised live:** `/setup`, `/backfill` and `/status` typed in Telegram, the media acknowledgement, the cron trigger, a Telegram delivery failure, the guardrail's refusal path, and the health endpoint under Railway.
 
 ## 11. Deploy to-do
 

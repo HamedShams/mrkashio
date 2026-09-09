@@ -16,12 +16,17 @@ def test_defaults_apply_when_optional_variables_are_absent(monkeypatch):
     assert s.sheet_tab == "Transactions_Trip#2"
 
 
-def test_missing_required_variables_are_all_named(monkeypatch):
+def test_only_the_bot_token_is_required_to_start(monkeypatch):
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN")
-    monkeypatch.delenv("ANTHROPIC_API_KEY")
-    with pytest.raises(ConfigError) as err:
+    with pytest.raises(ConfigError, match="TELEGRAM_BOT_TOKEN"):
         Settings.from_env()
-    assert "TELEGRAM_BOT_TOKEN" in str(err.value) and "ANTHROPIC_API_KEY" in str(err.value)
+
+
+def test_missing_integration_keys_do_not_stop_startup(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    s = Settings.from_env()  # the bot itself reports these as missing, with the fix
+    assert s.anthropic_api_key is None and s.google_service_account is None
 
 
 def test_invalid_effort_is_rejected_with_the_allowed_values(monkeypatch):

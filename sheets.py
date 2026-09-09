@@ -37,6 +37,15 @@ STATUS_EDITED_AFTER_SYNC = "edited_after_sync"
 CONFIG_HEADERS = ("key", "value", "updated_at", "updated_by")
 TARGET_HEADERS = ("", "Date", "Amount", "Currency", "Description", "By", "Category")  # A is left free
 
+# Number format for column C, so the symbol shown matches the currency in column D.
+CURRENCY_FORMATS = {
+    "TRY": ("CURRENCY", "[$₺]#,##0.0"),
+    "EUR": ("CURRENCY", "[$€]#,##0.0"),
+    "USD": ("CURRENCY", "[$$]#,##0.0"),
+    "GBP": ("CURRENCY", "[$£]#,##0.0"),
+    "TOMAN": ("NUMBER", '#,##0 "TOMAN"'),
+}
+
 # Zero-based column bounds of the block we format on the transactions tab: B (1) through G (7, exclusive).
 FIRST_COLUMN_INDEX, END_COLUMN_INDEX = 1, 7
 
@@ -81,6 +90,27 @@ class TransactionRow:
     message_id: int
 
 
+def currency_format_requests(sheet_id: int, start: int, currencies: Sequence[str]) -> list[dict]:
+    """One repeatCell request per run of equal currencies, for column C from row `start` (1-based)."""
+    requests: list[dict] = []
+    index = 0
+    while index < len(currencies):
+        last = index
+        while last + 1 < len(currencies) and currencies[last + 1] == currencies[index]:
+            last += 1
+        fmt = CURRENCY_FORMATS.get(currencies[index])
+        if fmt:
+            kind, pattern = fmt
+            requests.append({"repeatCell": {
+                "range": {"sheetId": sheet_id, "startRowIndex": start - 1 + index, "endRowIndex": start + last,
+                          "startColumnIndex": 2, "endColumnIndex": 3},
+                "cell": {"userEnteredFormat": {"numberFormat": {"type": kind, "pattern": pattern}}},
+                "fields": "userEnteredFormat.numberFormat",
+            }})
+        index = last + 1
+    return requests
+
+
 def _as_date(value: object) -> date | None:
     """A Google Sheets cell as a date: serial numbers (days since 1899-12-30) or common text formats."""
     if isinstance(value, bool):
@@ -101,6 +131,12 @@ class SheetStore:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        if settings.google_service_account is None:
+            raise ConfigError(
+                "GOOGLE_SERVICE_ACCOUNT_JSON is not set. Create a Google service account, download its JSON key, share the "
+                "spreadsheet with the account's e-mail as Editor, and set GOOGLE_SERVICE_ACCOUNT_JSON (the key as one line) "
+                "or GOOGLE_SERVICE_ACCOUNT_FILE (a path to it)."
+            )
         client = gspread.service_account_from_dict(settings.google_service_account)
         self.service_account_email = settings.google_service_account.get("client_email", "the service account")
         self.spreadsheet = self._open_spreadsheet(client)
@@ -204,6 +240,13 @@ class SheetStore:
             except ValueError:
                 continue
         return ids
+
+    def add_media_note(self, message_id: int, sender: str, sent_at: datetime, kind: str) -> None:
+        """Log that a photo, voice message or file was seen and skipped. The file itself is never touched."""
+        now = datetime.now(self.settings.timezone).strftime(TIMESTAMP)
+        row = [str(message_id), sender, sent_at.strftime(TIMESTAMP), "", f"[{kind}]", STATUS_SKIPPED, now, 0,
+               f"{kind}: not an expense note; the file was not downloaded, uploaded or sent to Claude"]
+        _retry(lambda: self.inbox.append_row(row, value_input_option="RAW"))
 
     def update_message(self, message_id: int, text: str, edited_at: datetime) -> str | None:
         """Store the edited text. Returns the status the message had before the edit, or None if it was never stored."""
@@ -353,7 +396,18 @@ class SheetStore:
             {"range": f"G{start}:G{end}", "values": [[r.category] for r in rows]},
         ]
         _retry(lambda: self.target.batch_update(updates, value_input_option="USER_ENTERED"))
+        self._apply_currency_formats(start, [r.currency for r in rows])
         return start, end
+
+    def _apply_currency_formats(self, start: int, currencies: Sequence[str]) -> None:
+        """Make the symbol in column C match column D (the copied format would show the previous row's currency)."""
+        requests = currency_format_requests(self.target.id, start, currencies)
+        if not requests:
+            return
+        try:
+            _retry(lambda: self.spreadsheet.batch_update({"requests": requests}))
+        except APIError as exc:  # cosmetic; never block the data write on it
+            log.warning("Could not set currency formats: %s", exc)
 
     def _assert_empty(self, start: int, end: int) -> None:
         """Guardrail: the bot only ever appends. Refuse to write if the destination rows hold anything but a default currency."""

@@ -40,7 +40,7 @@ def test_unknown_default_currency_is_a_config_error(settings, monkeypatch):
 
 
 def test_build_batch_wraps_each_message_with_its_metadata():
-    messages = [InboxMessage(2, 41, 'Shiva "S"', at(2026, 7, 24, 21, 46), at(2026, 7, 24, 23, 45), "Gratis\n266 TL", "pending")]
+    messages = [InboxMessage(2, 41, 'Sam "S"', at(2026, 7, 24, 21, 46), at(2026, 7, 24, 23, 45), "Gratis\n266 TL", "pending")]
     batch = build_batch(messages)
-    assert batch.startswith('<message id="41" sender="Shiva \'S\'" sent="2026-07-24 21:46" edited="true">')
+    assert batch.startswith('<message id="41" sender="Sam \'S\'" sent="2026-07-24 21:46" edited="true">')
     assert batch.endswith("Gratis\n266 TL\n</message>")

@@ -8,11 +8,14 @@
 
 Telegram commands:
     /setup     in the group, once, by a group admin: pairs the bot with that group and with you
-    /sync      process everything pending now
+    /sync      process everything pending now (also accepted as "@botname /sync")
     /backfill  in a private chat with the bot: paste copied messages; the import starts by itself after a short
                pause, or immediately on /done (/cancel discards)
+    /status    what is connected and what still needs setting up
     /start     who am I talking to, and the commands
 
+The bot starts with nothing but a Telegram token. Anything else that is missing or broken (Google Sheets,
+the Anthropic key, the group pairing) is reported in plain words to whoever talks to it, with the fix.
 A tiny HTTP endpoint answers GET /health on $PORT for Railway's healthcheck.
 """
 
@@ -31,7 +34,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import anthropic
 from apscheduler.triggers.cron import CronTrigger
-from telegram import Bot, Chat, Update, User
+from gspread.exceptions import APIError
+from telegram import Bot, Chat, Message, Update, User
 from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -55,6 +59,8 @@ log = logging.getLogger("kashio")
 
 TELEGRAM_MESSAGE_LIMIT = 4000  # Telegram allows 4096 characters per message
 BACKFILL_QUIET_SECONDS = 20  # a paste split into several messages is imported once nothing new arrives for this long
+RECONNECT_EVERY_SECONDS = 60  # how often a missing integration is retried
+HINT_EVERY_SECONDS = 3600  # how often the group is reminded that something is not set up
 GROUP_ROLES = ("member", "administrator", "creator")
 ADMIN_ROLES = ("administrator", "creator")
 HELP = (
@@ -62,25 +68,116 @@ HELP = (
     "/sync — process everything pending now\n"
     "/backfill — paste older messages (private chat); import starts after a short pause or on /done\n"
     "/setup — in the group, once, to pair me with it\n"
+    "/status — what is connected and what is still missing\n"
     "/start — this message"
 )
 
 
 class Kashio:
-    """Long-lived clients, the pairing configuration, and the rule that only one sync runs at a time."""
+    """Long-lived clients, the pairing configuration, and the rule that only one sync runs at a time.
+
+    Integrations are optional at startup: whatever cannot be reached is remembered as a plain-language
+    problem, retried now and then, and shown to whoever talks to the bot.
+    """
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.store = SheetStore(settings)
-        self.claude = anthropic.Anthropic(api_key=settings.anthropic_api_key)
         self.prompt = load_prompt(settings)
         self.lock = asyncio.Lock()
+        self.store: SheetStore | None = None
+        self.store_error: str | None = None
+        self.claude: anthropic.Anthropic | None = None
+        self.claude_error: str | None = None
         self._config: dict[str, str] = {}
-        self.reload_config()
+        self._last_connect = 0.0
+        self._last_hint: dict[int, float] = {}
+        self.connect(force=True)
+
+    # -- integrations
+    def connect(self, force: bool = False) -> None:
+        """(Re)connect whatever is missing, at most once a minute unless forced."""
+        now = time.monotonic()
+        if not force and now - self._last_connect < RECONNECT_EVERY_SECONDS:
+            return
+        self._last_connect = now
+        if self.store is None:
+            try:
+                self.store = SheetStore(self.settings)
+                self.store_error = None
+                self.reload_config()
+                log.info("Google Sheets connected: %r, tab %r", self.store.spreadsheet.title, self.settings.sheet_tab)
+            except ConfigError as exc:
+                self.store_error = str(exc)
+            except APIError as exc:
+                self.store_error = (f"Google Sheets answered {exc}. Check that the spreadsheet is shared with the "
+                                    f"service account as Editor and that the Google Sheets API is enabled.")
+            except Exception as exc:  # noqa: BLE001 - anything else is still worth explaining rather than crashing
+                self.store_error = f"Google Sheets could not be reached ({type(exc).__name__}: {exc})."
+            if self.store_error:
+                log.warning("Google Sheets not available: %s", self.store_error)
+        if self.claude is None:
+            self.claude_error = self._connect_claude()
+            if self.claude_error:
+                log.warning("Claude not available: %s", self.claude_error)
+
+    def _connect_claude(self) -> str | None:
+        if not self.settings.anthropic_api_key:
+            return "ANTHROPIC_API_KEY is not set. Create a key at console.anthropic.com and add it to the environment."
+        client = anthropic.Anthropic(api_key=self.settings.anthropic_api_key)
+        try:
+            client.models.retrieve(self.settings.anthropic_model)  # free call; proves the key and the model name
+        except anthropic.AuthenticationError:
+            return "ANTHROPIC_API_KEY was rejected by Anthropic. Check the key in the environment."
+        except anthropic.PermissionDeniedError:
+            return f"The Anthropic key is not allowed to use {self.settings.anthropic_model!r}. Check the key's workspace."
+        except anthropic.NotFoundError:
+            return f"Anthropic has no model called {self.settings.anthropic_model!r}. Check ANTHROPIC_MODEL."
+        except (anthropic.APIConnectionError, anthropic.APIStatusError) as exc:
+            log.warning("Anthropic could not be verified right now (%s); assuming it works", type(exc).__name__)
+        self.claude = client
+        return None
+
+    @property
+    def ready(self) -> bool:
+        return self.store is not None and self.claude is not None and self.group_id is not None
+
+    def status_lines(self, bot_username: str | None = None) -> list[str]:
+        """A checklist anyone can act on. No model involved: plain validations and prewritten sentences."""
+        lines = [f"✅ Telegram: connected as @{bot_username}" if bot_username else "✅ Telegram: connected"]
+        if self.store is not None:
+            lines.append(f"✅ Google Sheets: “{self.store.spreadsheet.title}”, tab “{self.settings.sheet_tab}”")
+        else:
+            lines.append(f"❌ Google Sheets: {self.store_error}")
+        if self.claude is not None:
+            lines.append(f"✅ Claude: {self.settings.anthropic_model} ready (effort {self.settings.anthropic_effort})")
+        else:
+            lines.append(f"❌ Claude: {self.claude_error}")
+        if self.group_id is not None:
+            title = self._config.get("group_title") or str(self.group_id)
+            lines.append(f"✅ Paired with group “{title}”")
+        else:
+            lines.append("⚠️ Not paired with a group yet: add me to your group and, as a group admin, type /setup there.")
+        if self.admin_id is not None:
+            lines.append("✅ Full reports go to the admin's private chat")
+        else:
+            lines.append("ℹ️ Full reports go to the group (no admin chat set; /setup sets one)")
+        return lines
+
+    def status_text(self, bot_username: str | None = None) -> str:
+        head = "All set, I'm working." if self.ready else "Not quite ready yet. Here is what I can see:"
+        return head + "\n" + "\n".join(self.status_lines(bot_username))
+
+    def hint_due(self, chat_id: int) -> bool:
+        """True at most once an hour per chat, so a broken setup does not flood the group."""
+        now = time.monotonic()
+        if now - self._last_hint.get(chat_id, -HINT_EVERY_SECONDS) < HINT_EVERY_SECONDS:
+            return False
+        self._last_hint[chat_id] = now
+        return True
 
     # -- pairing: environment variables win, otherwise what /setup stored in the sheet
     def reload_config(self) -> None:
-        self._config = self.store.read_config()
+        self._config = self.store.read_config() if self.store else {}
 
     @property
     def group_id(self) -> int | None:
@@ -99,6 +196,7 @@ class Kashio:
     # -- syncing
     async def sync(self, trigger: str, requested_by: str, dry_run: bool = False) -> RunReport | None:
         """Run a sync in a worker thread. Returns None if another sync is already running."""
+        assert self.store is not None and self.claude is not None, "sync called while not ready"
         if self.lock.locked():
             return None
         async with self.lock:
@@ -165,6 +263,33 @@ def _name(user: User | None) -> str:
     return user.first_name if user else "unknown"
 
 
+def describe_media(message: Message) -> str:
+    """What kind of non-text message this is. Only the kind is ever recorded; the file is never touched."""
+    if message.photo:
+        return "photo"
+    if message.video:
+        return "video"
+    if message.voice:
+        return "voice message"
+    if message.audio:
+        return "audio"
+    if message.animation:
+        return "GIF"
+    if message.document:
+        return f"file {message.document.file_name}" if message.document.file_name else "file"
+    if message.sticker:
+        return "sticker"
+    if message.video_note:
+        return "video note"
+    if message.location:
+        return "location"
+    if message.contact:
+        return "contact"
+    if message.poll:
+        return "poll"
+    return "attachment"
+
+
 # ---------------------------------------------------------------- group: ingest
 
 
@@ -173,13 +298,23 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     message, chat = update.effective_message, update.effective_chat
     if message is None or chat is None:
         return
+    app.connect()
     if app.group_id is None:
         log.info("Not paired yet. Message seen in group %s (%r): a group admin can type /setup there.", chat.id, chat.title)
+        if app.hint_due(chat.id):
+            await message.reply_text("Hi! I'm not paired with a group yet, so I'm not recording anything. "
+                                     "A group admin can type /setup here to pair me with this group.")
         return
     if chat.id != app.group_id:
         return
     text = message.text or message.caption
     if not text:
+        return
+    if app.store is None:
+        log.warning("Message %s not stored: %s", message.message_id, app.store_error)
+        if app.hint_due(chat.id):
+            await message.reply_text("⚠️ I can't reach the spreadsheet, so I'm not recording messages right now.\n"
+                                     f"{app.store_error}\nOnce fixed, edit a message (even slightly) and I'll pick it up.")
         return
     try:
         await asyncio.to_thread(
@@ -190,6 +325,21 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await message.reply_text("⚠️ Kashio couldn't save this message to the sheet. Edit it (even slightly) to retry.")
 
 
+async def on_group_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Photos, voice messages, files: acknowledged in the inbox, never downloaded, never sent anywhere."""
+    app = kashio_of(context)
+    message, chat = update.effective_message, update.effective_chat
+    if message is None or chat is None or app.store is None or chat.id != app.group_id:
+        return
+    kind = describe_media(message)
+    try:
+        await asyncio.to_thread(
+            app.store.add_media_note, message.message_id, _name(message.from_user), message.date.astimezone(app.settings.timezone), kind
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("Could not log %s message %s", kind, message.message_id)
+
+
 async def on_group_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     app = kashio_of(context)
     message = update.edited_message
@@ -198,10 +348,14 @@ async def on_group_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     text = message.text or message.caption
     if not text:
         return
+    app.connect()
+    if app.store is None:
+        log.warning("Edit of %s not stored: %s", message.message_id, app.store_error)
+        return
     edited_at = (message.edit_date or message.date).astimezone(app.settings.timezone)
     try:
         previous = await asyncio.to_thread(app.store.update_message, message.message_id, text, edited_at)
-        if previous is None:  # never stored, e.g. sent while the bot was offline for more than a day
+        if previous is None:  # never stored, e.g. sent while the bot was offline or the sheet unreachable
             await asyncio.to_thread(
                 app.store.add_message, message.message_id, _name(message.from_user), message.date.astimezone(app.settings.timezone), text
             )
@@ -223,22 +377,24 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat, message, user = update.effective_chat, update.effective_message, update.effective_user
     if chat is None or message is None:
         return
-    lines = ["Hi, I'm Kashio. I file the expense notes from your group into your Google Sheet."]
-    if chat.type == Chat.PRIVATE:
-        if user and user.id == app.admin_id:
-            lines.append("Sync reports arrive here.")
-        elif app.admin_id is None and app.group_id is None:
-            lines.append("I'm not paired with a group yet. Add me to your group and, as a group admin, type /setup there.")
-        lines.append(f"(This chat's id is {chat.id}.)")
-    else:
-        lines.append(
-            "I'm recording this group." if chat.id == app.group_id
-            else "A group admin can type /setup here to pair me with this group." if app.group_id is None
-            else "I'm paired with a different group."
-        )
-        lines.append(f"(This group's id is {chat.id}.)")
+    app.connect()
+    lines = ["Hi, I'm Kashio. I file the expense notes from your group into your Google Sheet.", ""]
+    lines.append(app.status_text(context.bot.username))
+    if chat.type == Chat.PRIVATE and user and user.id == app.admin_id:
+        lines.append("Sync reports arrive in this chat.")
+    lines.append(f"(This chat's id is {chat.id}.)")
+    lines.append("")
     lines.append(HELP)
-    await message.reply_text("\n".join(lines))
+    await deliver(context.bot, chat.id, "\n".join(lines))
+
+
+async def on_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = kashio_of(context)
+    message = update.effective_message
+    if message is None:
+        return
+    app.connect(force=True)
+    await deliver(context.bot, message.chat_id, app.status_text(context.bot.username))
 
 
 async def on_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -248,6 +404,11 @@ async def on_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if chat.type not in (Chat.GROUP, Chat.SUPERGROUP):
         await message.reply_text("Run /setup inside the group you want me to record.")
+        return
+    app.connect(force=True)
+    if app.store is None:
+        await message.reply_text("I can't save the pairing yet, because the spreadsheet is not reachable:\n"
+                                 f"{app.store_error}\nFix that first, then run /setup again.")
         return
     if app.settings.telegram_chat_id is not None:
         same = chat.id == app.settings.telegram_chat_id
@@ -275,7 +436,7 @@ async def on_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("Paired with group %s (%r); admin %s (%s)", chat.id, chat.title, user.first_name, user.id)
     await message.reply_text(
         f"Set up. From now on I record every message in this group; sync runs on the schedule and on /sync.\n"
-        f"Full reports go to {user.first_name} privately."
+        f"Full reports go to {user.first_name} privately.\n\n" + app.status_text(context.bot.username)
     )
     if not await deliver(context.bot, user.id, "Hi! Your Kashio sync reports will arrive here.\n" + HELP):
         await message.reply_text(f"{user.first_name}, open @{context.bot.username} and press Start so I can message you privately.")
@@ -286,11 +447,18 @@ async def on_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat, message, user = update.effective_chat, update.effective_message, update.effective_user
     if chat is None or message is None:
         return
+    app.connect()
     if chat.type == Chat.PRIVATE:
         if not await app.is_household_member(context.bot, user):
-            await message.reply_text("I only work for members of my paired group." if app.group_id else "I'm not paired with a group yet: a group admin has to type /setup in the group first.")
+            await message.reply_text("I only work for members of my paired group." if app.group_id else
+                                     "I'm not paired with a group yet: a group admin has to type /setup in the group first.")
             return
     elif chat.id != app.group_id:
+        if app.group_id is None and app.hint_due(chat.id):
+            await message.reply_text("I'm not paired with a group yet. A group admin can type /setup here.")
+        return
+    if not app.ready:
+        await deliver(context.bot, chat.id, "I can't sync yet.\n" + app.status_text(context.bot.username))
         return
     report = await app.sync(TRIGGER_MANUAL, _name(user))
     if report is None:
@@ -309,10 +477,15 @@ async def on_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if chat.type != Chat.PRIVATE:
         await message.reply_text("Please use /backfill in a private chat with me, so pasted history does not mix with live notes.")
         return
+    app.connect()
     if not await app.is_household_member(context.bot, user):
         await message.reply_text("Only members of the paired group can import history.")
         return
-    body = message.text.split(maxsplit=1)[1] if len(message.text.split(maxsplit=1)) > 1 else ""
+    if not app.ready:
+        await deliver(context.bot, chat.id, "I can't import yet.\n" + app.status_text(context.bot.username))
+        return
+    parts = message.text.split(maxsplit=1)
+    body = parts[1] if len(parts) > 1 else ""
     if body.strip():
         await process_backfill(app, context.bot, chat.id, _name(user), body)
         return
@@ -321,7 +494,7 @@ async def on_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "Paste the copied messages now, in as many messages as you need (Telegram splits long pastes itself).\n"
         f"I start the import {BACKFILL_QUIET_SECONDS} seconds after the last part arrives, or right away on /done. /cancel discards.\n\n"
         "Expected format, as copied from a Telegram chat:\n"
-        "Shiva ❤️, [1 Sep 2026 at 21:14:10]:\nA101\n2045"
+        "Sam, [1 Sep 2026 at 21:14:10]:\nA101\n2045"
     )
 
 
@@ -331,7 +504,9 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     capture = context.chat_data.get("capture")
     if capture is None:
-        await message.reply_text("I only read the group. " + HELP)
+        app = kashio_of(context)
+        app.connect()
+        await deliver(context.bot, message.chat_id, "I only read the group; here I answer commands.\n\n" + app.status_text(context.bot.username) + "\n\n" + HELP)
         return
     capture.append(message.text)
     _schedule_auto_finish(context, message.chat_id)
@@ -381,10 +556,13 @@ async def on_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def process_backfill(app: Kashio, bot: Bot, chat_id: int, requested_by: str, content: str) -> None:
     """Parse pasted history, queue it, and run a sync right away."""
+    if not app.ready:
+        await deliver(bot, chat_id, "I can't import yet.\n" + app.status_text(bot.username))
+        return
     parsed = parse(content, app.settings)
     if not parsed.messages:
         await deliver(bot, chat_id, "I couldn't recognise any messages. Copy them from the Telegram chat so each starts with a line like:\n"
-                                    "Hamed Shams, [3 Sep 2026 at 09:59:44]:\nfollowed by the message text. Nothing was imported.")
+                                    "Sam, [3 Sep 2026 at 09:59:44]:\nfollowed by the message text. Nothing was imported.")
         return
     result = await asyncio.to_thread(import_messages, app.store, app.settings, parsed.messages)
     text = result.describe()
@@ -404,6 +582,13 @@ async def process_backfill(app: Kashio, bot: Bot, chat_id: int, requested_by: st
 
 async def scheduled_sync(context: ContextTypes.DEFAULT_TYPE) -> None:
     app = kashio_of(context)
+    app.connect(force=True)
+    if not app.ready:
+        log.warning("Scheduled sync skipped, not ready:\n%s", "\n".join(app.status_lines()))
+        target = app.admin_id or app.group_id
+        if target is not None:
+            await deliver(context.bot, target, "Scheduled sync skipped.\n" + app.status_text(context.bot.username))
+        return
     report = await app.sync(TRIGGER_SCHEDULE, "schedule")
     if report is None:
         log.warning("Scheduled sync skipped: another sync is running")
@@ -426,6 +611,7 @@ def build_application(app: Kashio) -> Application:
     application.bot_data["kashio"] = app
     application.add_handler(CommandHandler("start", on_start))
     application.add_handler(CommandHandler("help", on_start))
+    application.add_handler(CommandHandler("status", on_status))
     application.add_handler(CommandHandler("setup", on_setup))
     application.add_handler(CommandHandler("sync", on_sync))
     application.add_handler(CommandHandler("backfill", on_backfill))
@@ -434,8 +620,10 @@ def build_application(app: Kashio) -> Application:
     # "@botname /sync" is not a Telegram command (commands start with "/"), but people type it; treat it as /sync.
     application.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.Regex(r"(?i)^@\w+\s*/sync\b"), on_sync))
     text = (filters.TEXT | filters.CAPTION) & ~filters.COMMAND
+    groups_new = filters.ChatType.GROUPS & filters.UpdateType.MESSAGE
     application.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.UpdateType.EDITED_MESSAGE & text, on_group_edit))
-    application.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.UpdateType.MESSAGE & text, on_group_message))
+    application.add_handler(MessageHandler(groups_new & text, on_group_message))
+    application.add_handler(MessageHandler(groups_new & ~filters.TEXT & ~filters.CAPTION & ~filters.StatusUpdate.ALL, on_group_media))
     application.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND, on_private_text))
     application.job_queue.run_custom(scheduled_sync, job_kwargs={"trigger": cron_trigger(app.settings)}, name="scheduled_sync")
     return application
@@ -452,11 +640,12 @@ def start_health_server(app: Kashio, port: int) -> None:
                 self.end_headers()
                 return
             body = json.dumps({
-                "status": "ok",
+                "status": "ok" if app.ready else "degraded",
                 "uptime_seconds": int(time.time() - started),
                 "paired": app.group_id is not None,
                 "syncing": app.lock.locked(),
-                "spreadsheet": app.store.spreadsheet.title,
+                "spreadsheet": app.store.spreadsheet.title if app.store else None,
+                "problems": [line for line in app.status_lines() if not line.startswith("✅")],
             }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -477,14 +666,13 @@ def start_health_server(app: Kashio, port: int) -> None:
 
 
 def run_bot(settings: Settings) -> None:
-    app = Kashio(settings)  # connects to the sheet now, so a bad key fails fast
+    app = Kashio(settings)  # never fails on missing integrations; it reports them instead
     application = build_application(app)
     start_health_server(app, int(os.environ.get("PORT", "8080")))
     next_run = cron_trigger(settings).get_next_fire_time(None, datetime.now(settings.timezone))
-    if app.group_id is None:
-        log.warning("Not paired with a group yet: add me to the group and type /setup there as a group admin.")
-    log.info("Kashio is running. Spreadsheet: %r · tab: %r · group: %s · admin: %s · schedule: %s (%s) · next sync: %s",
-             app.store.spreadsheet.title, settings.sheet_tab, app.group_id, app.admin_id, settings.sync_cron, settings.timezone.key, next_run)
+    for line in app.status_lines():
+        log.info(line)
+    log.info("Kashio is running. Schedule: %s (%s) · next sync: %s", settings.sync_cron, settings.timezone.key, next_run)
     application.run_polling(allowed_updates=[Update.MESSAGE, Update.EDITED_MESSAGE])
 
 
@@ -503,28 +691,22 @@ def check(settings: Settings) -> int:
     except Exception as exc:  # noqa: BLE001
         report("Telegram", f"{type(exc).__name__}: {exc}", ok=False)
 
-    app: Kashio | None = None
-    try:
-        app = Kashio(settings)
+    app = Kashio(settings)
+    if app.store is not None:
         source = "GOOGLE_SHEET_ID" if settings.google_sheet_id else "found via the Drive API"
         report("Google Sheets", f"spreadsheet {app.store.spreadsheet.title!r} ({source}), tab {settings.sheet_tab!r}, "
                                 f"last used row {app.store.last_used_row()}, {len(app.store.pending_messages())} pending")
         categories = clean_categories(app.store.category_options())
         report("Categories", f"{len(categories)} from the column-G dropdown: {', '.join(categories)}")
-    except Exception as exc:  # noqa: BLE001
-        report("Google Sheets", f"{type(exc).__name__}: {exc}", ok=False)
-
-    if app is not None:
-        report("Group", f"{app.group_id} ({app.source_of('group_id')})" if app.group_id else
-               "not paired: add the bot to the group and type /setup there, or set TELEGRAM_CHAT_ID", ok=app.group_id is not None)
-        report("Admin", f"{app.admin_id} ({app.source_of('admin_id')})" if app.admin_id else "not set; reports go to the group")
-
-    try:
-        model = anthropic.Anthropic(api_key=settings.anthropic_api_key).models.retrieve(settings.anthropic_model)
-        report("Anthropic", f"key works, model {model.display_name}, effort {settings.anthropic_effort}")
-    except Exception as exc:  # noqa: BLE001
-        report("Anthropic", f"{type(exc).__name__}: {exc}", ok=False)
-
+    else:
+        report("Google Sheets", app.store_error or "not connected", ok=False)
+    report("Group", f"{app.group_id} ({app.source_of('group_id')})" if app.group_id else
+           "not paired: add the bot to the group and type /setup there, or set TELEGRAM_CHAT_ID", ok=app.group_id is not None)
+    report("Admin", f"{app.admin_id} ({app.source_of('admin_id')})" if app.admin_id else "not set; reports go to the group")
+    if app.claude is not None:
+        report("Anthropic", f"key works, model {settings.anthropic_model}, effort {settings.anthropic_effort}")
+    else:
+        report("Anthropic", app.claude_error or "not connected", ok=False)
     try:
         next_run = cron_trigger(settings).get_next_fire_time(None, datetime.now(settings.timezone))
         report("Schedule", f"{settings.sync_cron!r} ({settings.timezone.key}), next run {next_run:%Y-%m-%d %H:%M}, "
@@ -536,26 +718,34 @@ def check(settings: Settings) -> int:
     return 0 if failures == 0 else 1
 
 
-async def cli_sync(settings: Settings, dry_run: bool) -> None:
+async def cli_sync(settings: Settings, dry_run: bool) -> int:
     app = Kashio(settings)
+    if not app.ready:
+        print(app.status_text())
+        return 1
     report = await app.sync(TRIGGER_CLI, "terminal", dry_run=dry_run)
     assert report is not None
     print(format_report(report, include_rows=dry_run))
     if not dry_run:
         async with Bot(settings.telegram_bot_token) as bot:
             await app.notify(bot, report)
+    return 0
 
 
 def cli_backfill(settings: Settings, path: str, since: date | None) -> int:
     """Queue older messages from a file: a pasted dump saved as text, or a Telegram Desktop result.json."""
+    app = Kashio(settings)
+    if app.store is None:
+        print(app.status_text())
+        return 1
     with open(path, encoding="utf-8") as handle:
         content = handle.read()
     parsed = parse(content, settings)
     if not parsed.messages:
-        print("No messages recognised. Expected lines like:  Hamed Shams, [3 Sep 2026 at 09:59:44]:  followed by the message text,"
+        print("No messages recognised. Expected lines like:  Sam, [3 Sep 2026 at 09:59:44]:  followed by the message text,"
               " or a Telegram Desktop JSON export.")
         return 1
-    result = import_messages(SheetStore(settings), settings, parsed.messages, since)
+    result = import_messages(app.store, settings, parsed.messages, since)
     print(result.describe())
     if parsed.problems():
         print(parsed.problems())
@@ -587,7 +777,7 @@ def main() -> None:
         if args.command == "check":
             sys.exit(check(settings))
         elif args.command == "sync":
-            asyncio.run(cli_sync(settings, args.dry_run))
+            sys.exit(asyncio.run(cli_sync(settings, args.dry_run)))
         elif args.command == "backfill":
             sys.exit(cli_backfill(settings, args.file, args.since))
         else:

@@ -35,7 +35,7 @@ def parsed(*results):
 
 
 def report_for(trigger=TRIGGER_MANUAL):
-    r = RunReport(trigger, "Hamed", at(2026, 9, 8, 9), "claude-sonnet-5", "high")
+    r = RunReport(trigger, "Alex", at(2026, 9, 8, 9), "claude-sonnet-5", "high")
     r.categories = CATEGORIES
     return r
 
@@ -59,11 +59,11 @@ def test_override_date_is_parsed_or_ignored():
 
 def test_apply_pairs_amount_messages_skips_noise_and_flags_doubt(settings):
     pending = [
-        InboxMessage(2, 2, "Hamed", at(2026, 9, 8, 2, 30), None, "UBER", "pending"),
-        InboxMessage(3, 3, "Hamed", at(2026, 9, 8, 2, 37), None, "10 TL", "pending"),
-        InboxMessage(4, 4, "Hamed", at(2026, 9, 8, 2, 47), None, "hi", "pending"),
-        InboxMessage(5, 5, "Shiva", at(2026, 9, 8, 12, 0), None, "Cafe", "pending"),
-        InboxMessage(6, 6, "Shiva", at(2026, 9, 8, 13, 0), None, "never answered", "pending"),
+        InboxMessage(2, 2, "Alex", at(2026, 9, 8, 2, 30), None, "UBER", "pending"),
+        InboxMessage(3, 3, "Alex", at(2026, 9, 8, 2, 37), None, "10 TL", "pending"),
+        InboxMessage(4, 4, "Alex", at(2026, 9, 8, 2, 47), None, "hi", "pending"),
+        InboxMessage(5, 5, "Sam", at(2026, 9, 8, 12, 0), None, "Cafe", "pending"),
+        InboxMessage(6, 6, "Sam", at(2026, 9, 8, 13, 0), None, "never answered", "pending"),
     ]
     results = parsed(
         result(2, [tx("UBER", 10, "Transport")]),
@@ -81,7 +81,7 @@ def test_apply_pairs_amount_messages_skips_noise_and_flags_doubt(settings):
 
 
 def test_apply_never_writes_rows_dated_before_the_sheets_last_entry(settings):
-    pending = [InboxMessage(2, -900, "Shiva", at(2026, 7, 20), None, "old cafe 100", "pending")]
+    pending = [InboxMessage(2, -900, "Sam", at(2026, 7, 20), None, "old cafe 100", "pending")]
     report = report_for()
     report.last_recorded = date(2026, 7, 29)
     marks = _apply(Extraction(parsed(result(-900, [tx("old cafe", 100, "Eating Out")])), 1, 1), pending, settings, report)
