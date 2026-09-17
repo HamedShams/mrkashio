@@ -241,31 +241,41 @@ class SheetStore:
                 continue
         return ids
 
-    def add_media_note(self, message_id: int, sender: str, sent_at: datetime, kind: str) -> None:
-        """Log that a photo, voice message or file was seen and skipped. The file itself is never touched."""
+    def add_skipped(self, message_id: int, sender: str, sent_at: datetime, label: str, reason: str) -> None:
+        """Log that a message was seen and skipped without storing its content: media, or a private note."""
         now = datetime.now(self.settings.timezone).strftime(TIMESTAMP)
-        row = [str(message_id), sender, sent_at.strftime(TIMESTAMP), "", f"[{kind}]", STATUS_SKIPPED, now, 0,
-               f"{kind}: not an expense note; the file was not downloaded, uploaded or sent to Claude"]
+        row = [str(message_id), sender, sent_at.strftime(TIMESTAMP), "", f"[{label}]", STATUS_SKIPPED, now, 0, reason]
         _retry(lambda: self.inbox.append_row(row, value_input_option="RAW"))
 
-    def update_message(self, message_id: int, text: str, edited_at: datetime) -> str | None:
-        """Store the edited text. Returns the status the message had before the edit, or None if it was never stored."""
+    def update_message(self, message_id: int, text: str, edited_at: datetime, retire_reason: str | None = None) -> str | None:
+        """Store an edit and return the message's resulting status, or None if it was never stored.
+
+        - still pending: the text is replaced (or, with `retire_reason`, the message is closed as skipped)
+        - skipped or flagged without any row written: reopened as pending, so the next sync looks at it again
+        - already turned into sheet rows: frozen as `edited_after_sync`; the sheet is never changed behind your back
+        """
         cell = _retry(lambda: self.inbox.find(str(message_id), in_column=1))
         if cell is None:
             return None
-        previous = (_retry(lambda: self.inbox.row_values(cell.row)) + [""] * 9)[5] or STATUS_PENDING
+        values = _retry(lambda: self.inbox.row_values(cell.row)) + [""] * len(INBOX_HEADERS)
+        previous = values[5] or STATUS_PENDING
+        rows_added = int(values[7] or 0) if str(values[7] or "0").isdigit() else 1
+        now = datetime.now(self.settings.timezone).strftime(TIMESTAMP)
         updates = [{"range": f"D{cell.row}:E{cell.row}", "values": [[edited_at.strftime(TIMESTAMP), text]]}]
-        if previous != STATUS_PENDING:
-            updates.append({
-                "range": f"F{cell.row}",
-                "values": [[STATUS_EDITED_AFTER_SYNC]],
-            })
-            updates.append({
-                "range": f"I{cell.row}",
-                "values": [[f"edited after sync (was {previous}); sheet not changed"]],
-            })
+        reopenable = previous == STATUS_PENDING or (previous in (STATUS_SKIPPED, STATUS_NEEDS_REVIEW) and rows_added == 0)
+        if reopenable and retire_reason:
+            status = STATUS_SKIPPED
+            updates.append({"range": f"F{cell.row}:I{cell.row}", "values": [[status, now, 0, retire_reason]]})
+        elif reopenable:
+            status = STATUS_PENDING
+            if previous != STATUS_PENDING:
+                updates.append({"range": f"F{cell.row}:I{cell.row}", "values": [[status, "", "", "reopened after an edit"]]})
+        else:
+            status = STATUS_EDITED_AFTER_SYNC
+            updates.append({"range": f"F{cell.row}", "values": [[status]]})
+            updates.append({"range": f"I{cell.row}", "values": [[f"edited after sync (was {previous}); sheet not changed"]]})
         _retry(lambda: self.inbox.batch_update(updates))
-        return previous
+        return status
 
     def pending_messages(self) -> list[InboxMessage]:
         rows = _retry(self.inbox.get_all_values)
@@ -280,14 +290,20 @@ class SheetStore:
                 continue
             if status != STATUS_PENDING or message_id in seen:  # a retried append could store a message twice
                 continue
+            try:
+                parsed_sent = self._parse_timestamp(sent_at)
+                parsed_edited = self._parse_timestamp(edited_at) if edited_at else None
+            except ValueError:
+                log.warning("Inbox row %s has an unreadable timestamp (%r); skipping it", index, sent_at)
+                continue
             seen.add(message_id)
             pending.append(
                 InboxMessage(
                     row=index,
                     message_id=message_id,
                     sender=sender,
-                    sent_at=self._parse_timestamp(sent_at),
-                    edited_at=self._parse_timestamp(edited_at) if edited_at else None,
+                    sent_at=parsed_sent,
+                    edited_at=parsed_edited,
                     text=text,
                     status=status,
                 )

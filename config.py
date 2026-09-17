@@ -106,6 +106,7 @@ class Settings:
     scheduled_min_messages: int
     manual_min_messages: int
     post_summary: bool
+    note_keyword: str  # text from this word to the end of a message is a private note: never stored, never sent to Claude
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -153,4 +154,5 @@ class Settings:
             scheduled_min_messages=max(1, _integer("SCHEDULED_MIN_MESSAGES", 5)),
             manual_min_messages=max(1, _integer("MANUAL_MIN_MESSAGES", 1)),
             post_summary=_flag("POST_SUMMARY", True),
+            note_keyword=(_text("NOTE_KEYWORD", "#note") or "#note").strip(),
         )

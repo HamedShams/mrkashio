@@ -22,6 +22,7 @@ Telegram group ──► Kashio (Python, always on) ──► Bot_Inbox tab     
 - **Hand-entered history is never duplicated.** A row dated before the sheet's last recorded date is not written; the message is flagged for review instead.
 - **It only ever appends.** The bot writes below the last used row, checks that the destination cells are empty a moment before writing, and never edits or deletes an existing row of your transactions tab. See Guardrails.
 - **It tells you what is missing.** The bot starts with nothing but a Telegram token. Whatever else is absent or broken (the Google key, a spreadsheet that is not shared, the Anthropic key, the group pairing) is reported in plain words to whoever talks to it, with the fix, by `/status`, `/start` and any command that cannot run. No model is involved in that: plain checks and prewritten sentences.
+- **Private notes stay private.** Anything from the word `#note` to the end of a message is a note for the humans: it is never stored, never sent to Claude, and a message that is only a note leaves nothing but a “[note]” acknowledgement in the inbox. The word is configurable (`NOTE_KEYWORD`).
 - **Photos, voice messages and files are never touched.** Only text is read. A photo without a caption is acknowledged in the inbox as “[photo]”, skipped, and never downloaded, uploaded or sent to Claude. A caption is treated as text.
 
 ## Project layout
@@ -120,6 +121,7 @@ All settings are environment variables. Defaults in **bold**.
 | `DAY_ROLLOVER_HOUR` | Messages before this hour count for the previous day. **4** |
 | `DEFAULT_CURRENCY` | Used when no currency is written. **`TRY`** |
 | `POST_SUMMARY` | Post a one-line summary in the group after each sync. **`true`** |
+| `NOTE_KEYWORD` | Word that turns the rest of a message into a private note, never stored or sent to Claude. **`#note`** |
 | `PORT` | Set by Railway. The `/health` endpoint listens here. **8080** |
 
 ### Categories and currencies
@@ -161,6 +163,20 @@ python bot.py backfill FILE   # queue older messages from a paste (.txt) or a Te
 python bot.py                 # run the bot locally (stop it before deploying: two pollers on one token conflict)
 ```
 
+## Private notes
+
+Sometimes a message is for the two of you, not for the sheet. Put `#note` in front of that part and the bot drops it before anything is stored:
+
+```
+Gratis 266 TL #note birthday present, don't tell
+→ recorded as “Gratis”, 266 TRY. The note is gone; it never reached the sheet or Claude.
+
+#note let's review the budget on Friday
+→ nothing recorded; the inbox shows a “[note]” line so you can see it was seen and skipped.
+```
+
+The keyword is matched as a whole word, in any case, anywhere in the message, and everything after it is dropped. Editing a pending message to start with `#note` retires it. The same rule applies to imported history. Change the word with `NOTE_KEYWORD`.
+
 ## Guardrails
 
 - The bot only appends to the transactions tab. It finds the last row that holds a date, amount or description, verifies that the destination cells below it are empty immediately before writing, and refuses to write otherwise. It never issues an edit or delete against an existing row, and it never touches columns A and F.
@@ -193,7 +209,7 @@ The tests run offline and cover configuration validation, prompt rendering and t
 | `merged` | Folded into another message's transaction, for example an amount sent as a separate message, or a correction. |
 | `skipped` | Not an expense (chit-chat, a recap, a test message). |
 | `needs_review` | Claude was not sure, or the row was dated before the sheet's last entry. Nothing written for the doubtful part; the note says why. |
-| `edited_after_sync` | The message was edited after its row was written; fix the row by hand. |
+| `edited_after_sync` | The message was edited after its rows were written; fix the row by hand. (A skipped or flagged message edited later goes back to `pending` instead.) |
 
 ## Cost
 
@@ -207,7 +223,7 @@ Only `TELEGRAM_BOT_TOKEN` is needed to start the bot. Add the rest in any order 
 
 - Bots cannot read chat history: messages sent before the bot joined are not seen. Use `backfill` with a Telegram Desktop export for those.
 - Telegram does not notify bots about deleted messages. To retract a note before a sync, edit it to say "ignore" or "cancelled".
-- If a message is edited after it was synced, the bot records the edit, warns in the chat, and leaves the sheet unchanged for you to fix by hand.
+- Edits are safe. Editing a pending message replaces its text. Editing a message that was skipped or flagged (no row written yet) makes it pending again, so the next sync looks at it. Editing a message that already produced sheet rows only records the edit and warns you; the sheet is never changed behind your back.
 - If Telegram upgrades your group to a supergroup, its id changes; update `TELEGRAM_CHAT_ID`.
 - Two people writing a few notes a day stay far below Google Sheets API quotas.
 

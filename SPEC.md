@@ -1,6 +1,6 @@
 # Kashio — Telegram expense notes to Google Sheets
 
-Revision 7 (9 Sep 2026). Status: **live on Railway; setup guidance, media handling, per-row currency formats, MIT license.** See README.md for setup and the to-do list at the end of this document.
+Revision 8 (17 Sep 2026). Status: **live on Railway; private-note keyword, stricter private-chat privacy, review pass.** See README.md for setup and the to-do list at the end of this document.
 
 Bot: `@mrkashio_bot` · Repo: `https://github.com/hamed-grantonomy/mrkashio` (linked to Railway) · Target tab: `Transactions_Trip#2` (env `SHEET_TAB`)
 
@@ -126,7 +126,7 @@ Chunks of at most 150 messages per call. Token usage from `response.usage` goes 
 - Accept messages only from the paired group. Everything else is ignored.
 - Until paired, the bot logs group messages with a hint to run `/setup` and records nothing. `/start` explains the state in any chat.
 - New message (text or photo caption): append a row to `Bot_Inbox` with `message_id, sender, sent_at, edited_at, text, status=pending`.
-- Edited message: find the row by `message_id`, replace text and `edited_at`. If already processed, set status `edited_after_sync` and warn in the chat so you fix the sheet by hand. If the message was never stored (for example sent while the bot was offline), store it as new.
+- Edited message: find the row by `message_id`, replace text and `edited_at`. Still pending: text replaced. Skipped or flagged without rows: reopened as `pending`. Already turned into rows: `edited_after_sync` plus a warning in the chat (the bot never changes the sheet behind your back). Never stored (sent while the bot was offline): stored as new. An edit into a note (`NOTE_KEYWORD`) retires a pending message.
 - Sheets write fails: retry 3 times with backoff, then reply "couldn't save this message; edit it to retry".
 
 ### Sync (on `SYNC_CRON` or `/sync`)
@@ -177,6 +177,10 @@ Telegram bots never receive messages sent before they joined, even when the grou
 ### Setup guidance (no model involved)
 
 Only `TELEGRAM_BOT_TOKEN` is required to start. `Kashio.connect()` tries Google Sheets and Anthropic, remembers each failure as a plain sentence with its fix (which e-mail to share the spreadsheet with, which variable to set, which command to type), retries every minute, and `status_lines()` renders a ✅/❌ checklist. `/status`, `/start` and `/help` show it; `/sync`, `/backfill` and `/setup` show it instead of running when something is missing; a scheduled sync that cannot run sends it to the admin; group messages that cannot be stored trigger the hint at most once an hour. `python bot.py check` prints the same checklist. `GET /health` reports `status: degraded` with the open problems.
+
+### Private notes (`NOTE_KEYWORD`, default `#note`)
+
+`split_note()` cuts everything from the keyword (whole word, any case, anywhere in the message) to the end before a message is stored. A message that is only a note is acknowledged in the inbox as `[note]`, status `skipped`, with the reason "private note; its content was not stored and not sent to Claude". Editing a pending message into a note retires it the same way. Imports apply the same rule and report how many notes they skipped. The keyword is an environment variable so other households can pick their own word.
 
 ### Photos, voice messages and files
 
@@ -351,7 +355,9 @@ Dependencies: `python-telegram-bot[job-queue]` (Telegram + scheduler), `gspread`
 
 **Live on Railway, 8 Sep 2026 15:50, first deploy:** the deployed bot consumed the nine updates queued at Telegram; three earlier `/sync` commands with nothing pending were answered "Nothing new to process" and logged as `skipped_threshold`; a fourth `/sync` processed "UBER 2 / 1,000.5 یورو" into row 154 (08/09/2026, 1000.5, EUR, Transport), so Persian currency words and comma-formatted amounts work end to end on the deployed code; a message edited after its sync was marked `edited_after_sync` with a warning, and the sheet left untouched. CI (GitHub Actions) green on the pushed commit.
 
-**Not exercised live:** `/setup`, `/backfill` and `/status` typed in Telegram, the media acknowledgement, the cron trigger, a Telegram delivery failure, the guardrail's refusal path, and the health endpoint under Railway.
+**Verified live by 17 Sep 2026:** the scheduled trigger (15 Sep 09:00, 10 messages → rows 159–168, 2 skipped), the media acknowledgement (`[photo]`), several manual `/sync` runs, `edited_after_sync` on real edits, and a week of production use.
+
+**Not exercised live:** `/setup`, `/backfill` and `/status` typed in Telegram, the note acknowledgement, a Telegram delivery failure, the guardrail's refusal path, and the health endpoint under Railway.
 
 ## 11. Deploy to-do
 

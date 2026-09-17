@@ -42,7 +42,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 from backfill import import_messages, parse
 from config import ConfigError, Settings
 from extractor import MAX_MESSAGES_PER_CALL, clean_categories, load_prompt
-from sheets import STATUS_PENDING, SheetStore
+from sheets import STATUS_EDITED_AFTER_SYNC, SheetStore
 from sync import (
     STATUS_FAILED,
     STATUS_OK,
@@ -53,6 +53,7 @@ from sync import (
     format_report,
     format_summary,
     run_sync,
+    split_note,
 )
 
 log = logging.getLogger("kashio")
@@ -71,6 +72,9 @@ HELP = (
     "/status — what is connected and what is still missing\n"
     "/start — this message"
 )
+NOTE_REASON = "private note ({keyword}); its content was not stored and not sent to Claude"
+MEDIA_REASON = "{kind}: not an expense note; the file was not downloaded, uploaded or sent to Claude"
+STRANGER_REPLY = "Hi! I'm Kashio, a private bot that files one household's expense notes. I can't help you here."
 
 
 class Kashio:
@@ -138,8 +142,12 @@ class Kashio:
         return None
 
     @property
+    def can_sync(self) -> bool:
+        return self.store is not None and self.claude is not None
+
+    @property
     def ready(self) -> bool:
-        return self.store is not None and self.claude is not None and self.group_id is not None
+        return self.can_sync and self.group_id is not None
 
     def status_lines(self, bot_username: str | None = None) -> list[str]:
         """A checklist anyone can act on. No model involved: plain validations and prewritten sentences."""
@@ -310,16 +318,20 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     text = message.text or message.caption
     if not text:
         return
+    text, had_note = split_note(text, app.settings.note_keyword)
     if app.store is None:
         log.warning("Message %s not stored: %s", message.message_id, app.store_error)
         if app.hint_due(chat.id):
             await message.reply_text("⚠️ I can't reach the spreadsheet, so I'm not recording messages right now.\n"
                                      f"{app.store_error}\nOnce fixed, edit a message (even slightly) and I'll pick it up.")
         return
+    sender, sent_at = _name(message.from_user), message.date.astimezone(app.settings.timezone)
     try:
-        await asyncio.to_thread(
-            app.store.add_message, message.message_id, _name(message.from_user), message.date.astimezone(app.settings.timezone), text
-        )
+        if had_note and not text.strip():  # the whole message was a note: acknowledge it, keep nothing of it
+            await asyncio.to_thread(app.store.add_skipped, message.message_id, sender, sent_at, "note",
+                                    NOTE_REASON.format(keyword=app.settings.note_keyword))
+        else:
+            await asyncio.to_thread(app.store.add_message, message.message_id, sender, sent_at, text)
     except Exception:  # noqa: BLE001
         log.exception("Could not store message %s", message.message_id)
         await message.reply_text("⚠️ Kashio couldn't save this message to the sheet. Edit it (even slightly) to retry.")
@@ -334,7 +346,8 @@ async def on_group_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     kind = describe_media(message)
     try:
         await asyncio.to_thread(
-            app.store.add_media_note, message.message_id, _name(message.from_user), message.date.astimezone(app.settings.timezone), kind
+            app.store.add_skipped, message.message_id, _name(message.from_user), message.date.astimezone(app.settings.timezone),
+            kind, MEDIA_REASON.format(kind=kind),
         )
     except Exception:  # noqa: BLE001
         log.exception("Could not log %s message %s", kind, message.message_id)
@@ -353,15 +366,22 @@ async def on_group_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         log.warning("Edit of %s not stored: %s", message.message_id, app.store_error)
         return
     edited_at = (message.edit_date or message.date).astimezone(app.settings.timezone)
+    text, had_note = split_note(text, app.settings.note_keyword)
+    note_only = had_note and not text.strip()
+    reason = NOTE_REASON.format(keyword=app.settings.note_keyword)
+    sender, sent_at = _name(message.from_user), message.date.astimezone(app.settings.timezone)
     try:
-        previous = await asyncio.to_thread(app.store.update_message, message.message_id, text, edited_at)
-        if previous is None:  # never stored, e.g. sent while the bot was offline or the sheet unreachable
-            await asyncio.to_thread(
-                app.store.add_message, message.message_id, _name(message.from_user), message.date.astimezone(app.settings.timezone), text
-            )
-        elif previous != STATUS_PENDING:
+        status = await asyncio.to_thread(
+            app.store.update_message, message.message_id, "[note]" if note_only else text, edited_at, reason if note_only else None
+        )
+        if status is None:  # never stored, e.g. sent while the bot was offline or the sheet unreachable
+            if note_only:
+                await asyncio.to_thread(app.store.add_skipped, message.message_id, sender, sent_at, "note", reason)
+            else:
+                await asyncio.to_thread(app.store.add_message, message.message_id, sender, sent_at, text)
+        elif status == STATUS_EDITED_AFTER_SYNC:
             await message.reply_text(
-                "⚠️ This message was already synced to the sheet. I recorded the edit but did not change the sheet; "
+                "⚠️ This message was already turned into sheet rows. I recorded the edit but did not change the sheet; "
                 "please fix that row by hand."
             )
     except Exception:  # noqa: BLE001
@@ -372,12 +392,23 @@ async def on_group_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ---------------------------------------------------------------- commands
 
 
+async def may_see_status(app: Kashio, bot: Bot, chat: Chat, user: User | None) -> bool:
+    """Group members and the admin see the full checklist; so does anyone while the bot is still unpaired
+    (someone has to set it up). A stranger messaging a paired bot privately learns nothing."""
+    if chat.type != Chat.PRIVATE or app.group_id is None:
+        return True
+    return await app.is_household_member(bot, user)
+
+
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     app = kashio_of(context)
     chat, message, user = update.effective_chat, update.effective_message, update.effective_user
     if chat is None or message is None:
         return
     app.connect()
+    if not await may_see_status(app, context.bot, chat, user):
+        await message.reply_text(STRANGER_REPLY)
+        return
     lines = ["Hi, I'm Kashio. I file the expense notes from your group into your Google Sheet.", ""]
     lines.append(app.status_text(context.bot.username))
     if chat.type == Chat.PRIVATE and user and user.id == app.admin_id:
@@ -390,10 +421,13 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     app = kashio_of(context)
-    message = update.effective_message
-    if message is None:
+    chat, message, user = update.effective_chat, update.effective_message, update.effective_user
+    if chat is None or message is None:
         return
     app.connect(force=True)
+    if not await may_see_status(app, context.bot, chat, user):
+        await message.reply_text(STRANGER_REPLY)
+        return
     await deliver(context.bot, message.chat_id, app.status_text(context.bot.username))
 
 
@@ -506,6 +540,9 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if capture is None:
         app = kashio_of(context)
         app.connect()
+        if not await may_see_status(app, context.bot, update.effective_chat, update.effective_user):
+            await message.reply_text(STRANGER_REPLY)
+            return
         await deliver(context.bot, message.chat_id, "I only read the group; here I answer commands.\n\n" + app.status_text(context.bot.username) + "\n\n" + HELP)
         return
     capture.append(message.text)
@@ -556,7 +593,7 @@ async def on_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def process_backfill(app: Kashio, bot: Bot, chat_id: int, requested_by: str, content: str) -> None:
     """Parse pasted history, queue it, and run a sync right away."""
-    if not app.ready:
+    if not app.can_sync:
         await deliver(bot, chat_id, "I can't import yet.\n" + app.status_text(bot.username))
         return
     parsed = parse(content, app.settings)
@@ -720,7 +757,7 @@ def check(settings: Settings) -> int:
 
 async def cli_sync(settings: Settings, dry_run: bool) -> int:
     app = Kashio(settings)
-    if not app.ready:
+    if not app.can_sync:
         print(app.status_text())
         return 1
     report = await app.sync(TRIGGER_CLI, "terminal", dry_run=dry_run)

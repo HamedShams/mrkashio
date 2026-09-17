@@ -7,6 +7,7 @@ notification always goes out even when the spreadsheet is unreachable.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
@@ -115,6 +116,20 @@ def parse_override_date(value: str | None) -> date | None:
         return date.fromisoformat(value)
     except ValueError:
         return None
+
+
+def split_note(text: str, keyword: str) -> tuple[str, bool]:
+    """Cut a private note off a message: everything from the keyword (a whole word, any case) to the end.
+
+    Returns (what is left, whether a note was present). "A101 300 #note oil for the week" → ("A101 300", True);
+    "#note review the budget on Friday" → ("", True). The note itself is never stored anywhere.
+    """
+    if not keyword:
+        return text, False
+    match = re.search(r"(?<!\S)" + re.escape(keyword) + r"(?!\w)", text, re.IGNORECASE)
+    if not match:
+        return text, False
+    return text[: match.start()].rstrip(), True
 
 
 def sanitize_description(text: str) -> str:

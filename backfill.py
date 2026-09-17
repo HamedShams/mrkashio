@@ -15,7 +15,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from config import Settings
 from sheets import SheetStore
-from sync import rollover_date
+from sync import rollover_date, split_note
 
 # "Hamed Shams, [24 Jul 2026 at 21:46:10 (24 Jul 2026 at 23:45:01)]:"  (the part in parentheses is the edit time)
 # Tolerant on purpose: the comma, the spaces and the trailing colon are all optional.
@@ -59,6 +59,7 @@ class ImportResult:
     duplicates: int
     start: date | None
     dismissed: list[str]  # human-readable lines for the messages skipped as already covered by the sheet
+    notes: int = 0  # messages that were only a private note (NOTE_KEYWORD)
 
     def describe(self) -> str:
         lines = [f"Found {self.found} message(s); queued {self.imported} for the next sync."]
@@ -69,6 +70,8 @@ class ImportResult:
                 lines.append(f"  • … and {self.before_start - MAX_LISTED} more")
         if self.duplicates:
             lines.append(f"Skipped {self.duplicates} already queued or processed earlier (same sender, time and text).")
+        if self.notes:
+            lines.append(f"Skipped {self.notes} private note(s); notes are never stored or sent to Claude.")
         return "\n".join(lines)
 
 
@@ -140,8 +143,13 @@ def import_messages(
     known = store.stored_message_ids()
     rows: list[tuple[int, str, datetime, datetime | None, str]] = []
     dismissed: list[str] = []
-    duplicates = 0
+    duplicates = notes = 0
     for message in messages:
+        kept, had_note = split_note(message.text, settings.note_keyword)
+        if had_note and not kept.strip():
+            notes += 1
+            continue
+        message.text = kept
         if start and rollover_date(message.sent_at, settings.day_rollover_hour) < start:
             excerpt = " | ".join(part.strip() for part in message.text.splitlines() if part.strip())[:60]
             dismissed.append(f"{message.sent_at:%d/%m/%Y %H:%M} {message.sender}: {excerpt}")
@@ -153,7 +161,7 @@ def import_messages(
         rows.append((message.message_id, message.sender, message.sent_at, message.edited_at, message.text))
     if rows:
         store.add_messages(rows)
-    return ImportResult(len(messages), len(rows), len(dismissed), duplicates, start, dismissed)
+    return ImportResult(len(messages), len(rows), len(dismissed), duplicates, start, dismissed, notes)
 
 
 def _dump_message(sender: str, sent_at: datetime, edited_at: datetime | None, text: str) -> DumpMessage:
