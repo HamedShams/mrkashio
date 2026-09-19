@@ -43,9 +43,9 @@ def test_status_is_all_green_when_everything_is_connected(settings):
     store = SimpleNamespace(spreadsheet=SimpleNamespace(title="Budget"))
     app = stub_kashio(settings, store=store, claude=object(), config={"group_title": "Family"})
     text = app.status_text()
-    assert text.startswith("✅ All set") and "“Budget”" in text and "✅ Claude" in text and app.ready is True
+    assert text.startswith("All set, I'm working.") and "“Budget”" in text and "✅ Claude" in text and app.ready is True
     html_text = app.status_text(as_html=True)
-    assert html_text.startswith("<b>✅ All set, I'm working.</b>\n• ✅ Telegram")
+    assert html_text.startswith("<b>All set, I'm working.</b>\n• ✅ Telegram")
 
 
 def test_hints_are_rate_limited_per_chat(settings):

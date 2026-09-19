@@ -183,7 +183,7 @@ class Kashio:
         return lines
 
     def status_text(self, bot_username: str | None = None, as_html: bool = False) -> str:
-        head = "✅ All set, I'm working." if self.ready else "🛠 Not quite ready yet. Here is what I can see:"
+        head = "All set, I'm working." if self.ready else "🛠 Not quite ready yet. Here is what I can see:"
         lines = self.status_lines(bot_username)
         if as_html:
             return f"<b>{html.escape(head, quote=False)}</b>\n" + "\n".join("• " + html.escape(line, quote=False) for line in lines)

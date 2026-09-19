@@ -300,7 +300,7 @@ def format_totals(report: RunReport) -> str:
     return " · ".join(format_amount(total, currency) for currency, total in sorted(report.totals_by_currency().items()))
 
 
-STATUS_EMOJI = {STATUS_OK: "✅", STATUS_DRY_RUN: "🧪", STATUS_SKIPPED_THRESHOLD: "⏭", STATUS_FAILED: "❌"}
+STATUS_EMOJI = {STATUS_OK: "💸", STATUS_DRY_RUN: "🧪", STATUS_SKIPPED_THRESHOLD: "⏭", STATUS_FAILED: "❌"}
 
 
 def _t(value: object, as_html: bool) -> str:

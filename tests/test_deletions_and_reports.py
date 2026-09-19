@@ -83,11 +83,11 @@ def test_html_report_is_bold_bulleted_and_escaped(settings):
     report.review.append(sync.ReviewItem(52, "Alex", at(2026, 9, 16, 17, 4), "Sep 3 & more", "amount '11,58.4' <unclear>"))
     text = sync.format_report(report, as_html=True)
     lines = text.split("\n")
-    assert lines[0] == "<b>✅ Kashio sync report</b>" and lines[1].startswith("• Status: ok")
+    assert lines[0] == "<b>💸 Kashio sync report</b>" and lines[1].startswith("• Status: ok")
     assert "• Trigger: manual (Alex &lt;3)" in text and "<b>⚠️ Needs review:</b>" in text
     assert "Sep 3 &amp; more" in text and "&lt;unclear&gt;" in text and "<unclear>" not in text
     plain = sync.format_report(report)
-    assert plain.startswith("✅ Kashio sync report\n• Status: ok") and "<b>" not in plain and "<unclear>" in plain
+    assert plain.startswith("💸 Kashio sync report\n• Status: ok") and "<b>" not in plain and "<unclear>" in plain
 
 
 def test_photo_with_caption_stores_the_caption_and_notes_the_attachment(settings):

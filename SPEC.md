@@ -179,7 +179,7 @@ An edit never overwrites an inbox row: the previous row is marked `superseded` (
 
 ### The Summary report tab (`init-sheet`)
 
-`python bot.py init-sheet` builds a report tab (`SUMMARY_TAB`, default `Summary`) over the transactions tab, all formulas: spend, share and count per category, spend per month (months found with `SORT(UNIQUE(EOMONTH(…)))`), totals per currency, the ten largest expenses, a pie chart by category and a column chart by month. Totals count rows in a base currency (cell B3, prefilled from `DEFAULT_CURRENCY`); other currencies are listed separately, never summed together. The category names in `A7:A25` of that tab are what the category dropdown on the transactions tab offers, because `init-sheet` points the dropdown's data validation there, so a category is added by typing it in the next free cell. An existing tab of that name is kept unless `--rewrite` is given, in which case it is deleted and rebuilt (the transactions tab is never touched).
+`python bot.py init-sheet` builds a report tab (`SUMMARY_TAB`, default `Summary`) over the transactions tab, all formulas, styled with green header bands, tinted column headers, alternating row shading, a donut chart and a column chart: spend, share and count per category, spend per month (months found with `SORT(UNIQUE(EOMONTH(…)))`), totals per currency, the ten largest expenses, a pie chart by category and a column chart by month. Totals count rows in a base currency (cell B3, prefilled from `DEFAULT_CURRENCY`); other currencies are listed separately, never summed together. The category names in `A7:A25` of that tab are what the category dropdown on the transactions tab offers, because `init-sheet` points the dropdown's data validation there, so a category is added by typing it in the next free cell. An existing tab of that name is kept unless `--rewrite` is given, in which case it is deleted and rebuilt (the transactions tab is never touched).
 
 ### Who can talk to the bot
 
@@ -187,7 +187,7 @@ Only the paired group is recorded; messages from any other chat are ignored, and
 
 ### Reports
 
-The private report is Telegram HTML: a bold header with a status emoji (✅ ok, 🧪 dry run, ⏭ nothing to do, ❌ failed), one bullet per figure, then bold sections with bullets for rejected answers, still-pending messages, held edits and items needing review; all user text is HTML-escaped. The group summary and the status checklist use the same style. The terminal gets the plain-text form of the same report.
+The private report is Telegram HTML: a bold header with a status emoji (💸 synced, 🧪 dry run, ⏭ nothing to do, ❌ failed), one bullet per figure, then bold sections with bullets for rejected answers, still-pending messages, held edits and items needing review; all user text is HTML-escaped. The group summary and the status checklist use the same style. The terminal gets the plain-text form of the same report.
 
 ### Retries
 

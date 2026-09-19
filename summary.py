@@ -121,35 +121,93 @@ def _write_cells(sheet, settings: Settings, categories: list[str]) -> None:
     _retry(lambda: sheet.batch_update(updates, value_input_option="USER_ENTERED"))
 
 
+GREEN = {"red": 0.118, "green": 0.420, "blue": 0.333}  # header bands
+GREEN_SOFT = {"red": 0.890, "green": 0.941, "blue": 0.918}  # column headers, totals
+BAND = {"red": 0.965, "green": 0.976, "blue": 0.969}  # every second row
+WHITE = {"red": 1, "green": 1, "blue": 1}
+INK = {"red": 0.102, "green": 0.149, "blue": 0.125}
+GREY = {"red": 0.42, "green": 0.42, "blue": 0.42}
+ACCENT = {"red": 0.710, "green": 0.220, "blue": 0.184}  # the editable base-currency cell
+CHART_WIDTH, CHART_HEIGHT = 560, 360
+
+
 def _apply_layout(store: SheetStore, sheet, settings: Settings) -> None:
+    """Colour bands for titles, tinted column headers, alternating rows, borders, widths. Cosmetic only."""
     sid = sheet.id
+    last_month = FIRST_MONTH_ROW + MONTH_SLOTS - 1
+    last_currency = FIRST_CURRENCY_ROW + len(CURRENCIES) - 1
+    last_top = FIRST_TOP_ROW + TOP_COUNT - 1
+
     def rng(r1, r2, c1, c2):
         return {"sheetId": sid, "startRowIndex": r1 - 1, "endRowIndex": r2, "startColumnIndex": c1, "endColumnIndex": c2}
+
     def fmt(r1, r2, c1, c2, cell_format, fields):
         return {"repeatCell": {"range": rng(r1, r2, c1, c2), "cell": {"userEnteredFormat": cell_format}, "fields": fields}}
-    bold = {"textFormat": {"bold": True}}
+
+    def number(r1, r2, col, pattern, kind="NUMBER"):
+        return fmt(r1, r2, col, col + 1, {"numberFormat": {"type": kind, "pattern": pattern}, "horizontalAlignment": "RIGHT"},
+                   "userEnteredFormat(numberFormat,horizontalAlignment)")
+
+    def section_title(row, width=4):
+        return [
+            {"mergeCells": {"range": rng(row, row, 0, width), "mergeType": "MERGE_ALL"}},
+            fmt(row, row, 0, width, {"backgroundColor": GREEN, "textFormat": {"bold": True, "fontSize": 12, "foregroundColor": WHITE},
+                                     "verticalAlignment": "MIDDLE", "padding": {"left": 8}},
+                "userEnteredFormat(backgroundColor,textFormat,verticalAlignment,padding)"),
+            {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "ROWS", "startIndex": row - 1, "endIndex": row},
+                                           "properties": {"pixelSize": 30}, "fields": "pixelSize"}},
+        ]
+
+    def column_header(row, width=4):
+        return [
+            fmt(row, row, 0, width, {"backgroundColor": GREEN_SOFT, "textFormat": {"bold": True, "foregroundColor": INK}},
+                "userEnteredFormat(backgroundColor,textFormat)"),
+            {"updateBorders": {"range": rng(row, row, 0, width), "bottom": {"style": "SOLID", "width": 1, "color": GREEN}}},
+        ]
+
+    def banding(r1, r2, width=4):
+        return {"addBanding": {"bandedRange": {"range": rng(r1, r2, 0, width),
+                                               "rowProperties": {"firstBandColor": WHITE, "secondBandColor": BAND}}}}
+
     requests = [
-        fmt(1, 1, 0, 4, {"textFormat": {"bold": True, "fontSize": 16}}, "userEnteredFormat.textFormat"),
-        fmt(3, 3, 1, 2, {"backgroundColor": {"red": 1, "green": 0.97, "blue": 0.85}}, "userEnteredFormat.backgroundColor"),
-        fmt(5, 5, 0, 4, {"textFormat": {"bold": True, "fontSize": 12}}, "userEnteredFormat.textFormat"),
-        fmt(6, 6, 0, 4, bold, "userEnteredFormat.textFormat"),
-        fmt(CATEGORY_TOTAL_ROW, CATEGORY_TOTAL_ROW, 0, 4, bold, "userEnteredFormat.textFormat"),
-        fmt(UNCATEGORISED_ROW, UNCATEGORISED_ROW, 0, 4, {"textFormat": {"italic": True, "foregroundColor": {"red": 0.4, "green": 0.4, "blue": 0.4}}}, "userEnteredFormat.textFormat"),
-        fmt(FIRST_CATEGORY_ROW, UNCATEGORISED_ROW, 1, 2, {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.0"}}, "userEnteredFormat.numberFormat"),
-        fmt(FIRST_CATEGORY_ROW, CATEGORY_TOTAL_ROW, 2, 3, {"numberFormat": {"type": "PERCENT", "pattern": "0.0%"}}, "userEnteredFormat.numberFormat"),
-        fmt(MONTH_TITLE_ROW, MONTH_TITLE_ROW, 0, 3, {"textFormat": {"bold": True, "fontSize": 12}}, "userEnteredFormat.textFormat"),
-        fmt(MONTH_TITLE_ROW + 1, MONTH_TITLE_ROW + 1, 0, 3, bold, "userEnteredFormat.textFormat"),
-        fmt(FIRST_MONTH_ROW, FIRST_MONTH_ROW + MONTH_SLOTS - 1, 0, 1, {"numberFormat": {"type": "DATE", "pattern": "mmm yyyy"}}, "userEnteredFormat.numberFormat"),
-        fmt(FIRST_MONTH_ROW, FIRST_MONTH_ROW + MONTH_SLOTS - 1, 1, 2, {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.0"}}, "userEnteredFormat.numberFormat"),
-        fmt(CURRENCY_TITLE_ROW, CURRENCY_TITLE_ROW, 0, 3, {"textFormat": {"bold": True, "fontSize": 12}}, "userEnteredFormat.textFormat"),
-        fmt(CURRENCY_TITLE_ROW + 1, CURRENCY_TITLE_ROW + 1, 0, 3, bold, "userEnteredFormat.textFormat"),
-        fmt(FIRST_CURRENCY_ROW, FIRST_CURRENCY_ROW + len(CURRENCIES) - 1, 1, 2, {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.0"}}, "userEnteredFormat.numberFormat"),
-        fmt(TOP_TITLE_ROW, TOP_TITLE_ROW, 0, 4, {"textFormat": {"bold": True, "fontSize": 12}}, "userEnteredFormat.textFormat"),
-        fmt(TOP_TITLE_ROW + 1, TOP_TITLE_ROW + 1, 0, 4, bold, "userEnteredFormat.textFormat"),
-        fmt(FIRST_TOP_ROW, FIRST_TOP_ROW + TOP_COUNT - 1, 0, 1, {"numberFormat": {"type": "DATE", "pattern": "dd/mm/yyyy"}}, "userEnteredFormat.numberFormat"),
-        fmt(FIRST_TOP_ROW, FIRST_TOP_ROW + TOP_COUNT - 1, 2, 3, {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.0"}}, "userEnteredFormat.numberFormat"),
-        {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1}, "properties": {"pixelSize": 230}, "fields": "pixelSize"}},
-        {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 4}, "properties": {"pixelSize": 120}, "fields": "pixelSize"}},
+        # title band
+        {"mergeCells": {"range": rng(1, 1, 0, 4), "mergeType": "MERGE_ALL"}},
+        fmt(1, 1, 0, 4, {"backgroundColor": GREEN, "textFormat": {"bold": True, "fontSize": 18, "foregroundColor": WHITE},
+                         "verticalAlignment": "MIDDLE", "padding": {"left": 8}},
+            "userEnteredFormat(backgroundColor,textFormat,verticalAlignment,padding)"),
+        {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "ROWS", "startIndex": 0, "endIndex": 1},
+                                       "properties": {"pixelSize": 48}, "fields": "pixelSize"}},
+        fmt(2, 3, 0, 1, {"textFormat": {"bold": True, "foregroundColor": GREY}}, "userEnteredFormat.textFormat"),
+        fmt(3, 3, 1, 2, {"backgroundColor": {"red": 1, "green": 0.96, "blue": 0.88}, "textFormat": {"bold": True, "foregroundColor": ACCENT},
+                         "horizontalAlignment": "CENTER"}, "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)"),
+        {"updateBorders": {"range": rng(3, 3, 1, 2), "top": {"style": "SOLID", "color": ACCENT}, "bottom": {"style": "SOLID", "color": ACCENT},
+                           "left": {"style": "SOLID", "color": ACCENT}, "right": {"style": "SOLID", "color": ACCENT}}},
+        {"mergeCells": {"range": rng(4, 4, 0, 4), "mergeType": "MERGE_ALL"}},
+        fmt(4, 4, 0, 4, {"textFormat": {"italic": True, "foregroundColor": GREY, "fontSize": 9}}, "userEnteredFormat.textFormat"),
+        # by category
+        *section_title(5), *column_header(6), banding(FIRST_CATEGORY_ROW, CATEGORY_TOTAL_ROW - 1),
+        fmt(CATEGORY_TOTAL_ROW, CATEGORY_TOTAL_ROW, 0, 4, {"backgroundColor": GREEN_SOFT, "textFormat": {"bold": True}},
+            "userEnteredFormat(backgroundColor,textFormat)"),
+        {"updateBorders": {"range": rng(CATEGORY_TOTAL_ROW, CATEGORY_TOTAL_ROW, 0, 4), "top": {"style": "SOLID", "width": 1, "color": GREEN}}},
+        fmt(UNCATEGORISED_ROW, UNCATEGORISED_ROW, 0, 4, {"textFormat": {"italic": True, "foregroundColor": GREY}}, "userEnteredFormat.textFormat"),
+        number(FIRST_CATEGORY_ROW, UNCATEGORISED_ROW, 1, "#,##0.0"),
+        number(FIRST_CATEGORY_ROW, CATEGORY_TOTAL_ROW, 2, "0.0%", "PERCENT"),
+        number(FIRST_CATEGORY_ROW, UNCATEGORISED_ROW, 3, "#,##0"),
+        # by month
+        *section_title(MONTH_TITLE_ROW, 3), *column_header(MONTH_TITLE_ROW + 1, 3), banding(FIRST_MONTH_ROW, last_month, 3),
+        fmt(FIRST_MONTH_ROW, last_month, 0, 1, {"numberFormat": {"type": "DATE", "pattern": "mmm yyyy"}}, "userEnteredFormat.numberFormat"),
+        number(FIRST_MONTH_ROW, last_month, 1, "#,##0.0"), number(FIRST_MONTH_ROW, last_month, 2, "#,##0"),
+        # by currency
+        *section_title(CURRENCY_TITLE_ROW, 3), *column_header(CURRENCY_TITLE_ROW + 1, 3), banding(FIRST_CURRENCY_ROW, last_currency, 3),
+        number(FIRST_CURRENCY_ROW, last_currency, 1, "#,##0.0"), number(FIRST_CURRENCY_ROW, last_currency, 2, "#,##0"),
+        # largest expenses
+        *section_title(TOP_TITLE_ROW), *column_header(TOP_TITLE_ROW + 1), banding(FIRST_TOP_ROW, last_top),
+        fmt(FIRST_TOP_ROW, last_top, 0, 1, {"numberFormat": {"type": "DATE", "pattern": "dd/mm/yyyy"}}, "userEnteredFormat.numberFormat"),
+        number(FIRST_TOP_ROW, last_top, 2, "#,##0.0"),
+        # widths and gridlines
+        {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1}, "properties": {"pixelSize": 280}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 4}, "properties": {"pixelSize": 130}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 4, "endIndex": 5}, "properties": {"pixelSize": 30}, "fields": "pixelSize"}},
         {"updateSheetProperties": {"properties": {"sheetId": sid, "gridProperties": {"hideGridlines": True}}, "fields": "gridProperties.hideGridlines"}},
     ]
     _retry(lambda: store.spreadsheet.batch_update({"requests": requests}))
@@ -157,26 +215,30 @@ def _apply_layout(store: SheetStore, sheet, settings: Settings) -> None:
 
 def _add_charts(store: SheetStore, sheet) -> None:
     sid = sheet.id
+
     def src(r1, r2, col):
         return {"sheetId": sid, "startRowIndex": r1 - 1, "endRowIndex": r2, "startColumnIndex": col, "endColumnIndex": col + 1}
-    def position(row, col, width, height):
-        return {"overlayPosition": {"anchorCell": {"sheetId": sid, "rowIndex": row - 1, "columnIndex": col}, "widthPixels": width, "heightPixels": height}}
+
+    def position(row):
+        return {"overlayPosition": {"anchorCell": {"sheetId": sid, "rowIndex": row - 1, "columnIndex": 5},
+                                    "widthPixels": CHART_WIDTH, "heightPixels": CHART_HEIGHT}}
+
+    title_format = {"bold": True, "fontSize": 14, "foregroundColor": INK}
     pie = {"addChart": {"chart": {
-        "spec": {"title": "Share by category", "pieChart": {
-            "legendPosition": "RIGHT_LEGEND",
-            "domain": {"sourceRange": {"sources": [src(FIRST_CATEGORY_ROW, CATEGORY_TOTAL_ROW - 1, 0)]}},
-            "series": {"sourceRange": {"sources": [src(FIRST_CATEGORY_ROW, CATEGORY_TOTAL_ROW - 1, 1)]}},
-        }},
-        "position": position(5, 5, 520, 340),
+        "spec": {"title": "Share by category", "titleTextFormat": title_format, "backgroundColor": WHITE,
+                 "pieChart": {"legendPosition": "RIGHT_LEGEND", "pieHole": 0.45,
+                              "domain": {"sourceRange": {"sources": [src(FIRST_CATEGORY_ROW, CATEGORY_TOTAL_ROW - 1, 0)]}},
+                              "series": {"sourceRange": {"sources": [src(FIRST_CATEGORY_ROW, CATEGORY_TOTAL_ROW - 1, 1)]}}}},
+        "position": position(5),
     }}}
     columns = {"addChart": {"chart": {
-        "spec": {"title": "Spend by month", "basicChart": {
-            "chartType": "COLUMN", "legendPosition": "NO_LEGEND",
-            "axis": [{"position": "BOTTOM_AXIS", "title": "Month"}, {"position": "LEFT_AXIS", "title": "Total"}],
-            "domains": [{"domain": {"sourceRange": {"sources": [src(FIRST_MONTH_ROW, FIRST_MONTH_ROW + MONTH_SLOTS - 1, 0)]}}}],
-            "series": [{"series": {"sourceRange": {"sources": [src(FIRST_MONTH_ROW, FIRST_MONTH_ROW + MONTH_SLOTS - 1, 1)]}}, "targetAxis": "LEFT_AXIS"}],
-        }},
-        "position": position(MONTH_TITLE_ROW, 5, 520, 340),
+        "spec": {"title": "Spend by month", "titleTextFormat": title_format, "backgroundColor": WHITE,
+                 "basicChart": {"chartType": "COLUMN", "legendPosition": "NO_LEGEND",
+                                "axis": [{"position": "BOTTOM_AXIS", "title": ""}, {"position": "LEFT_AXIS", "title": ""}],
+                                "domains": [{"domain": {"sourceRange": {"sources": [src(FIRST_MONTH_ROW, FIRST_MONTH_ROW + MONTH_SLOTS - 1, 0)]}}}],
+                                "series": [{"series": {"sourceRange": {"sources": [src(FIRST_MONTH_ROW, FIRST_MONTH_ROW + MONTH_SLOTS - 1, 1)]}},
+                                            "targetAxis": "LEFT_AXIS", "color": GREEN}]}},
+        "position": position(MONTH_TITLE_ROW),
     }}}
     _retry(lambda: store.spreadsheet.batch_update({"requests": [pie, columns]}))
 
