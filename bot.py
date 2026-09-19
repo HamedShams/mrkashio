@@ -5,6 +5,7 @@
     python bot.py sync            run one sync from the terminal and exit
     python bot.py sync --dry-run  call Claude and print the rows, but write nothing and message nobody
     python bot.py backfill FILE   queue older messages from a pasted dump or a Telegram Desktop JSON export
+    python bot.py init-sheet      build the Summary report tab (add --rewrite to replace an existing one)
 
 Telegram commands:
     /setup     in the group, once, by a group admin: pairs the bot with that group and with you
@@ -20,6 +21,7 @@ clear its (non-existent) reaction on every message that has rows in the sheet; a
 
 The bot starts with nothing but a Telegram token. Anything else that is missing or broken (Google Sheets,
 the Anthropic key, the group pairing) is reported in plain words to whoever talks to it, with the fix.
+Only the paired group is ever recorded. If the bot is added to another group while paired, it leaves it.
 A tiny HTTP endpoint answers GET /health on $PORT for Railway's healthcheck.
 """
 
@@ -43,9 +45,10 @@ from gspread.exceptions import APIError
 from telegram import Bot, Chat, Message, Update, User
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, ChatMemberHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from backfill import import_messages, parse
+from summary import build_summary
 from config import ConfigError, Settings
 from extractor import MAX_MESSAGES_PER_CALL, clean_categories, load_prompt
 from sheets import STATUS_PENDING_REVISION, STATUS_SKIPPED, SheetStore
@@ -669,6 +672,21 @@ async def process_backfill(app: Kashio, bot: Bot, chat_id: int, requested_by: st
     await app.notify(bot, report, already_informed=frozenset({chat_id}))
 
 
+async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Someone added the bot to a chat. While paired, any group other than the paired one is left at once."""
+    app = kashio_of(context)
+    change = update.my_chat_member
+    if change is None or change.chat.type not in (Chat.GROUP, Chat.SUPERGROUP):
+        return
+    joined = change.new_chat_member.status in ("member", "administrator", "restricted")
+    if joined and app.group_id is not None and change.chat.id != app.group_id:
+        log.warning("Added to a group I am not paired with (%s, %r); leaving it", change.chat.id, change.chat.title)
+        try:
+            await context.bot.leave_chat(change.chat.id)
+        except TelegramError as exc:
+            log.warning("Could not leave chat %s: %s", change.chat.id, exc)
+
+
 async def scheduled_sync(context: ContextTypes.DEFAULT_TYPE) -> None:
     app = kashio_of(context)
     app.connect(force=True)
@@ -715,6 +733,7 @@ def build_application(app: Kashio) -> Application:
     application.add_handler(MessageHandler(groups_new & text, on_group_message))
     application.add_handler(MessageHandler(groups_new & ~filters.TEXT & ~filters.CAPTION & ~filters.StatusUpdate.ALL, on_group_media))
     application.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND, on_private_text))
+    application.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     application.job_queue.run_custom(scheduled_sync, job_kwargs={"trigger": cron_trigger(app.settings)}, name="scheduled_sync")
     return application
 
@@ -763,7 +782,7 @@ def run_bot(settings: Settings) -> None:
     for line in app.status_lines():
         log.info(line)
     log.info("Kashio is running. Schedule: %s (%s) · next sync: %s", settings.sync_cron, settings.timezone.key, next_run)
-    application.run_polling(allowed_updates=[Update.MESSAGE, Update.EDITED_MESSAGE])
+    application.run_polling(allowed_updates=[Update.MESSAGE, Update.EDITED_MESSAGE, Update.MY_CHAT_MEMBER])
 
 
 def check(settings: Settings) -> int:
@@ -851,6 +870,20 @@ def cli_backfill(settings: Settings, path: str, since: date | None) -> int:
     return 0
 
 
+def cli_init_sheet(settings: Settings, rewrite: bool) -> int:
+    """Create (or rewrite) the Summary report tab and point the category dropdown at its category list."""
+    app = Kashio(settings)
+    if app.store is None:
+        print(app.status_text())
+        return 1
+    try:
+        print(build_summary(app.store, settings, rewrite=rewrite))
+    except FileExistsError as exc:
+        print(f"{exc} Add --rewrite to replace it (everything on that tab is lost; the transactions tab is untouched).")
+        return 1
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="kashio", description="Telegram expense notes → Google Sheets.")
     commands = parser.add_subparsers(dest="command")
@@ -862,6 +895,8 @@ def main() -> None:
     backfill_parser.add_argument("file", help="text file with copied messages, or result.json from Telegram Desktop")
     backfill_parser.add_argument("--from", dest="since", type=date.fromisoformat, metavar="YYYY-MM-DD",
                                  help="import from this day on (default: the day after the sheet's last recorded date)")
+    init_parser = commands.add_parser("init-sheet", help="build the Summary report tab over the transactions tab")
+    init_parser.add_argument("--rewrite", action="store_true", help="replace an existing Summary tab (its contents are lost)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -876,6 +911,8 @@ def main() -> None:
             sys.exit(asyncio.run(cli_sync(settings, args.dry_run)))
         elif args.command == "backfill":
             sys.exit(cli_backfill(settings, args.file, args.since))
+        elif args.command == "init-sheet":
+            sys.exit(cli_init_sheet(settings, args.rewrite))
         else:
             run_bot(settings)
     except ConfigError as exc:

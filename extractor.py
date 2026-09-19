@@ -1,14 +1,20 @@
 """Claude does the fuzzy part: which messages are expenses, how many, amount, currency, category.
 
 The deterministic parts (dates, row placement, formatting) live in `sync.py` and `sheets.py`.
+Claude answers in plain JSON, which is validated here against the same Pydantic schema (categories limited
+to the sheet's own list). The API's schema-enforced output mode is deliberately not used: with long
+reasoning it produced answers that were syntactically valid but cut short or garbled, while plain JSON at
+the same effort came back complete every time it was tested.
+
 Every answer is audited: a result for an unknown message, an unreadable description, a malformed date,
 a missing message, or far fewer items than the text visibly contains means the answer is incomplete or
-damaged, and the batch is asked again once at low effort (long reasoning at high effort is where damaged
-answers were traced to). Messages that still look incomplete are flagged, never trusted blindly.
+damaged, and the batch is asked once more at the same effort. Messages that still look incomplete are
+flagged, never trusted blindly.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from collections.abc import Sequence
@@ -17,7 +23,7 @@ from pathlib import Path
 from typing import Literal, get_args
 
 import anthropic
-from pydantic import BaseModel, create_model
+from pydantic import BaseModel, ValidationError, create_model
 
 from config import ConfigError, Settings
 from sheets import InboxMessage
@@ -26,12 +32,12 @@ log = logging.getLogger(__name__)
 
 PROMPT_PATH = Path(__file__).with_name("prompt.md")
 MAX_MESSAGES_PER_CALL = 150
-MAX_OUTPUT_TOKENS = 16000
+MAX_OUTPUT_TOKENS = 32000  # streamed, so a long batch plus its reasoning never hits an HTTP timeout
+JSON_FENCE = re.compile(r"^```(?:json)?\s*|\s*```$")
 DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 A_LETTER = re.compile(r"[^\W\d_]")  # any letter in any script
 AMOUNT_LIKE = re.compile(r"(?<![\w.,])\d[\d.,]*\d(?![\w.,])|(?<![\w.,])\d{2,}(?![\w.,])")  # numbers with 2+ digits, incl. 1,158.4
 MAX_PLAUSIBLE_AMOUNT = 1e12
-RETRY_EFFORT = "low"  # complete, coherent answers in every reproduction of the 19 Sep 2026 failure
 
 # Currencies the spreadsheet accepts in the currency column. TOMAN is Iranian toman, kept as the household writes it.
 Currency = Literal["TRY", "TOMAN", "EUR", "USD", "GBP"]
@@ -169,6 +175,26 @@ def render_prompt(template: str, categories: Sequence[str]) -> str:
     return template.replace("{{CATEGORIES}}", "\n".join(lines))
 
 
+def output_instructions(schema: type[SyncResult]) -> str:
+    """Appended to the system prompt: answer as one JSON object matching this schema, nothing else."""
+    return (
+        "\n\n# Output\n\nReply with one JSON object and nothing else: no code fences, no commentary before or after. "
+        "It must validate against this JSON schema:\n" + json.dumps(schema.model_json_schema(), ensure_ascii=False)
+    )
+
+
+def parse_answer(text: str, schema: type[SyncResult]) -> list[MessageResult] | None:
+    """The JSON object in Claude's text, validated; None when there is none or it does not fit the schema."""
+    body = JSON_FENCE.sub("", text.strip())
+    start, end = body.find("{"), body.rfind("}")
+    if start == -1 or end == -1:
+        return None
+    try:
+        return list(schema.model_validate_json(body[start : end + 1]).results)
+    except (ValidationError, ValueError):
+        return None
+
+
 def build_batch(messages: Sequence[InboxMessage]) -> str:
     """Wrap each raw message in a tag carrying its id, sender and local send time."""
     blocks = []
@@ -245,7 +271,7 @@ def extract(
 ) -> Extraction:
     """One structured-output call per chunk of up to MAX_MESSAGES_PER_CALL messages, audited, retried once if needed."""
     schema = result_model(categories)
-    system_prompt = render_prompt(prompt_template, categories)
+    system_prompt = render_prompt(prompt_template, categories) + output_instructions(schema)
     out = Extraction(results=[])
     for start in range(0, len(messages), MAX_MESSAGES_PER_CALL):
         chunk = messages[start : start + MAX_MESSAGES_PER_CALL]
@@ -255,7 +281,7 @@ def extract(
         missing = expected - {r.message_id for r in good}
         if problems or missing or suspicious:
             log.warning("Claude's answer was incomplete or damaged (%d problem(s), %d unanswered, %d cut short); "
-                        "asking once more at effort %s", len(problems), len(missing), len(suspicious), RETRY_EFFORT)
+                        "asking once more", len(problems), len(missing), len(suspicious))
             out.problems.extend(problems)
             out.problems.extend(f"message {mid}: {why}" for mid, why in suspicious.items())
             retried, problems, still = audit(_ask(client, settings, system_prompt, chunk, schema, out, retry=True), expected, texts)
@@ -280,20 +306,23 @@ def _ask(
     *,
     retry: bool,
 ) -> list[MessageResult]:
-    """One API call. The retry runs at low effort: every reproduction of the damaged-answer failure was clean there."""
-    request: dict = dict(
+    """One streamed API call at the configured effort; the retry is simply a second try at the same effort."""
+    with client.messages.stream(
         model=settings.anthropic_model,
         max_tokens=MAX_OUTPUT_TOKENS,
         system=system_prompt,
         messages=[{"role": "user", "content": build_batch(chunk)}],
-        output_format=schema,
-    )
-    request["output_config"] = {"effort": RETRY_EFFORT if retry else settings.anthropic_effort}
-    response = client.messages.parse(**request)
+        output_config={"effort": settings.anthropic_effort},
+    ) as stream:
+        response = stream.get_final_message()
     out.calls += 1
     out.input_tokens += response.usage.input_tokens
     out.output_tokens += response.usage.output_tokens
-    if response.parsed_output is None:
-        log.warning("Claude returned no structured output (stop_reason=%s)", response.stop_reason)
+    text = "".join(block.text for block in response.content if getattr(block, "type", "") == "text")
+    results = parse_answer(text, schema)
+    if results is None:
+        log.warning("Claude's answer was not a valid JSON object for the schema (stop_reason=%s, %d characters)%s",
+                    response.stop_reason, len(text), " on the retry" if retry else "")
+        out.problems.append("the answer was not a valid JSON object for the schema")
         return []
-    return list(response.parsed_output.results)
+    return results

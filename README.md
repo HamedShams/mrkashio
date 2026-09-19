@@ -19,7 +19,7 @@ Telegram group ──► Kashio (Python, always on) ──► Bot_Inbox tab     
 - **Every run is recorded twice**: a row in the hidden `Bot_Runs` tab (tokens, cost, rows added, errors) and the same report as a Telegram message, so you have it even when the spreadsheet is unreachable.
 - **Messy input is expected.** A description and its amount split across two consecutive messages ("UBER", then "10 TL") are paired into one transaction. Turkish, German, English and Persian currency words (TL, ₺, لیر, تومان, euro, dollar…) and Persian digits are understood. Corrections to an earlier message in the same batch are applied.
 - **Nothing is guessed.** Messages Claude cannot resolve (no amount, unknown currency, a correction to an older message) are flagged `needs_review` in the inbox and listed in the report.
-- **Every answer is checked.** Claude's reply is audited: a result for a message that was never sent, an unreadable description, a malformed date, a missing message, or far fewer items than the text visibly lists. If anything is off, the batch is asked once more at low effort; whatever still has no usable answer stays pending, and an answer that still looks cut short is flagged rather than trusted. Nothing invented ever reaches the sheet.
+- **Every answer is checked.** Claude answers in plain JSON that the bot validates against its own schema (categories limited to your sheet's list), then audits: a result for a message that was never sent, an unreadable description, a malformed date, a missing message, or far fewer items than the text visibly lists. If anything is off, the batch is asked once more; whatever still has no usable answer stays pending, and an answer that still looks cut short is flagged rather than trusted. Nothing invented ever reaches the sheet.
 - **It never touches rows it did not write.** New rows go below the last used row, after a check that the destination cells are empty. Rows the bot wrote carry a small provenance note, and only those are ever updated or removed, when their Telegram message is edited or deleted. See Guardrails.
 - **It tells you what is missing.** The bot starts with nothing but a Telegram token. Whatever else is absent or broken (the Google key, a spreadsheet that is not shared, the Anthropic key, the group pairing) is reported in plain words to whoever talks to it, with the fix, by `/status`, `/start` and any command that cannot run. No model is involved in that: plain checks and prewritten sentences.
 - **Private notes stay private.** Anything from the word `#note` to the end of a message is a note for the humans: it is never stored, never sent to Claude, and a message that is only a note leaves nothing but a “[note]” acknowledgement in the inbox. The word is configurable (`NOTE_KEYWORD`).
@@ -109,12 +109,13 @@ All settings are environment variables. Defaults in **bold**.
 | `TELEGRAM_ADMIN_CHAT_ID` | Optional. Your private chat with the bot for full reports, which is your own Telegram user id; overrides `/setup`. Press Start in that chat once. |
 | `ANTHROPIC_API_KEY` | Needed to sync. Until set, the bot records messages and reports the missing key. |
 | `ANTHROPIC_MODEL` | **`claude-sonnet-5`** |
-| `ANTHROPIC_EFFORT` | Thinking effort for the first attempt, `low`…`max`. **`high`**. On long batches `high` has produced cut-short answers in production; the audit catches that and retries at `low`, which has been reliable, at the cost of a second call. `low` avoids the extra call. |
+| `ANTHROPIC_EFFORT` | Thinking effort, `low`…`max`, used for every call including the retry. **`high`** |
 | `ANTHROPIC_PRICE_INPUT_PER_MILLION`, `ANTHROPIC_PRICE_OUTPUT_PER_MILLION` | USD prices used to estimate cost in the run log. **2.0 / 10.0** |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | The whole key file as one line (single-quoted in a `.env` file). Or `GOOGLE_SERVICE_ACCOUNT_FILE`, a path to the file, for local runs. Needed to store anything; the bot reports it when missing. |
 | `GOOGLE_SHEET_ID` | Optional. The id from the spreadsheet URL (`/d/<id>/edit`). When empty, the bot finds the spreadsheet shared with the service account through the Google Drive API, which must then be enabled in the same Cloud project (the one containing `SHEET_TAB` wins if several are shared). |
 | `SHEET_TAB` | Tab that receives transactions; created with a header row if missing. **`Transactions_Trip#2`** |
 | `INBOX_TAB`, `RUNS_TAB`, `CONFIG_TAB` | Hidden tabs the bot creates: raw messages, run log, pairing. **`Bot_Inbox`, `Bot_Runs`, `Bot_Config`** |
+| `SUMMARY_TAB` | Report tab built by `init-sheet`. **`Summary`** |
 | `SYNC_CRON` | Crontab schedule in `TIMEZONE`. **`0 9 1,15 * *`** (09:00 on the 1st and 15th). Weekly Mondays: `0 9 * * 1` |
 | `TIMEZONE` | **`Europe/Istanbul`** |
 | `SCHEDULED_MIN_MESSAGES` | Minimum pending messages for a scheduled sync to call Claude. **5** |
@@ -163,8 +164,19 @@ python bot.py check           # verifies Telegram, Sheets, Anthropic, pairing an
 python bot.py sync --dry-run  # calls Claude, prints the rows it would write, writes nothing
 python bot.py sync            # one real sync from the terminal
 python bot.py backfill FILE   # queue older messages from a paste (.txt) or a Telegram Desktop export (.json)
+python bot.py init-sheet      # build the Summary report tab; --rewrite replaces an existing one
 python bot.py                 # run the bot locally (stop it before deploying: two pollers on one token conflict)
 ```
+
+## The Summary tab
+
+`python bot.py init-sheet` builds a report tab over your transactions tab, made only of formulas so it stays live:
+
+- spend, share and number of transactions per category, with a pie chart;
+- spend per month, with a column chart;
+- totals per currency, and the ten largest expenses.
+
+Totals count rows in a base currency (cell B3 on that tab, prefilled from `DEFAULT_CURRENCY`); other currencies are listed separately rather than mixed in. The category names in column A of that tab are what the category dropdown on the transactions tab offers, so adding a category is typing it in the next free cell. An existing tab of that name is left alone unless you pass `--rewrite`, which deletes and rebuilds it; the transactions tab is never touched. Starting from a blank spreadsheet, `init-sheet` plus the tab the bot creates by itself gives you the whole layout.
 
 ## Private notes
 
@@ -180,6 +192,21 @@ Gratis 266 TL #note birthday present, don't tell
 
 The keyword is matched as a whole word, in any case, anywhere in the message, and everything after it is dropped. Editing a pending message to start with `#note` retires it. The same rule applies to imported history. Change the word with `NOTE_KEYWORD`.
 
+## Privacy
+
+What leaves your Telegram group, and where it goes:
+
+- The text of messages in the paired group (captions included) is stored in the hidden `Bot_Inbox` tab of your own spreadsheet as it arrives, and sent to Anthropic's API at sync time so Claude can turn it into rows. Nothing else is sent: no photos, voice messages or files, no member names beyond the sender's first name, no messages from other chats.
+- Text after the note keyword (`#note` by default) is dropped before storage and never sent anywhere.
+- Anthropic's API terms and data policy apply to what is sent; check their current documentation for retention and training rules.
+- The service account can only reach spreadsheets you share with it. The bot keeps no other copy of your data: no database, no files, and its log lines carry message ids and counts, not message text.
+
+## Security
+
+- Only the paired group is recorded. Messages in any other chat are ignored, and while paired the bot leaves any other group it is added to.
+- `/sync` and `/backfill` work only for members of the paired group (checked with Telegram); `/setup` only for a group admin, and only while the bot is unpaired or from the fixed group. Strangers who message the bot privately get a one-line refusal and learn nothing about your setup.
+- For a personal instance, also tell BotFather `/setjoingroups` → Disable, so nobody can add your bot to another group at all, and rotate the token with `/revoke` if it ever leaks. Secrets live in environment variables only, never in the repository.
+
 ## Guardrails
 
 - New rows only ever go below the last used row, after the bot verifies that the destination cells are empty. Rows it wrote earlier are updated or removed only through their provenance note, when their Telegram message is edited or deleted, and a row is re-checked immediately before deletion. Columns it is not configured for are never touched.
@@ -192,7 +219,7 @@ The keyword is matched as a whole word, in any case, anywhere in the message, an
 
 ## When Claude or Telegram fail
 
-Calls to Anthropic are retried by the SDK on rate limits, server errors and connection problems: up to 3 retries with exponential backoff starting at half a second and capped at 8 seconds, honouring any `retry-after` the API sends. A request that still fails leaves every message pending and the failure is reported to you; the next sync retries. On top of that, an answer that comes back damaged or cut short triggers one more call at low effort (see above). Telegram delivery failures are logged and never break a sync.
+Calls to Anthropic are retried by the SDK on rate limits, server errors and connection problems: up to 3 retries with exponential backoff starting at half a second and capped at 8 seconds, honouring any `retry-after` the API sends. A request that still fails leaves every message pending and the failure is reported to you; the next sync retries. On top of that, an answer that comes back damaged, invalid or cut short triggers one more call at the same effort (see above). Telegram delivery failures are logged and never break a sync.
 
 ## Health and monitoring
 
@@ -218,6 +245,7 @@ The tests run offline and cover configuration validation, prompt rendering and t
 | `needs_review` | Claude was not sure about something in it; the note says what. Rows it was sure about are still written. |
 | `pending_revision` | The message was edited after its rows were written; the next sync updates or removes those rows, unless the new answer looks incomplete, in which case the rows stay and the message is flagged. |
 | `pending_deletion`, `deleted` | The message was deleted in Telegram after its rows were written; the next sync removes the rows and the inbox row stays, with the text, for tracing. |
+| `superseded` | An earlier version of a message that was edited later. Edits never overwrite a row: the old row stays with this status and the new text gets a new row, so the chain of edits can be read. |
 
 ## Cost
 

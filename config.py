@@ -139,6 +139,7 @@ class Settings:
     inbox_tab: str
     runs_tab: str
     config_tab: str
+    summary_tab: str  # the report tab built by `init-sheet`
     # Behaviour
     sync_cron: str
     timezone: ZoneInfo
@@ -190,6 +191,7 @@ class Settings:
             inbox_tab=_text("INBOX_TAB", "Bot_Inbox"),
             runs_tab=_text("RUNS_TAB", "Bot_Runs"),
             config_tab=_text("CONFIG_TAB", "Bot_Config"),
+            summary_tab=_text("SUMMARY_TAB", "Summary"),
             sync_cron=_text("SYNC_CRON", "0 9 1,15 * *"),
             timezone=timezone,
             day_rollover_hour=rollover,

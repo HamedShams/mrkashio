@@ -1,8 +1,6 @@
 # Kashio — Telegram expense notes to Google Sheets
 
-Revision 11 (19 Sep 2026). Status: **live on Railway; deleted messages detected and their rows removed; Telegram HTML reports; Drive discovery verified; SDK retries.** See README.md for setup.
-
-Bot: `@mrkashio_bot` · Repo: `https://github.com/hamed-grantonomy/mrkashio` (linked to Railway) · Target tab: `Transactions_Trip#2` (env `SHEET_TAB`)
+Reference specification for the current code. Anything specific to one deployment (bot name, spreadsheet, chat ids, hosting) lives only in that deployment's environment variables and is not described here.
 
 ---
 
@@ -20,7 +18,7 @@ Kashio is a small always-on Python service on Railway. It sits in your Telegram 
 ## 2. Architecture
 
 ```
-Telegram group (you + partner)                  Your private chat with the bot
+Telegram group (the household)                  Your private chat with the bot
         │  long polling                                ▲ full run report, every run
         ▼                                              │
 ┌──────────────────────────────────────────────────────┴───────┐
@@ -80,9 +78,9 @@ A file "as a mini database" is the one option that fails on Railway: the filesys
 
 Haiku 4.5 ($1 / $5) would handle most messages, but its failure mode is a silent wrong row in a finance sheet, and the price difference is a few cents a month. Opus 5 ($5 / $25) is overkill. `ANTHROPIC_MODEL` is an env var.
 
-### Thinking effort: `high` first, `low` on retry (settled 19 Sep 2026)
+### Thinking effort: `high`, and why the API's schema-enforced output is not used
 
-On 19 Sep 2026 a ten-message batch at `high` came back with results for only two messages: the model reasoned correctly about all ten (visible in the thinking summary) but the JSON it then wrote degenerated after about 1,800 characters into garbage (`"date":","`, a description `"026 kU"`, a `merged_into` of 101736) and stopped; the API's schema enforcement kept it syntactically valid, so it parsed as a success. Reproduced twice; `medium` even returned a server error; `low` and thinking-disabled both returned complete, coherent answers, and `low` still flagged an ambiguous amount for review. The same afternoon, at `high` on Railway, the corrected version of that message came back with one transaction and a needs-review flag, and the revision logic replaced twelve rows with one. Decisions: the first attempt runs at the configured effort (`high` by default, as the owner prefers); `extractor.audit()` rejects results for unknown ids, duplicates, `merged_into` outside the batch, unreadable descriptions, implausible amounts and malformed dates, and flags an answer as *cut short* when a message lists at least three amounts but came back with fewer than half as many transactions and no reason; any rejection, missing message or cut-short answer triggers one retry at `low`; whatever is still unanswered stays pending, whatever still looks cut short is flagged instead of trusted. For an edited message, `sync._hold_reason` refuses to touch its rows when the new answer looks cut short, when Claude is unsure and returned fewer items than the rows already written, or when the count fell below half; the message is flagged with "rows left unchanged" and the owner edits again to retry.
+On 19 Sep 2026 a ten-message batch at `high` came back with results for only two messages: the model reasoned correctly about all ten (visible in the thinking summary) but the JSON it then wrote degenerated after about 1,800 characters into garbage (`"date":","`, a description `"026 kU"`, a `merged_into` of 101736) and stopped; the API's schema-enforced output mode (`output_config.format`) kept it syntactically valid, so it parsed as a success. Reproduced three times. The same afternoon the edited version of that message came back with one transaction and the revision logic replaced twelve rows with one. The decisive test came later that day: the identical batch at `high` with the schema-enforced mode switched off, asking for plain JSON in text and validating it locally against the same Pydantic schema, came back complete and coherent twice (10 results, 24 items, message 52 with all 13). The fault was the constrained output mode interacting with long reasoning, not the reasoning. Decisions: Claude answers in plain JSON (the schema is appended to the prompt, the answer is streamed, code fences tolerated, validated with the same model, categories still limited to the sheet's list); effort stays `high` for both the first attempt and the retry; `extractor.audit()` still rejects results for unknown ids, duplicates, `merged_into` outside the batch, unreadable descriptions, implausible amounts and malformed dates, and flags an answer as *cut short* when a message lists at least three amounts but came back with fewer than half as many transactions and no reason; any rejection, missing message, invalid JSON or cut-short answer triggers one retry; whatever is still unanswered stays pending, whatever still looks cut short is flagged instead of trusted. For an edited message, `sync._hold_reason` refuses to touch its rows when the new answer looks cut short, when Claude is unsure and returned fewer items than the rows already written, or when the count fell below half; the message is flagged with "rows left unchanged" and the operator edits again to retry.
 
 ### Your traffic, priced
 
@@ -175,17 +173,29 @@ Telegram bots never receive messages sent before they joined. History comes in t
 
 "2€ lieferung" was filed under Eating Out because the category hints named "food delivery" under Eating Out and nothing about delivery under Transport, so the model matched the German word to the only delivery it had been given. Fix: the Transport hint now reads "moving people or things: … courier, shipping and delivery fees (Lieferung, kargo)", Eating Out is "a food order (the food itself; a separate delivery fee is Transport)", Other names money transfers (havale, Überweisung), and the prompt's Category section tells the model that descriptions come in English, German, Turkish or Persian, often as a single word, to judge by meaning with a few worked equivalences, and to categorise the service paid for rather than the place. One example ("2€ lieferung" → Transport) was added.
 
+### The inbox as an audit trail
+
+An edit never overwrites an inbox row: the previous row is marked `superseded` (its text, status and rows kept) and a new row is appended with the edited text and the status the next sync should act on (`pending`, `pending_revision`, or `skipped` for a note). A deletion marks the latest row `pending_deletion`, then `deleted`, text kept. So the chain of edits and deletions of any message can be read from the tab. Status changes made by a sync (`processed`, `merged`, `skipped`, `needs_review`) are written in place on the row they concern.
+
+### The Summary report tab (`init-sheet`)
+
+`python bot.py init-sheet` builds a report tab (`SUMMARY_TAB`, default `Summary`) over the transactions tab, all formulas: spend, share and count per category, spend per month (months found with `SORT(UNIQUE(EOMONTH(…)))`), totals per currency, the ten largest expenses, a pie chart by category and a column chart by month. Totals count rows in a base currency (cell B3, prefilled from `DEFAULT_CURRENCY`); other currencies are listed separately, never summed together. The category names in `A7:A25` of that tab are what the category dropdown on the transactions tab offers, because `init-sheet` points the dropdown's data validation there, so a category is added by typing it in the next free cell. An existing tab of that name is kept unless `--rewrite` is given, in which case it is deleted and rebuilt (the transactions tab is never touched).
+
+### Who can talk to the bot
+
+Only the paired group is recorded; messages from any other chat are ignored, and while paired the bot leaves any other group it is added to (`my_chat_member` updates). `/sync` and `/backfill` are accepted only from members of the paired group (checked with Telegram), `/setup` only from a group admin and only while unpaired or from the fixed group; strangers in a private chat get a one-line refusal. The remaining exposure is the unpaired window of a fresh deployment and the token itself; the README recommends BotFather's `/setjoingroups` → Disable for a personal instance and `/revoke` if the token ever leaks.
+
 ### Reports
 
 The private report is Telegram HTML: a bold header with a status emoji (✅ ok, 🧪 dry run, ⏭ nothing to do, ❌ failed), one bullet per figure, then bold sections with bullets for rejected answers, still-pending messages, held edits and items needing review; all user text is HTML-escaped. The group summary and the status checklist use the same style. The terminal gets the plain-text form of the same report.
 
 ### Retries
 
-Anthropic calls: the SDK retries 408/409/429/5xx and connection errors up to 3 times with exponential backoff (0.5 s doubling to 8 s, honouring `retry-after`); a request that still fails fails the sync, messages stay pending, and the report carries the error. Damaged or cut-short answers get one more call at low effort. Google Sheets calls: 3 attempts with 2/4 s backoff. Telegram sends: logged, never fatal.
+Anthropic calls: the SDK retries 408/409/429/5xx and connection errors up to 3 times with exponential backoff (0.5 s doubling to 8 s, honouring `retry-after`); a request that still fails fails the sync, messages stay pending, and the report carries the error. Damaged, invalid or cut-short answers get one more call at the same effort. Google Sheets calls: 3 attempts with 2/4 s backoff. Telegram sends: logged, never fatal.
 
 ### Number format and layout
 
-`DECIMAL_SEPARATOR` (`.` default, `,` for 1.154,5) is rendered into the prompt's amount rules. `COLUMN_DATE/AMOUNT/CURRENCY/DESCRIPTION/CATEGORY` (defaults B, C, D, E, G) drive every read and write on the transactions tab, the header row of a tab the bot creates, the guardrail and the formats; letters must be single and distinct.
+`DECIMAL_SEPARATOR` (`.` default, `,` for 1.154,5) is rendered into the prompt's amount rules. `COLUMN_DATE/AMOUNT/CURRENCY/DESCRIPTION/CATEGORY` (defaults B, C, D, E, G) drive every read and write on the transactions tab, the header row of a tab the bot creates, the guardrail, the formats and the Summary's formulas; letters must be single and distinct.
 
 ### Guarantees and limits
 
@@ -201,7 +211,7 @@ Anthropic calls: the SDK retries 408/409/429/5xx and connection errors up to 3 t
 Input to Claude (one per pending message):
 
 ```xml
-<message id="1041" sender="the owner" sent="2026-07-24 21:46" edited="true">
+<message id="1041" sender="Sam" sent="2026-07-24 21:46" edited="true">
 Gratis
 266 TL
 
@@ -239,7 +249,7 @@ Sheet columns written: **B** date, **C** amount (number), **D** currency, **E** 
 
 ### Categories (column G): read from the sheet at every sync
 
-Column G carries a dropdown fed from the category table in `Summary!B28:B35`, which the Summary's SUMIF formulas also use. The bot imposes no list: at each sync it reads the dropdown's allowed values, drops template placeholders, builds the output schema with exactly those names, and lists them in the prompt with a one-line hint where one is known. Editing the Summary table is all it takes to change categories. On 8 Sep 2026 the list was reduced, with the owner's approval, to eight MECE names (the planned £750 stays on the housing row):
+Column G carries a dropdown fed from the category table in `Summary!B28:B35`, which the Summary's SUMIF formulas also use. The bot imposes no list: at each sync it reads the dropdown's allowed values, drops template placeholders, builds the output schema with exactly those names, and lists them in the prompt with a one-line hint where one is known. Editing the Summary table is all it takes to change categories. On 8 Sep 2026 the list was reduced, with the operator's approval, to eight MECE names (the planned £750 stays on the housing row):
 
 | Category | Covers |
 |---|---|
@@ -264,7 +274,7 @@ If column G ever has no dropdown, this same list is the built-in fallback (`DEFA
 |---|---|---|---|
 | Gratis 266 TL (24 Jul 21:46) | 24/07/2026 · 266 · TRY · Gratis · Personal Care | same | — |
 | Cafe 385 TL (same message, edited in) | 24/07/2026 · 385 · TRY · Cafe · Eating Out | Cafe (Turk Kahvesi) | detail added by hand |
-| Avm 810 (partner) | 24/07/2026 · 810 · TRY · Avm · Shopping | avm (random stuffs for the hause) | detail added by hand |
+| Avm 810 (second member) | 24/07/2026 · 810 · TRY · Avm · Shopping | avm (random stuffs for the hause) | detail added by hand |
 | Cafe IKEA 350 TL | 25/07/2026 · 350 · TRY · Cafe IKEA · Eating Out | same | — |
 | UBER 452 TL | 25/07/2026 · 452 · TRY · UBER · Transport | UBER nach hause (with luggages from Meka) | detail added by hand |
 | A101 300 (26 Jul 01:28) | **25/07/2026** · 300 · TRY · Groceries - A101 · Groceries | Groceries - A101 (oil) | date via 04:00 rollover ✓; "(oil)" by hand |
@@ -274,7 +284,7 @@ If column G ever has no dropdown, this same list is the built-in fallback (`DEFA
 | Cafe 435 TL | 28/07/2026 · 435 · TRY · Cafe · Eating Out | same | — |
 | istanbul card charge 414 TL | 28/07/2026 · 414 · TRY · istanbul card charge · Transport | same | — |
 | A101 100 TL | 28/07/2026 · 100 · TRY · Groceries - A101 · Groceries | same | — |
-| 📅 @partner | skipped: no expense | skipped | ✓ |
+| 📅 @member | skipped: no expense | skipped | ✓ |
 | Barbershop 💈 (arash) 604 TL | 29/07/2026 · 604 · TRY · Barbershop · Personal Care | Barbershop | ✓ emoji and name dropped |
 
 If you want those extra details in the sheet, write them in the Telegram message ("Cafe (Turk Kahvesi) 385") and the bot keeps them verbatim.
@@ -283,7 +293,7 @@ If you want those extra details in the sheet, write them in the Telegram message
 
 ## 7. Decisions (all settled)
 
-- Name **Kashio**, bot `@mrkashio_bot`, privacy mode disabled.
+- Name **Kashio**; the bot's privacy mode must be disabled in BotFather so it sees group messages.
 - Scheduled sync twice a month (`SYNC_CRON=0 9 1,15 * *`), only when ≥ `SCHEDULED_MIN_MESSAGES` (5) are pending.
 - `/sync` processes everything pending when ≥ `MANUAL_MIN_MESSAGES` (1); otherwise "nothing new".
 - Thinking effort `high`.
@@ -300,9 +310,10 @@ If you want those extra details in the sheet, write them in the Telegram message
 ## 8. Files (flat, no subfolders)
 
 ```
-mrkashio/
+kashio/
 ├── bot.py            Telegram handlers (/setup, /sync, /backfill…), schedule, command line
 ├── backfill.py       Parses pasted Telegram messages or a Desktop JSON export; queues them
+├── summary.py        Builds the Summary report tab (init-sheet): formulas, charts, the category dropdown
 ├── tests/            Offline pytest suite (config, extractor, sync, sheets, backfill, bot routing)
 ├── LICENSE           MIT
 ├── .github/workflows/tests.yml   runs the tests on every push
@@ -338,7 +349,7 @@ Dependencies: `python-telegram-bot[job-queue]` (Telegram + scheduler), `gspread`
 
 ## 10. Testing status
 
-**Live, 8 Sep 2026, from the owner's machine with the real credentials:**
+**Live, 8 Sep 2026, from a developer machine with real credentials:**
 - `python bot.py check`: Telegram token, group and admin (from env), Sheets access, categories from the dropdown, Anthropic key and schedule all pass. Hidden tabs created; run-log header extended with `merged`.
 - Ingest: the bot ran locally for 45 s and stored three pending group messages, including an edit ("test" → "UBER"); migration service messages were ignored.
 - One sync (the only paid call): 3 pending → 1 row at `Transactions_Trip#2!B153:G153` as a real date 07/09/2026 (02:30 rolled back a day), numeric ₺10.0, TRY, "UBER", F empty, G "Transport"; "10 TL" folded into that row; the greeting skipped; inbox statuses and run log correct; report delivered. 4,600 input / 234 output tokens, $0.0115.
@@ -348,7 +359,7 @@ Dependencies: `python-telegram-bot[job-queue]` (Telegram + scheduler), `gspread`
 
 **Live on Railway, 8 Sep 2026 15:50, first deploy:** the deployed bot consumed the nine updates queued at Telegram; three earlier `/sync` commands with nothing pending were answered "Nothing new to process" and logged as `skipped_threshold`; a fourth `/sync` processed "UBER 2 / 1,000.5 یورو" into row 154 (08/09/2026, 1000.5, EUR, Transport), so Persian currency words and comma-formatted amounts work end to end on the deployed code; a message edited after its sync was marked `edited_after_sync` with a warning, and the sheet left untouched. CI (GitHub Actions) green on the pushed commit.
 
-**Verified live by 19 Sep 2026:** the scheduled trigger (15 Sep), the photo acknowledgement, manual `/sync` runs, a week of production use, and the failure of 19 Sep reproduced three times with diagnostic calls before the fix.
+**Verified live by 19 Sep 2026:** the scheduled trigger (15 Sep), the photo acknowledgement, manual `/sync` runs, an edit re-synced in place, a deleted message's row removed, the Summary tab built over live data, the plain-JSON extractor at `high` on the batch that used to fail (10 of 10 messages, 24 items, one call), and a week of production use.
 
 **Not exercised live:** `/setup`, `/backfill` and `/status` typed in Telegram, the note acknowledgement, a Telegram delivery failure, the guardrail's refusal path, and the health endpoint under Railway.
 

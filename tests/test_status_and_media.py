@@ -30,9 +30,9 @@ def test_status_names_every_missing_piece_with_its_fix(settings):
     settings = replace(settings, telegram_chat_id=None, telegram_admin_chat_id=None)
     app = stub_kashio(settings, store_error="GOOGLE_SERVICE_ACCOUNT_JSON is not set. Create a Google service account…",
                       claude_error="ANTHROPIC_API_KEY is not set. Create a key at console.anthropic.com…")
-    text = app.status_text("mrkashio_bot")
+    text = app.status_text("kashio_bot")
     assert text.startswith("🛠 Not quite ready yet")
-    assert "✅ Telegram: connected as @mrkashio_bot" in text
+    assert "✅ Telegram: connected as @kashio_bot" in text
     assert "❌ Google Sheets: GOOGLE_SERVICE_ACCOUNT_JSON is not set" in text
     assert "❌ Claude: ANTHROPIC_API_KEY is not set" in text
     assert "⚠️ Not paired with a group yet" in text and "/setup" in text

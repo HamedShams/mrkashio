@@ -9,7 +9,7 @@ from telegram.ext import MessageHandler
 import bot
 from config import Settings
 
-BOT = SimpleNamespace(username="mrkashio_bot")
+BOT = SimpleNamespace(username="kashio_bot")
 
 
 def update_for(text: str, chat_type: str = Chat.SUPERGROUP, edited: bool = False) -> Update:
@@ -33,7 +33,7 @@ def first_matching_handler(application, update):
 
 def test_sync_variants_route_to_the_sync_handler(settings: Settings):
     application = bot.build_application(SimpleNamespace(settings=settings))
-    for text in ("/sync", "/sync@mrkashio_bot", "@mrkashio_bot /sync", "@mrkashio_bot  /sync please"):
+    for text in ("/sync", "/sync@kashio_bot", "@kashio_bot /sync", "@kashio_bot  /sync please"):
         handler = first_matching_handler(application, update_for(text))
         assert handler is not None and handler.callback is bot.on_sync, text
 
@@ -49,3 +49,24 @@ def test_private_text_goes_to_the_paste_collector_and_setup_is_a_command(setting
     application = bot.build_application(SimpleNamespace(settings=settings))
     assert first_matching_handler(application, update_for("some pasted text", chat_type=Chat.PRIVATE)).callback is bot.on_private_text
     assert first_matching_handler(application, update_for("/setup")).callback is bot.on_setup
+
+
+def test_bot_leaves_a_group_it_is_not_paired_with(settings):
+    import asyncio
+    from telegram import ChatMember, ChatMemberUpdated
+    from tests.test_status_and_media import stub_kashio
+    app = stub_kashio(settings, store=object(), claude=object())
+    left = []
+    context = SimpleNamespace(application=SimpleNamespace(bot_data={"kashio": app}),
+                              bot=SimpleNamespace(leave_chat=lambda chat_id: left.append(chat_id) or _done()))
+    me = User(id=1, first_name="Kashio", is_bot=True)
+    def joined(chat_id):
+        return ChatMemberUpdated(chat=Chat(id=chat_id, type=Chat.SUPERGROUP, title="Other"), from_user=User(id=7, first_name="X", is_bot=False),
+                                 date=datetime.now(timezone.utc), old_chat_member=ChatMember(user=me, status="left"), new_chat_member=ChatMember(user=me, status="member"))
+    asyncio.run(bot.on_my_chat_member(Update(update_id=1, my_chat_member=joined(-999)), context))
+    asyncio.run(bot.on_my_chat_member(Update(update_id=2, my_chat_member=joined(settings.telegram_chat_id)), context))
+    assert left == [-999]
+
+
+async def _done():
+    return None

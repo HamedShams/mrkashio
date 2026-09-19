@@ -1,3 +1,6 @@
+import json
+from types import SimpleNamespace
+
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
@@ -89,27 +92,38 @@ def test_audit_flags_an_answer_that_is_cut_short():
 
 
 class FakeClient:
-    """Answers the first call with a damaged, incomplete result and the retry with a complete one."""
+    """Answers messages.stream() with canned JSON text, the way the bot now asks Claude to reply."""
 
     def __init__(self, answers):
         self.answers, self.requests = list(answers), []
 
-    class _Messages:
-        def __init__(self, outer):
-            self.outer = outer
+    class _Stream:
+        def __init__(self, outer, request):
+            self.outer, self.request = outer, request
 
-        def parse(self, **request):
-            self.outer.requests.append(request)
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get_final_message(self):
             payload = self.outer.answers.pop(0)
-            parsed_output = request["output_format"].model_validate({"results": payload})
-            return SimpleNamespace(parsed_output=parsed_output, stop_reason="end_turn", usage=SimpleNamespace(input_tokens=100, output_tokens=50))
+            text = payload if isinstance(payload, str) else json.dumps({"results": payload})
+            return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)], stop_reason="end_turn",
+                                   usage=SimpleNamespace(input_tokens=100, output_tokens=50))
 
     @property
     def messages(self):
-        return self._Messages(self)
+        outer = self
+
+        def stream(**request):
+            outer.requests.append(request)
+            return FakeClient._Stream(outer, request)
+        return SimpleNamespace(stream=stream)
 
 
-def test_extract_retries_once_without_thinking_and_reports_the_rest(settings):
+def test_extract_retries_once_at_the_same_effort_and_reports_the_rest(settings):
     from types import SimpleNamespace as NS
     messages = [InboxMessage(2, 50, "Alex", at(2026, 9, 8, 12), None, "Cafe 385", "pending"),
                 InboxMessage(3, 51, "Alex", at(2026, 9, 8, 13), None, "A101 300", "pending"),
@@ -121,9 +135,29 @@ def test_extract_retries_once_without_thinking_and_reports_the_rest(settings):
     out = extract(client, settings, load_prompt(settings), messages, ["Other"])
     assert [r.message_id for r in out.results] == [51, 50]  # the retry's answers first, then the surviving good one
     assert out.unanswered == [52] and out.calls == 2 and out.input_tokens == 200
-    assert client.requests[0]["output_config"] == {"effort": "high"} and client.requests[1]["output_config"] == {"effort": "low"}
-    assert "thinking" not in client.requests[1]
+    assert client.requests[0]["output_config"] == {"effort": "high"} and client.requests[1]["output_config"] == {"effort": "high"}
+    assert "output_format" not in client.requests[0] and "thinking" not in client.requests[1]
+    system = client.requests[0]["system"]
+    assert system.rstrip().endswith("}") and '"SyncResult"' in system and '"Other"' in system  # the schema rides in the prompt
     assert any("malformed date" in p for p in out.problems)
+
+
+def test_answers_in_code_fences_or_with_chatter_are_parsed_and_junk_is_rejected():
+    from extractor import parse_answer
+    model = result_model(["Other"])
+    body = json.dumps({"results": [result(1, [tx()])]})
+    assert [r.message_id for r in parse_answer("```json\n" + body + "\n```", model)] == [1]
+    assert [r.message_id for r in parse_answer("Here you go:\n" + body + "\nDone.", model)] == [1]
+    assert parse_answer("no json here", model) is None
+    assert parse_answer(json.dumps({"results": [{"message_id": 1, "transactions": [{"description": "x", "amount": 1, "currency": "TRY", "category": "Not a category", "date": None}], "merged_into": None, "skip_reason": None, "needs_review": False, "note": None}]}), model) is None
+
+
+def test_an_unparseable_answer_is_retried_then_left_pending(settings):
+    messages = [InboxMessage(2, 50, "Alex", at(2026, 9, 8, 12), None, "Cafe 385", "pending")]
+    client = FakeClient(["garbage", "still garbage"])
+    out = extract(client, settings, load_prompt(settings), messages, ["Other"])
+    assert out.results == [] and out.unanswered == [50] and out.calls == 2
+    assert out.problems.count("the answer was not a valid JSON object for the schema") == 2
 
 
 def test_extract_retries_a_truncated_answer_and_keeps_the_flag_if_it_stays_short(settings):
@@ -138,4 +172,3 @@ def test_extract_retries_a_truncated_answer_and_keeps_the_flag_if_it_stays_short
     assert out.calls == 2 and 52 in out.suspicious
 
 
-from types import SimpleNamespace  # noqa: E402  (used by FakeClient)

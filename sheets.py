@@ -40,6 +40,7 @@ STATUS_PENDING = "pending"
 STATUS_PENDING_REVISION = "pending_revision"  # edited after its rows were written; the rows get replaced at the next sync
 STATUS_PENDING_DELETION = "pending_deletion"  # deleted in Telegram after its rows were written; the rows go at the next sync
 STATUS_DELETED = "deleted"  # rows removed because the message was deleted in Telegram; the inbox row stays for tracing
+STATUS_SUPERSEDED = "superseded"  # an earlier version of a message that was edited later; kept so the chain of edits can be read
 PENDING_STATUSES = (STATUS_PENDING, STATUS_PENDING_REVISION, STATUS_PENDING_DELETION)
 STATUS_PROCESSED = "processed"
 STATUS_SKIPPED = "skipped"
@@ -245,36 +246,47 @@ class SheetStore:
                 continue
         return ids
 
-    def update_message(self, message_id: int, text: str, edited_at: datetime, retire_reason: str | None = None) -> str | None:
-        """Store an edit and return the message's resulting status, or None if it was never stored.
+    def latest_row(self, message_id: int) -> tuple[int, list[str]] | None:
+        """The newest inbox row for a message (edits append rows), as (row number, values), or None."""
+        found: tuple[int, list[str]] | None = None
+        for index, values in enumerate(_retry(self.inbox.get_all_values)[1:], start=2):
+            if values and values[0] == str(message_id):
+                found = (index, list(values) + [""] * (len(INBOX_HEADERS) - len(values)))
+        return found
 
-        - still pending: the text is replaced (or, with `retire_reason`, the message is closed as skipped)
-        - skipped or flagged without any row written: reopened as pending, so the next sync looks at it again
-        - already turned into sheet rows: `pending_revision`, and the next sync replaces those rows with
-          whatever the edited text now says (or removes them, when the message was edited into a note)
+    def update_message(self, message_id: int, text: str, edited_at: datetime, retire_reason: str | None = None) -> str | None:
+        """Record an edit as a new inbox row and return the new row's status, or None if the message was never stored.
+
+        The inbox is an audit trail: the previous row is kept and marked `superseded`, the new row carries the
+        edited text. Its status says what the next sync should do:
+        - the message was still pending: `pending` again (or `skipped`, with `retire_reason`, when edited into a note)
+        - it was skipped or flagged without any row written: `pending`, so the next sync looks at it again
+        - it already has rows in the sheet: `pending_revision`, and the sync replaces those rows with what the
+          edited text now says (or removes them, when the message was edited into a note)
         """
-        cell = _retry(lambda: self.inbox.find(str(message_id), in_column=1))
-        if cell is None:
+        latest = self.latest_row(message_id)
+        if latest is None:
             return None
-        values = _retry(lambda: self.inbox.row_values(cell.row)) + [""] * len(INBOX_HEADERS)
+        index, values = latest
         previous = values[5] or STATUS_PENDING
         rows_added = int(values[7]) if str(values[7]).isdigit() else 0
-        has_rows = rows_added > 0 or previous == STATUS_PENDING_REVISION
+        has_rows = rows_added > 0 or previous in (STATUS_PENDING_REVISION, STATUS_PENDING_DELETION)
         now = datetime.now(self.settings.timezone).strftime(TIMESTAMP)
-        updates = [{"range": f"D{cell.row}:E{cell.row}", "values": [[edited_at.strftime(TIMESTAMP), text]]}]
         if has_rows:
             status = STATUS_PENDING_REVISION
             note = "retracted after an edit; its rows will be removed" if retire_reason else "edited after its rows were written; they will be replaced"
-            updates.append({"range": f"F{cell.row}", "values": [[status]]})
-            updates.append({"range": f"I{cell.row}", "values": [[note]]})
+            processed_at, carried = "", rows_added
         elif retire_reason:
-            status = STATUS_SKIPPED
-            updates.append({"range": f"F{cell.row}:I{cell.row}", "values": [[status, now, 0, retire_reason]]})
+            status, note, processed_at, carried = STATUS_SKIPPED, retire_reason, now, 0
         else:
-            status = STATUS_PENDING
-            if previous != STATUS_PENDING:
-                updates.append({"range": f"F{cell.row}:I{cell.row}", "values": [[status, "", "", "reopened after an edit"]]})
-        _retry(lambda: self.inbox.batch_update(updates))
+            status, processed_at, carried = STATUS_PENDING, "", ""
+            note = "edited" if previous == STATUS_PENDING else "reopened after an edit"
+        new_row = [str(message_id), values[1], values[2], edited_at.strftime(TIMESTAMP), text, status, processed_at, carried, note]
+        _retry(lambda: self.inbox.batch_update([
+            {"range": f"F{index}", "values": [[STATUS_SUPERSEDED]]},
+            {"range": f"I{index}", "values": [[f"superseded by an edit at {edited_at.strftime(TIMESTAMP)}; was {previous}"]]},
+        ]))
+        _retry(lambda: self.inbox.append_row(new_row, value_input_option="RAW"))
         return status
 
     def pending_messages(self) -> list[InboxMessage]:

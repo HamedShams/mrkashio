@@ -1,71 +1,72 @@
-"""What an edit does to a stored message, driven through a stubbed inbox tab."""
+"""What an edit does to the inbox: the old row is superseded, a new row carries the edited text and the next action."""
 
-from datetime import datetime
 from types import SimpleNamespace
 
-from sheets import STATUS_PENDING, STATUS_PENDING_REVISION, STATUS_SKIPPED, SheetStore
+from sheets import STATUS_PENDING, STATUS_PENDING_REVISION, STATUS_SKIPPED, STATUS_SUPERSEDED, SheetStore
 from tests.conftest import at
+
+HEADER = ["message_id", "sender", "sent_at", "edited_at", "text", "status", "processed_at", "rows_added", "note"]
 
 
 class StubInbox:
-    def __init__(self, row):
-        self.row, self.updates = row, []
+    def __init__(self, *rows):
+        self.rows, self.updates, self.appended = [HEADER, *rows], [], []
 
-    def find(self, query, in_column=None):
-        return SimpleNamespace(row=7) if query == self.row[0] else None
-
-    def row_values(self, index):
-        return list(self.row)
+    def get_all_values(self):
+        return [list(r) for r in self.rows]
 
     def batch_update(self, updates):
         self.updates.extend(updates)
 
+    def append_row(self, values, value_input_option=None):
+        self.appended.append(values)
 
-def store_with(row, settings):
+
+def store_with(settings, *rows):
     store = SheetStore.__new__(SheetStore)
-    store.settings = settings
-    store.columns = settings.columns
-    store.inbox = StubInbox(row)
+    store.settings, store.columns = settings, settings.columns
+    store.inbox = StubInbox(*rows)
     return store
 
 
-def status_written(inbox):
-    for update in inbox.updates:
-        if update["range"].startswith("F7"):
-            return update["values"][0][0]
-    return None
+def superseded_row(inbox):
+    return next(int(u["range"][1:]) for u in inbox.updates if u["values"][0][0] == STATUS_SUPERSEDED)
 
 
-def test_pending_message_keeps_pending_and_gets_the_new_text(settings):
-    store = store_with(["42", "Alex", "2026-09-08 12:00:00", "", "A101", STATUS_PENDING, "", "", ""], settings)
+def test_pending_message_gets_a_new_pending_row_and_the_old_one_is_superseded(settings):
+    store = store_with(settings, ["42", "Alex", "2026-09-08 12:00:00", "", "A101", STATUS_PENDING, "", "", ""])
     assert store.update_message(42, "A101 300", at(2026, 9, 8, 12, 5)) == STATUS_PENDING
-    assert store.inbox.updates[0]["values"][0][1] == "A101 300" and status_written(store.inbox) is None
+    assert superseded_row(store.inbox) == 2
+    new = store.inbox.appended[0]
+    assert new[0] == "42" and new[4] == "A101 300" and new[5] == STATUS_PENDING and new[3] == "2026-09-08 12:05:00"
+    assert new[1] == "Alex" and new[2] == "2026-09-08 12:00:00"  # sender and original send time carried over
+
+
+def test_the_latest_row_is_used_when_a_message_was_edited_before(settings):
+    store = store_with(settings,
+                       ["42", "Alex", "2026-09-08 12:00:00", "", "A101", STATUS_SUPERSEDED, "", "", "superseded"],
+                       ["42", "Alex", "2026-09-08 12:00:00", "2026-09-08 12:05:00", "A101 300", "processed", "2026-09-08 13:00:00", "1", ""])
+    assert store.update_message(42, "A101 350", at(2026, 9, 8, 14)) == STATUS_PENDING_REVISION
+    assert superseded_row(store.inbox) == 3 and store.inbox.appended[0][7] == 1  # rows_added carried for the hold rule
 
 
 def test_skipped_message_without_rows_is_reopened(settings):
-    store = store_with(["42", "Alex", "2026-09-08 12:00:00", "", "IKEA", STATUS_SKIPPED, "2026-09-08 13:00:00", "0", "no amount"], settings)
+    store = store_with(settings, ["42", "Alex", "2026-09-08 12:00:00", "", "IKEA", STATUS_SKIPPED, "2026-09-08 13:00:00", "0", "no amount"])
     assert store.update_message(42, "IKEA 900 TL", at(2026, 9, 8, 14)) == STATUS_PENDING
-    assert status_written(store.inbox) == STATUS_PENDING
-
-
-def test_message_that_produced_rows_becomes_a_revision(settings):
-    store = store_with(["42", "Alex", "2026-09-08 12:00:00", "", "A101 300", "processed", "2026-09-08 13:00:00", "1", ""], settings)
-    assert store.update_message(42, "A101 350", at(2026, 9, 8, 14)) == STATUS_PENDING_REVISION
-    assert status_written(store.inbox) == STATUS_PENDING_REVISION
+    assert store.inbox.appended[0][8] == "reopened after an edit"
 
 
 def test_message_with_rows_edited_into_a_note_is_a_retraction(settings):
-    store = store_with(["42", "Alex", "2026-09-08 12:00:00", "", "A101 300", "processed", "2026-09-08 13:00:00", "1", ""], settings)
+    store = store_with(settings, ["42", "Alex", "2026-09-08 12:00:00", "", "A101 300", "processed", "2026-09-08 13:00:00", "1", ""])
     assert store.update_message(42, "[note]", at(2026, 9, 8, 14), retire_reason="private note") == STATUS_PENDING_REVISION
-    assert store.inbox.updates[0]["values"][0][1] == "[note]"
+    assert store.inbox.appended[0][4] == "[note]" and "removed" in store.inbox.appended[0][8]
 
 
-def test_pending_message_edited_into_a_note_is_retired(settings):
-    store = store_with(["42", "Alex", "2026-09-08 12:00:00", "", "A101 300", STATUS_PENDING, "", "", ""], settings)
+def test_pending_message_edited_into_a_note_is_closed(settings):
+    store = store_with(settings, ["42", "Alex", "2026-09-08 12:00:00", "", "A101 300", STATUS_PENDING, "", "", ""])
     assert store.update_message(42, "[note]", at(2026, 9, 8, 14), retire_reason="private note") == STATUS_SKIPPED
-    assert status_written(store.inbox) == STATUS_SKIPPED
 
 
 def test_unknown_message_returns_none(settings):
-    store = store_with(["1", "Alex", "2026-09-08 12:00:00", "", "x", STATUS_PENDING, "", "", ""], settings)
-    assert store.update_message(999, "y", at(2026, 9, 8, 14)) is None
+    store = store_with(settings, ["1", "Alex", "2026-09-08 12:00:00", "", "x", STATUS_PENDING, "", "", ""])
+    assert store.update_message(999, "y", at(2026, 9, 8, 14)) is None and store.inbox.appended == []

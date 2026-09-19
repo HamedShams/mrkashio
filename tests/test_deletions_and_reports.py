@@ -79,12 +79,12 @@ def test_text_messages_still_wait_for_the_threshold_while_deletions_go_through(s
 
 
 def test_html_report_is_bold_bulleted_and_escaped(settings):
-    report = sync.RunReport("manual", "Hamed <3", at(2026, 9, 19, 14, 9), "claude-sonnet-5", "high", status=sync.STATUS_OK, pending=8, processed=8, calls=1)
-    report.review.append(sync.ReviewItem(52, "Hamed", at(2026, 9, 16, 17, 4), "Sep 3 & more", "amount '11,58.4' <unclear>"))
+    report = sync.RunReport("manual", "Alex <3", at(2026, 9, 19, 14, 9), "claude-sonnet-5", "high", status=sync.STATUS_OK, pending=8, processed=8, calls=1)
+    report.review.append(sync.ReviewItem(52, "Alex", at(2026, 9, 16, 17, 4), "Sep 3 & more", "amount '11,58.4' <unclear>"))
     text = sync.format_report(report, as_html=True)
     lines = text.split("\n")
     assert lines[0] == "<b>✅ Kashio sync report</b>" and lines[1].startswith("• Status: ok")
-    assert "• Trigger: manual (Hamed &lt;3)" in text and "<b>⚠️ Needs review:</b>" in text
+    assert "• Trigger: manual (Alex &lt;3)" in text and "<b>⚠️ Needs review:</b>" in text
     assert "Sep 3 &amp; more" in text and "&lt;unclear&gt;" in text and "<unclear>" not in text
     plain = sync.format_report(report)
     assert plain.startswith("✅ Kashio sync report\n• Status: ok") and "<b>" not in plain and "<unclear>" in plain
