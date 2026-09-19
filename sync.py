@@ -6,6 +6,7 @@ out even when the spreadsheet is unreachable. It says exactly what was written, 
 
 from __future__ import annotations
 
+import html
 import logging
 import re
 from dataclasses import dataclass, field
@@ -16,6 +17,7 @@ import anthropic
 from config import Settings
 from extractor import Extraction, clean_categories, extract
 from sheets import (
+    STATUS_DELETED,
     STATUS_MERGED,
     STATUS_NEEDS_REVIEW,
     STATUS_PROCESSED,
@@ -69,6 +71,7 @@ class RunReport:
     review: list[ReviewItem] = field(default_factory=list)
     revisions: list[tuple[InboxMessage, list[TransactionRow]]] = field(default_factory=list)  # edited messages and their new rows
     retractions: list[InboxMessage] = field(default_factory=list)  # edited into a note: rows to remove
+    deletions: list[InboxMessage] = field(default_factory=list)  # deleted in Telegram: rows to remove
     rows_updated: int = 0
     rows_deleted: int = 0
     unanswered: list[int] = field(default_factory=list)  # message ids Claude gave no usable answer for; they stay pending
@@ -86,6 +89,10 @@ class RunReport:
     @property
     def revised(self) -> int:
         return len(self.revisions) + len(self.retractions)
+
+    @property
+    def removed_messages(self) -> int:
+        return len(self.retractions) + len(self.deletions)
 
     def totals_by_currency(self) -> dict[str, float]:
         totals: dict[str, float] = {}
@@ -157,22 +164,29 @@ def run_sync(
     try:
         pending = store.pending_messages()
         report.pending = len(pending)
-        if len(pending) < report.threshold:
+        # Deletions and notes-only edits cost nothing and are applied regardless of the threshold; only Claude is gated.
+        report.deletions = [m for m in pending if m.deletion]
+        report.retractions = [m for m in pending if m.revision and m.text.strip() in ("", NOTE_ONLY_TEXT)]
+        to_extract = [m for m in pending if not m.deletion and m not in report.retractions]
+        ask_claude = len(to_extract) >= report.threshold and bool(to_extract)
+        if not ask_claude and not report.deletions and not report.retractions:
             report.status = STATUS_SKIPPED_THRESHOLD
         else:
-            # A message edited into a note (or emptied) has nothing for Claude: its rows just go away.
-            report.retractions = [m for m in pending if m.revision and m.text.strip() in ("", NOTE_ONLY_TEXT)]
-            to_extract = [m for m in pending if m not in report.retractions]
-            report.categories = clean_categories(store.category_options())
-            log.info("Categories in force: %s", ", ".join(report.categories))
-            extraction = extract(client, settings, system_prompt, to_extract, report.categories) if to_extract else Extraction(results=[])
-            report.calls, report.input_tokens, report.output_tokens = extraction.calls, extraction.input_tokens, extraction.output_tokens
-            report.cost_usd = extraction.cost_usd(settings)
-            report.unanswered = list(extraction.unanswered)
-            report.problems = list(extraction.problems)
-            report.suspicious = dict(extraction.suspicious)
-            marks = _apply(extraction, to_extract, settings, report)
-            report.processed = len(pending) - len(report.unanswered)
+            extraction = Extraction(results=[])
+            marks: list[tuple[int, str, int, str]] = []
+            if ask_claude:
+                report.categories = clean_categories(store.category_options())
+                log.info("Categories in force: %s", ", ".join(report.categories))
+                extraction = extract(client, settings, system_prompt, to_extract, report.categories)
+                report.calls, report.input_tokens, report.output_tokens = extraction.calls, extraction.input_tokens, extraction.output_tokens
+                report.cost_usd = extraction.cost_usd(settings)
+                report.unanswered = list(extraction.unanswered)
+                report.problems = list(extraction.problems)
+                report.suspicious = dict(extraction.suspicious)
+                marks = _apply(extraction, to_extract, settings, report)
+                report.processed = len(to_extract) - len(report.unanswered)
+            else:
+                report.unanswered = []  # nothing was asked; the text messages simply wait for the threshold
             if dry_run:
                 report.status = STATUS_DRY_RUN
             else:
@@ -189,6 +203,10 @@ def run_sync(
                     outcome = store.replace_transactions(message.message_id, [])
                     report.rows_deleted += outcome.deleted
                     marks.append((message.row, STATUS_SKIPPED, 0, f"retracted after an edit: {outcome.deleted} row(s) removed"))
+                for message in report.deletions:
+                    outcome = store.replace_transactions(message.message_id, [])
+                    report.rows_deleted += outcome.deleted
+                    marks.append((message.row, STATUS_DELETED, 0, f"deleted in Telegram: {outcome.deleted} row(s) removed from the sheet"))
                 store.mark_messages(marks)
                 report.status = STATUS_OK
     except Exception as exc:  # noqa: BLE001 - the report must be delivered whatever failed
@@ -282,30 +300,51 @@ def format_totals(report: RunReport) -> str:
     return " · ".join(format_amount(total, currency) for currency, total in sorted(report.totals_by_currency().items()))
 
 
-def _excerpt(item: ReviewItem) -> str:
+STATUS_EMOJI = {STATUS_OK: "✅", STATUS_DRY_RUN: "🧪", STATUS_SKIPPED_THRESHOLD: "⏭", STATUS_FAILED: "❌"}
+
+
+def _t(value: object, as_html: bool) -> str:
+    """User-supplied text (descriptions, notes, errors) escaped for Telegram HTML when needed."""
+    return html.escape(str(value), quote=False) if as_html else str(value)  # Telegram needs only <, > and & escaped
+
+
+def _excerpt(item: ReviewItem, as_html: bool = False) -> str:
     text = " | ".join(part.strip() for part in item.text.splitlines() if part.strip())[:60]
-    return f"{item.sender} · {item.sent_at:%d %b %H:%M} · \"{text}\""
+    return _t(f"{item.sender} · {item.sent_at:%d %b %H:%M} · \"{text}\"", as_html)
 
 
-def format_summary(report: RunReport) -> str:
+def _below_threshold_line(report: RunReport) -> str:
+    if report.trigger == TRIGGER_SCHEDULE:
+        return (f"⏭ {report.pending - report.removed_messages} pending message(s), below the minimum of {report.threshold} "
+                f"for a scheduled sync. Nothing was sent to Claude.")
+    return f"Nothing new to process: {report.pending - report.removed_messages} pending message(s), minimum is {report.threshold}."
+
+
+def format_summary(report: RunReport, as_html: bool = False) -> str:
     """What happened, in the group. Every message that was not written is accounted for."""
     if report.status == STATUS_SKIPPED_THRESHOLD:
-        if report.trigger == TRIGGER_SCHEDULE:
-            return (f"⏭ Kashio: {report.pending} pending message(s), below the minimum of {report.threshold} "
-                    f"for a scheduled sync. Nothing was sent to Claude.")
-        return f"Nothing new to process: {report.pending} pending message(s), minimum is {report.threshold}."
+        return _below_threshold_line(report)
     if report.status == STATUS_FAILED:
-        return f"⚠️ Kashio sync failed: {report.error}\nMessages stay pending and will be retried next time."
+        return f"❌ Kashio sync failed: {_t(report.error, as_html)}\nMessages stay pending and will be retried next time."
     lines = []
     prefix = "🧪 Dry run, nothing written." if report.status == STATUS_DRY_RUN else "✅ Kashio"
     written = len(report.rows) + report.rows_updated
     if written:
         lines.append(f"{prefix} wrote {len(report.rows)} new row(s)" + (f" ({format_totals(report)})" if report.rows else "")
                      + (f" and updated {report.rows_updated}" if report.rows_updated else "") + f" from {report.processed} message(s).")
-    else:
+    elif report.calls:
         lines.append(f"{prefix} wrote nothing from {report.processed} message(s).")
+    else:
+        lines.append(f"{prefix} made no Claude call this time.")
     if report.rows_deleted:
-        lines.append(f"🗑 Removed {report.rows_deleted} row(s) of edited or retracted messages.")
+        what = []
+        if report.deletions:
+            what.append(f"{len(report.deletions)} message(s) deleted in Telegram")
+        if report.retractions:
+            what.append(f"{len(report.retractions)} retracted by an edit")
+        lines.append(f"🗑 Removed {report.rows_deleted} row(s) ({', '.join(what) or 'edited messages'}).")
+    if not report.calls and report.pending - report.removed_messages:
+        lines.append(_below_threshold_line(report))
     if report.skipped:
         lines.append(f"⏭ Skipped {report.skipped} message(s) that were not expenses.")
     if report.merged:
@@ -313,62 +352,74 @@ def format_summary(report: RunReport) -> str:
     if report.review:
         lines.append(f"⚠️ {len(report.review)} message(s) need a look:")
         for item in report.review[:MAX_REVIEW_ITEMS_IN_SUMMARY]:
-            lines.append(f"  • {_excerpt(item)} — {item.note}")
+            lines.append(f"  • {_excerpt(item, as_html)} — {_t(item.note, as_html)}")
         if len(report.review) > MAX_REVIEW_ITEMS_IN_SUMMARY:
             lines.append(f"  • … and {len(report.review) - MAX_REVIEW_ITEMS_IN_SUMMARY} more, see the report")
     if report.held:
         lines.append(f"✋ {len(report.held)} edited message(s) left unchanged in the sheet, because the new answer looked incomplete:")
         for item in report.held[:MAX_REVIEW_ITEMS_IN_SUMMARY]:
-            lines.append(f"  • {_excerpt(item)} — {item.note}. Edit it again to retry.")
+            lines.append(f"  • {_excerpt(item, as_html)} — {_t(item.note, as_html)}. Edit it again to retry.")
     if report.unanswered:
         lines.append(f"🔁 {len(report.unanswered)} message(s) got no usable answer from Claude and stay pending; "
                      "they will be retried at the next sync.")
     return "\n".join(lines)
 
 
-def format_report(report: RunReport, include_rows: bool = False) -> str:
-    """The full run record, mirrored to the admin chat so it survives even if the sheet is down."""
+def format_report(report: RunReport, include_rows: bool = False, as_html: bool = False) -> str:
+    """The full run record, mirrored to the admin chat so it survives even if the sheet is down.
+
+    Plain text for the terminal; Telegram HTML (bold header, escaped content) for the private chat.
+    """
+    def bold(text: str) -> str:
+        return f"<b>{text}</b>" if as_html else text
+
+    head = f"{STATUS_EMOJI.get(report.status, '•')} Kashio sync report"
     lines = [
-        "Kashio sync report",
-        f"Status: {report.status}",
-        f"Trigger: {report.trigger} ({report.requested_by})",
-        f"Time: {report.started_at:%Y-%m-%d %H:%M} {report.started_at.tzname()}",
-        f"Pending: {report.pending} · threshold {report.threshold} · answered {report.processed}",
-        f"New rows: {len(report.rows)}" + (f" → {report.sheet_range}" if report.sheet_range else ""),
+        bold(head),
+        f"• Status: {report.status}",
+        f"• Trigger: {report.trigger} ({_t(report.requested_by, as_html)})",
+        f"• Time: {report.started_at:%Y-%m-%d %H:%M} {report.started_at.tzname()}",
+        f"• Pending: {report.pending} · threshold {report.threshold} · answered {report.processed}",
+        f"• New rows: {len(report.rows)}" + (f" → {_t(report.sheet_range, as_html)}" if report.sheet_range else ""),
     ]
     if report.rows:
-        lines.append(f"Totals: {format_totals(report)}")
-    if report.revised:
-        lines.append(f"Edited messages re-synced: {report.revised} · rows updated {report.rows_updated} · rows removed {report.rows_deleted}")
-    lines.append(f"Skipped: {report.skipped} · merged: {report.merged} · needs review: {len(report.review)} · held: {len(report.held)} · unanswered: {len(report.unanswered)}")
+        lines.append(f"• Totals: {format_totals(report)}")
+    if report.revised or report.deletions:
+        lines.append(f"• Edited messages re-synced: {report.revised} · deleted in Telegram: {len(report.deletions)} · "
+                     f"rows updated {report.rows_updated} · rows removed {report.rows_deleted}")
+    lines.append(f"• Skipped: {report.skipped} · merged: {report.merged} · needs review: {len(report.review)} · "
+                 f"held: {len(report.held)} · unanswered: {len(report.unanswered)}")
     if report.calls or report.input_tokens:
-        lines.append(f"Claude: {report.calls} call(s), {report.input_tokens:,} in / {report.output_tokens:,} out · "
+        lines.append(f"• Claude: {report.calls} call(s), {report.input_tokens:,} in / {report.output_tokens:,} out · "
                      f"cost ${report.cost_usd:.4f} ({report.model}, effort {report.effort})")
     if report.problems:
-        lines.append("Rejected answers: " + "; ".join(report.problems[:4]) + (" …" if len(report.problems) > 4 else ""))
+        lines += ["", bold("🚫 Rejected answers:")]
+        lines += [f"• {_t(problem, as_html)}" for problem in report.problems[:4]]
+        if len(report.problems) > 4:
+            lines.append(f"• … and {len(report.problems) - 4} more")
     if report.unanswered:
-        lines.append(f"Still pending, no usable answer (retried next sync): message ids {', '.join(map(str, report.unanswered))}")
+        lines += ["", bold("🔁 Still pending, no usable answer (retried next sync):"),
+                  f"• message ids {', '.join(map(str, report.unanswered))}"]
     if report.held:
-        lines.append("Edited messages held (sheet unchanged):")
-        for item in report.held:
-            lines.append(f"• {_excerpt(item)} — {item.note}")
+        lines += ["", bold("✋ Edited messages held (sheet unchanged):")]
+        lines += [f"• {_excerpt(item, as_html)} — {_t(item.note, as_html)}" for item in report.held]
     if report.review:
-        lines.append("Needs review:")
-        for item in report.review[:MAX_REVIEW_ITEMS_IN_REPORT]:
-            lines.append(f"• {_excerpt(item)} — {item.note}")
+        lines += ["", bold("⚠️ Needs review:")]
+        lines += [f"• {_excerpt(item, as_html)} — {_t(item.note, as_html)}" for item in report.review[:MAX_REVIEW_ITEMS_IN_REPORT]]
         if len(report.review) > MAX_REVIEW_ITEMS_IN_REPORT:
             lines.append(f"• … and {len(report.review) - MAX_REVIEW_ITEMS_IN_REPORT} more (see the inbox tab)")
     if include_rows and report.categories:
-        lines.append("Categories: " + ", ".join(report.categories))
+        lines += ["", bold("Categories: ") + _t(", ".join(report.categories), as_html)]
     if include_rows:
         for row in report.rows:
-            lines.append(f"• {row.date:%d/%m/%Y} · {format_amount(row.amount, row.currency)} · {row.currency} · {row.description} · {row.category}")
+            lines.append(f"• {row.date:%d/%m/%Y} · {format_amount(row.amount, row.currency)} · {row.currency} · "
+                         f"{_t(row.description, as_html)} · {_t(row.category, as_html)}")
         for message, rows in report.revisions:
             lines.append(f"• message {message.message_id} re-synced → {len(rows)} row(s):")
             for row in rows:
-                lines.append(f"    {row.date:%d/%m/%Y} · {format_amount(row.amount, row.currency)} · {row.description} · {row.category}")
+                lines.append(f"    {row.date:%d/%m/%Y} · {format_amount(row.amount, row.currency)} · {_t(row.description, as_html)} · {_t(row.category, as_html)}")
     if report.error:
-        lines.append(f"Error: {report.error}")
+        lines += ["", bold("❌ Error: ") + _t(report.error, as_html)]
     if report.log_error:
-        lines.append(f"Run log: could not write to the runs tab ({report.log_error})")
+        lines.append(f"• Run log: could not write to the runs tab ({_t(report.log_error, as_html)})")
     return "\n".join(lines)

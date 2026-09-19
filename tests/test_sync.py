@@ -88,8 +88,10 @@ def test_late_posted_history_is_written_with_its_own_dates(settings):
 
 
 def test_summaries_read_well_in_every_state():
-    ok = report_for(); ok.status = STATUS_OK; ok.processed = 3
+    ok = report_for(); ok.status = STATUS_OK; ok.processed = 3; ok.calls = 1
     assert format_summary(ok).startswith("✅ Kashio wrote nothing from 3 message(s).")
+    quiet_ok = report_for(); quiet_ok.status = STATUS_OK
+    assert format_summary(quiet_ok).startswith("✅ Kashio made no Claude call this time.")
     quiet = report_for(TRIGGER_SCHEDULE); quiet.status = STATUS_SKIPPED_THRESHOLD; quiet.pending, quiet.threshold = 3, 5
     assert "below the minimum of 5" in format_summary(quiet)
     empty = report_for(); empty.status = STATUS_SKIPPED_THRESHOLD; empty.threshold = 1

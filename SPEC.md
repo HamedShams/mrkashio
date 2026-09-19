@@ -1,6 +1,6 @@
 # Kashio — Telegram expense notes to Google Sheets
 
-Revision 10 (19 Sep 2026). Status: **live on Railway; audited answers with a low-effort retry, truncation detection, edits re-synced with a hold rule that never deletes on a doubtful answer, multilingual category rules.** See README.md for setup.
+Revision 11 (19 Sep 2026). Status: **live on Railway; deleted messages detected and their rows removed; Telegram HTML reports; Drive discovery verified; SDK retries.** See README.md for setup.
 
 Bot: `@mrkashio_bot` · Repo: `https://github.com/hamed-grantonomy/mrkashio` (linked to Railway) · Target tab: `Transactions_Trip#2` (env `SHEET_TAB`)
 
@@ -175,6 +175,14 @@ Telegram bots never receive messages sent before they joined. History comes in t
 
 "2€ lieferung" was filed under Eating Out because the category hints named "food delivery" under Eating Out and nothing about delivery under Transport, so the model matched the German word to the only delivery it had been given. Fix: the Transport hint now reads "moving people or things: … courier, shipping and delivery fees (Lieferung, kargo)", Eating Out is "a food order (the food itself; a separate delivery fee is Transport)", Other names money transfers (havale, Überweisung), and the prompt's Category section tells the model that descriptions come in English, German, Turkish or Persian, often as a single word, to judge by meaning with a few worked equivalences, and to categorise the service paid for rather than the place. One example ("2€ lieferung" → Transport) was added.
 
+### Reports
+
+The private report is Telegram HTML: a bold header with a status emoji (✅ ok, 🧪 dry run, ⏭ nothing to do, ❌ failed), one bullet per figure, then bold sections with bullets for rejected answers, still-pending messages, held edits and items needing review; all user text is HTML-escaped. The group summary and the status checklist use the same style. The terminal gets the plain-text form of the same report.
+
+### Retries
+
+Anthropic calls: the SDK retries 408/409/429/5xx and connection errors up to 3 times with exponential backoff (0.5 s doubling to 8 s, honouring `retry-after`); a request that still fails fails the sync, messages stay pending, and the report carries the error. Damaged or cut-short answers get one more call at low effort. Google Sheets calls: 3 attempts with 2/4 s backoff. Telegram sends: logged, never fatal.
+
 ### Number format and layout
 
 `DECIMAL_SEPARATOR` (`.` default, `,` for 1.154,5) is rendered into the prompt's amount rules. `COLUMN_DATE/AMOUNT/CURRENCY/DESCRIPTION/CATEGORY` (defaults B, C, D, E, G) drive every read and write on the transactions tab, the header row of a tab the bot creates, the guardrail and the formats; letters must be single and distinct.
@@ -183,7 +191,7 @@ Telegram bots never receive messages sent before they joined. History comes in t
 
 - A message is inserted at most once (status column plus de-duplication by message id).
 - Messages sent before the bot joined the group are invisible to it.
-- Telegram does not tell bots about deleted messages. To retract an expense before a sync, edit the message to say "ignore" or "cancelled".
+- Deleted messages: Telegram sends no event, so before each sync `Kashio.detect_deletions` calls `setMessageReaction(reaction=[])` on every live message that has rows in the sheet (`SheetStore.messages_with_rows`); an existing message answers `Reaction_empty`, a deleted one `Message to react not found` (verified live on 19 Sep 2026 with messages 73 and 78). Deleted ones are queued as `pending_deletion`; the sync removes their rows through the provenance note and marks them `deleted`, keeping text and history in the inbox. Safety: a "chat not found" aborts the check, unexpected answers are ignored, and if every probed message looks deleted the check is discarded. Deletions and note-only edits are applied even below the scheduled threshold; only Claude is gated by it.
 - If Telegram upgrades your group to a supergroup, the chat id changes. Update the env var.
 
 ---
@@ -281,8 +289,8 @@ If you want those extra details in the sheet, write them in the Telegram message
 - Thinking effort `high`.
 - Messages stored in `Bot_Inbox`; runs in `Bot_Runs`; every run report also sent to your private chat with the bot. No database, no file.
 - Column F (the "By" dropdown: member names) left empty as asked; column G gets a category read from the sheet's own dropdown, now the eight names above; column D one of TRY, TOMAN, EUR, USD, GBP.
-- History: rows dated before the sheet's last entry are flagged, never written; older messages come in through `/backfill` (paste) or `backfill FILE`, strictly after the last recorded day by default.
-- Guardrail: the bot only appends; it verifies the destination cells are empty right before writing and never edits or deletes an existing row of the target tab.
+- History: older messages come in through `/backfill` (paste) or `backfill FILE`, strictly after the last recorded day by default; live messages are written whatever their date.
+- Guardrail: new rows only ever go below the last used row, after the destination cells are verified empty; rows the bot wrote are updated or removed only through their provenance note when their message is edited or deleted, each re-checked before deletion; other rows and columns are never touched.
 - Pairing via `/setup`, stored in the sheet; env vars are optional overrides.
 - Day rollover at 04:00. Grocery prefix list and name-dropping rule in `prompt.md`. Formatting copied from the previous row.
 - Backfill: built, by paste in Telegram or from a file, because the bot cannot see history.

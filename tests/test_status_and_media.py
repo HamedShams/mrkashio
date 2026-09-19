@@ -21,6 +21,8 @@ def stub_kashio(settings, store=None, store_error=None, claude=None, claude_erro
     app.claude, app.claude_error = claude, claude_error
     app._config = config or {}
     app._last_hint = {}
+    app._last_connect = 0.0
+    app.connect = lambda force=False: None  # integrations are whatever the test stubbed
     return app
 
 
@@ -29,7 +31,7 @@ def test_status_names_every_missing_piece_with_its_fix(settings):
     app = stub_kashio(settings, store_error="GOOGLE_SERVICE_ACCOUNT_JSON is not set. Create a Google service account…",
                       claude_error="ANTHROPIC_API_KEY is not set. Create a key at console.anthropic.com…")
     text = app.status_text("mrkashio_bot")
-    assert text.startswith("Not quite ready yet")
+    assert text.startswith("🛠 Not quite ready yet")
     assert "✅ Telegram: connected as @mrkashio_bot" in text
     assert "❌ Google Sheets: GOOGLE_SERVICE_ACCOUNT_JSON is not set" in text
     assert "❌ Claude: ANTHROPIC_API_KEY is not set" in text
@@ -41,7 +43,9 @@ def test_status_is_all_green_when_everything_is_connected(settings):
     store = SimpleNamespace(spreadsheet=SimpleNamespace(title="Budget"))
     app = stub_kashio(settings, store=store, claude=object(), config={"group_title": "Family"})
     text = app.status_text()
-    assert text.startswith("All set") and "“Budget”" in text and "✅ Claude" in text and app.ready is True
+    assert text.startswith("✅ All set") and "“Budget”" in text and "✅ Claude" in text and app.ready is True
+    html_text = app.status_text(as_html=True)
+    assert html_text.startswith("<b>✅ All set, I'm working.</b>\n• ✅ Telegram")
 
 
 def test_hints_are_rate_limited_per_chat(settings):

@@ -14,6 +14,10 @@ Telegram commands:
     /status    what is connected and what still needs setting up
     /start     who am I talking to, and the commands
 
+Deleted messages: Telegram sends bots no event for a deletion, so before each sync the bot asks Telegram to
+clear its (non-existent) reaction on every message that has rows in the sheet; a deleted message answers
+"not found" and its rows are removed at that sync. No visible side effect on existing messages.
+
 The bot starts with nothing but a Telegram token. Anything else that is missing or broken (Google Sheets,
 the Anthropic key, the group pairing) is reported in plain words to whoever talks to it, with the fix.
 A tiny HTTP endpoint answers GET /health on $PORT for Railway's healthcheck.
@@ -23,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html
 import json
 import logging
 import os
@@ -36,7 +41,8 @@ import anthropic
 from apscheduler.triggers.cron import CronTrigger
 from gspread.exceptions import APIError
 from telegram import Bot, Chat, Message, Update, User
-from telegram.error import TelegramError
+from telegram.constants import ParseMode
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from backfill import import_messages, parse
@@ -61,6 +67,8 @@ log = logging.getLogger("kashio")
 TELEGRAM_MESSAGE_LIMIT = 4000  # Telegram allows 4096 characters per message
 BACKFILL_QUIET_SECONDS = 20  # a paste split into several messages is imported once nothing new arrives for this long
 RECONNECT_EVERY_SECONDS = 60  # how often a missing integration is retried
+ANTHROPIC_MAX_RETRIES = 3  # SDK retries on 408/409/429/5xx and connection errors with exponential backoff (0.5 s → 8 s)
+DELETION_PROBE_PAUSE = 0.05  # seconds between Telegram probes, well under the rate limit
 HINT_EVERY_SECONDS = 3600  # how often the group is reminded that something is not set up
 GROUP_ROLES = ("member", "administrator", "creator")
 ADMIN_ROLES = ("administrator", "creator")
@@ -127,7 +135,7 @@ class Kashio:
     def _connect_claude(self) -> str | None:
         if not self.settings.anthropic_api_key:
             return "ANTHROPIC_API_KEY is not set. Create a key at console.anthropic.com and add it to the environment."
-        client = anthropic.Anthropic(api_key=self.settings.anthropic_api_key)
+        client = anthropic.Anthropic(api_key=self.settings.anthropic_api_key, max_retries=ANTHROPIC_MAX_RETRIES)
         try:
             client.models.retrieve(self.settings.anthropic_model)  # free call; proves the key and the model name
         except anthropic.AuthenticationError:
@@ -171,9 +179,12 @@ class Kashio:
             lines.append("ℹ️ Full reports go to the group (no admin chat set; /setup sets one)")
         return lines
 
-    def status_text(self, bot_username: str | None = None) -> str:
-        head = "All set, I'm working." if self.ready else "Not quite ready yet. Here is what I can see:"
-        return head + "\n" + "\n".join(self.status_lines(bot_username))
+    def status_text(self, bot_username: str | None = None, as_html: bool = False) -> str:
+        head = "✅ All set, I'm working." if self.ready else "🛠 Not quite ready yet. Here is what I can see:"
+        lines = self.status_lines(bot_username)
+        if as_html:
+            return f"<b>{html.escape(head, quote=False)}</b>\n" + "\n".join("• " + html.escape(line, quote=False) for line in lines)
+        return head + "\n" + "\n".join(lines)
 
     def hint_due(self, chat_id: int) -> bool:
         """True at most once an hour per chat, so a broken setup does not flood the group."""
@@ -218,7 +229,7 @@ class Kashio:
         group = self.group_id
         admin = self.admin_id or group
         if admin is not None and admin not in already_informed:
-            await deliver(bot, admin, format_report(report))
+            await deliver(bot, admin, format_report(report, as_html=True), as_html=True)
         if (
             self.settings.post_summary
             and group is not None
@@ -226,7 +237,43 @@ class Kashio:
             and group not in already_informed
             and report.status in (STATUS_OK, STATUS_FAILED)
         ):
-            await deliver(bot, group, format_summary(report))
+            await deliver(bot, group, format_summary(report, as_html=True), as_html=True)
+
+    async def detect_deletions(self, bot: Bot) -> list[int]:
+        """Find messages that were deleted in Telegram after their rows were written, and queue their rows for removal.
+
+        Telegram sends no event for deletions. Clearing the bot's reaction on a message is a harmless probe:
+        an existing message answers "Reaction_empty", a deleted one "Message to react not found".
+        """
+        if self.store is None or self.group_id is None:
+            return []
+        candidates = await asyncio.to_thread(self.store.messages_with_rows)
+        deleted: list[tuple[int, int]] = []
+        unknown = 0
+        for inbox_row, message_id in candidates:
+            try:
+                await bot.set_message_reaction(self.group_id, message_id, reaction=[])
+            except BadRequest as exc:
+                text = str(exc).lower()
+                if "chat not found" in text:
+                    log.warning("Deletion check aborted: Telegram cannot find the group (%s)", exc)
+                    return []
+                if "message to react not found" in text or "message not found" in text:
+                    deleted.append((inbox_row, message_id))
+                elif "reaction_empty" not in text and "reaction is invalid" not in text:
+                    unknown += 1
+                    log.warning("Deletion check: unexpected answer for message %s: %s", message_id, exc)
+            except TelegramError as exc:
+                unknown += 1
+                log.warning("Deletion check: could not probe message %s: %s", message_id, exc)
+            await asyncio.sleep(DELETION_PROBE_PAUSE)
+        if deleted and len(deleted) == len(candidates) and len(candidates) >= 3:
+            log.warning("Deletion check: every one of %d messages looks deleted; that cannot be right, ignoring", len(candidates))
+            return []
+        if deleted:
+            await asyncio.to_thread(self.store.mark_deleted, [row for row, _ in deleted])
+            log.info("Deleted in Telegram: message ids %s", [mid for _, mid in deleted])
+        return [mid for _, mid in deleted]
 
     async def is_household_member(self, bot: Bot, user: User | None) -> bool:
         """The admin, or anyone who is a member of the paired group."""
@@ -250,12 +297,15 @@ def _as_int(value: str | None) -> int | None:
         return None
 
 
-async def deliver(bot: Bot, chat_id: int, text: str) -> bool:
+async def deliver(bot: Bot, chat_id: int, text: str, as_html: bool = False) -> bool:
     """Send a message without letting a Telegram failure break the sync that produced it."""
     try:
         while text:
-            chunk, text = text[:TELEGRAM_MESSAGE_LIMIT], text[TELEGRAM_MESSAGE_LIMIT:]
-            await bot.send_message(chat_id, chunk)
+            cut = TELEGRAM_MESSAGE_LIMIT
+            if as_html and len(text) > cut:  # never split inside a tag or an entity
+                cut = max(text.rfind("\n", 0, cut), 1)
+            chunk, text = text[:cut], text[cut:]
+            await bot.send_message(chat_id, chunk, parse_mode=ParseMode.HTML if as_html else None)
         return True
     except TelegramError as exc:
         hint = " Open a private chat with the bot and press Start first." if "initiate" in str(exc) or "not found" in str(exc).lower() else ""
@@ -326,12 +376,13 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                                      f"{app.store_error}\nOnce fixed, edit a message (even slightly) and I'll pick it up.")
         return
     sender, sent_at = _name(message.from_user), message.date.astimezone(app.settings.timezone)
+    attachment = f"with a {describe_media(message)} (the file was not downloaded, uploaded or sent to Claude)" if message.caption and not message.text else ""
     try:
         if had_note and not text.strip():  # the whole message was a note: acknowledge it, keep nothing of it
             await asyncio.to_thread(app.store.add_skipped, message.message_id, sender, sent_at, "note",
                                     NOTE_REASON.format(keyword=app.settings.note_keyword))
         else:
-            await asyncio.to_thread(app.store.add_message, message.message_id, sender, sent_at, text)
+            await asyncio.to_thread(app.store.add_message, message.message_id, sender, sent_at, text, attachment)
     except Exception:  # noqa: BLE001
         log.exception("Could not store message %s", message.message_id)
         await message.reply_text("⚠️ Kashio couldn't save this message to the sheet. Edit it (even slightly) to retry.")
@@ -409,14 +460,14 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await may_see_status(app, context.bot, chat, user):
         await message.reply_text(STRANGER_REPLY)
         return
-    lines = ["Hi, I'm Kashio. I file the expense notes from your group into your Google Sheet.", ""]
-    lines.append(app.status_text(context.bot.username))
+    lines = ["<b>Hi, I'm Kashio.</b> I file the expense notes from your group into your Google Sheet.", ""]
+    lines.append(app.status_text(context.bot.username, as_html=True))
     if chat.type == Chat.PRIVATE and user and user.id == app.admin_id:
         lines.append("Sync reports arrive in this chat.")
     lines.append(f"(This chat's id is {chat.id}.)")
     lines.append("")
-    lines.append(HELP)
-    await deliver(context.bot, chat.id, "\n".join(lines))
+    lines.append(html.escape(HELP, quote=False))
+    await deliver(context.bot, chat.id, "\n".join(lines), as_html=True)
 
 
 async def on_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -428,7 +479,7 @@ async def on_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await may_see_status(app, context.bot, chat, user):
         await message.reply_text(STRANGER_REPLY)
         return
-    await deliver(context.bot, message.chat_id, app.status_text(context.bot.username))
+    await deliver(context.bot, message.chat_id, app.status_text(context.bot.username, as_html=True), as_html=True)
 
 
 async def on_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -494,12 +545,13 @@ async def on_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not app.ready:
         await deliver(context.bot, chat.id, "I can't sync yet.\n" + app.status_text(context.bot.username))
         return
+    await app.detect_deletions(context.bot)
     report = await app.sync(TRIGGER_MANUAL, _name(user))
     if report is None:
         await message.reply_text("A sync is already running. Give it a minute.")
         return
     full_report = chat.type == Chat.PRIVATE
-    await deliver(context.bot, chat.id, format_report(report) if full_report else format_summary(report))
+    await deliver(context.bot, chat.id, format_report(report, as_html=True) if full_report else format_summary(report, as_html=True), as_html=True)
     await app.notify(context.bot, report, already_informed=frozenset({chat.id}))
 
 
@@ -613,7 +665,7 @@ async def process_backfill(app: Kashio, bot: Bot, chat_id: int, requested_by: st
     if report is None:
         await deliver(bot, chat_id, "A sync is already running; the imported messages will be processed when you run /sync.")
         return
-    await deliver(bot, chat_id, format_report(report))
+    await deliver(bot, chat_id, format_report(report, as_html=True), as_html=True)
     await app.notify(bot, report, already_informed=frozenset({chat_id}))
 
 
@@ -626,6 +678,7 @@ async def scheduled_sync(context: ContextTypes.DEFAULT_TYPE) -> None:
         if target is not None:
             await deliver(context.bot, target, "Scheduled sync skipped.\n" + app.status_text(context.bot.username))
         return
+    await app.detect_deletions(context.bot)
     report = await app.sync(TRIGGER_SCHEDULE, "schedule")
     if report is None:
         log.warning("Scheduled sync skipped: another sync is running")
@@ -762,11 +815,15 @@ async def cli_sync(settings: Settings, dry_run: bool) -> int:
     if not app.can_sync:
         print(app.status_text())
         return 1
-    report = await app.sync(TRIGGER_CLI, "terminal", dry_run=dry_run)
-    assert report is not None
-    print(format_report(report, include_rows=dry_run))
-    if not dry_run:
-        async with Bot(settings.telegram_bot_token) as bot:
+    async with Bot(settings.telegram_bot_token) as bot:
+        if not dry_run:
+            deleted = await app.detect_deletions(bot)
+            if deleted:
+                print(f"Deleted in Telegram since their rows were written: message ids {deleted}")
+        report = await app.sync(TRIGGER_CLI, "terminal", dry_run=dry_run)
+        assert report is not None
+        print(format_report(report, include_rows=dry_run))
+        if not dry_run:
             await app.notify(bot, report)
     return 0
 

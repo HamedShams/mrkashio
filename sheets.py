@@ -38,6 +38,9 @@ TARGET_HEADER_NAMES = {"date": "Date", "amount": "Amount", "currency": "Currency
 
 STATUS_PENDING = "pending"
 STATUS_PENDING_REVISION = "pending_revision"  # edited after its rows were written; the rows get replaced at the next sync
+STATUS_PENDING_DELETION = "pending_deletion"  # deleted in Telegram after its rows were written; the rows go at the next sync
+STATUS_DELETED = "deleted"  # rows removed because the message was deleted in Telegram; the inbox row stays for tracing
+PENDING_STATUSES = (STATUS_PENDING, STATUS_PENDING_REVISION, STATUS_PENDING_DELETION)
 STATUS_PROCESSED = "processed"
 STATUS_SKIPPED = "skipped"
 STATUS_MERGED = "merged"  # folded into another message's transaction (an amount sent separately, a correction)
@@ -85,6 +88,10 @@ class InboxMessage:
     @property
     def revision(self) -> bool:
         return self.status == STATUS_PENDING_REVISION
+
+    @property
+    def deletion(self) -> bool:
+        return self.status == STATUS_PENDING_DELETION
 
 
 @dataclass
@@ -209,8 +216,8 @@ class SheetStore:
 
     # ------------------------------------------------------------------ inbox
 
-    def add_message(self, message_id: int, sender: str, sent_at: datetime, text: str) -> None:
-        row = [str(message_id), sender, sent_at.strftime(TIMESTAMP), "", text, STATUS_PENDING, "", "", ""]
+    def add_message(self, message_id: int, sender: str, sent_at: datetime, text: str, note: str = "") -> None:
+        row = [str(message_id), sender, sent_at.strftime(TIMESTAMP), "", text, STATUS_PENDING, "", "", note]
         _retry(lambda: self.inbox.append_row(row, value_input_option="RAW"))
 
     def add_skipped(self, message_id: int, sender: str, sent_at: datetime, label: str, reason: str) -> None:
@@ -281,7 +288,7 @@ class SheetStore:
                 message_id = int(message_id)  # negative ids mark messages imported from a chat export
             except ValueError:
                 continue
-            if status not in (STATUS_PENDING, STATUS_PENDING_REVISION) or message_id in seen:
+            if status not in PENDING_STATUSES or message_id in seen:
                 continue
             try:
                 parsed_sent = self._parse_timestamp(sent_at)
@@ -295,6 +302,29 @@ class SheetStore:
                 text=text, status=status, rows_added=int(rows_added) if str(rows_added).isdigit() else 0,
             ))
         return pending
+
+    def messages_with_rows(self) -> list[tuple[int, int]]:
+        """(inbox row, message id) of live Telegram messages whose rows are in the sheet: the ones a deletion could orphan."""
+        found: list[tuple[int, int]] = []
+        for index, values in enumerate(_retry(self.inbox.get_all_values)[1:], start=2):
+            values = list(values) + [""] * (len(INBOX_HEADERS) - len(values))
+            try:
+                message_id = int(values[0])
+            except ValueError:
+                continue
+            rows_added = int(values[7]) if str(values[7]).isdigit() else 0
+            if message_id > 0 and rows_added > 0 and values[5] in (STATUS_PROCESSED, STATUS_NEEDS_REVIEW, STATUS_PENDING_REVISION):
+                found.append((index, message_id))
+        return found
+
+    def mark_deleted(self, rows: Sequence[int]) -> None:
+        """Queue messages deleted in Telegram for row removal. Text and history stay in the inbox for tracing."""
+        if not rows:
+            return
+        when = datetime.now(self.settings.timezone).strftime(TIMESTAMP)
+        updates = [{"range": f"F{row}", "values": [[STATUS_PENDING_DELETION]]} for row in rows]
+        updates += [{"range": f"I{row}", "values": [[f"deleted in Telegram, noticed {when}; its rows will be removed"]]} for row in rows]
+        _retry(lambda: self.inbox.batch_update(updates))
 
     def mark_messages(self, marks: Sequence[tuple[int, str, int, str]]) -> None:
         """Set status, processed_at, rows_added and note for the given inbox rows: (row, status, rows_added, note)."""
