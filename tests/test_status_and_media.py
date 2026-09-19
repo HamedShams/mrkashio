@@ -77,7 +77,7 @@ def test_photo_without_caption_routes_to_the_media_handler_and_with_caption_to_i
 
 
 def test_currency_formats_follow_column_d_and_group_runs():
-    requests = currency_format_requests(sheet_id=9, start=153, currencies=["TRY", "TRY", "EUR", "TOMAN", "XXX"])
+    requests = currency_format_requests(sheet_id=9, start=153, currencies=["TRY", "TRY", "EUR", "TOMAN", "XXX"], column_index=2)
     ranges = [(r["repeatCell"]["range"]["startRowIndex"], r["repeatCell"]["range"]["endRowIndex"]) for r in requests]
     patterns = [r["repeatCell"]["cell"]["userEnteredFormat"]["numberFormat"]["pattern"] for r in requests]
     assert ranges == [(152, 154), (154, 155), (155, 156)]  # two TRY rows share one request; unknown currency untouched
@@ -107,6 +107,11 @@ class FakeStore:
         self.written.extend(rows)
         return 153, 152 + len(rows)
 
+    def replace_transactions(self, message_id, rows):
+        from sheets import Replacement
+        self.replaced = getattr(self, "replaced", []) + [(message_id, list(rows))]
+        return Replacement(updated=min(1, len(rows)), deleted=0 if rows else 1, appended=max(0, len(rows) - 1))
+
     def mark_messages(self, marks):
         self.marks.extend(marks)
 
@@ -114,10 +119,10 @@ class FakeStore:
         self.runs.append(values)
 
 
-def fake_extract(results):
+def fake_extract(results, unanswered=()):
     def _extract(client, settings, prompt, messages, categories):
         model = result_model(categories)
-        return Extraction(model.model_validate({"results": results}).results, 1000, 100)
+        return Extraction(model.model_validate({"results": results}).results, 1000, 100, calls=1, unanswered=list(unanswered))
     return _extract
 
 
@@ -130,6 +135,7 @@ def test_run_sync_writes_marks_and_logs(settings, monkeypatch):
         "merged_into": None, "skip_reason": None, "needs_review": False, "note": None}]))
     report = sync.run_sync(settings, store, object(), "prompt", trigger=sync.TRIGGER_MANUAL, requested_by="Alex")
     assert report.status == sync.STATUS_OK and report.sheet_range.endswith("!B153:G153")
+    assert "wrote 1 new row(s)" in sync.format_summary(report)
     assert [r.description for r in store.written] == ["Groceries - A101"] and store.marks[0][1] == "processed"
     assert len(store.runs) == 1 and store.runs[0][3] == "ok" and report.cost_usd == pytest.approx(0.003)
 
@@ -147,3 +153,36 @@ def test_run_sync_respects_the_scheduled_threshold_and_reports_failures(settings
     failed = sync.run_sync(settings, store, object(), "prompt", trigger=sync.TRIGGER_MANUAL, requested_by="Alex")
     assert failed.status == sync.STATUS_FAILED and "refusing to write" in failed.error
     assert store.marks == [] and store.runs[0][3] == "failed"  # nothing marked, the failure is logged
+
+
+def test_unanswered_messages_stay_pending_and_are_reported(settings, monkeypatch):
+    from sheets import InboxMessage
+    pending = [InboxMessage(2, 2, "Alex", at(2026, 9, 8, 12), None, "A101 300", "pending"),
+               InboxMessage(3, 3, "Sam", at(2026, 9, 8, 13), None, "Cafe 385", "pending")]
+    store = FakeStore(pending)
+    monkeypatch.setattr(sync, "extract", fake_extract([{"message_id": 2, "transactions": [
+        {"description": "Groceries - A101", "amount": 300, "currency": "TRY", "category": "Groceries", "date": None}],
+        "merged_into": None, "skip_reason": None, "needs_review": False, "note": None}], unanswered=[3]))
+    report = sync.run_sync(settings, store, object(), "prompt", trigger=sync.TRIGGER_MANUAL, requested_by="Alex")
+    assert report.unanswered == [3] and [m[0] for m in store.marks] == [2]  # message 3 is not marked: still pending
+    summary = sync.format_summary(report)
+    assert "1 message(s) got no usable answer" in summary and "stay pending" in summary
+    assert "unanswered: 1" in sync.format_report(report)
+
+
+def test_edited_messages_are_re_synced_and_retractions_remove_rows(settings, monkeypatch):
+    from sheets import STATUS_PENDING_REVISION, InboxMessage
+    pending = [InboxMessage(2, 2, "Alex", at(2026, 9, 8, 12), at(2026, 9, 9), "A101 350", STATUS_PENDING_REVISION, rows_added=1),
+               InboxMessage(3, 3, "Sam", at(2026, 9, 8, 13), at(2026, 9, 9), "[note]", STATUS_PENDING_REVISION, rows_added=2)]
+    store = FakeStore(pending)
+    monkeypatch.setattr(sync, "extract", fake_extract([{"message_id": 2, "transactions": [
+        {"description": "Groceries - A101", "amount": 350, "currency": "TRY", "category": "Groceries", "date": None}],
+        "merged_into": None, "skip_reason": None, "needs_review": False, "note": None}]))
+    report = sync.run_sync(settings, store, object(), "prompt", trigger=sync.TRIGGER_MANUAL, requested_by="Alex")
+    assert report.status == sync.STATUS_OK and store.written == []  # nothing appended: the edit updated its own row
+    assert [(mid, len(rows)) for mid, rows in store.replaced] == [(2, 1), (3, 0)]
+    assert (report.rows_updated, report.rows_deleted, report.revised) == (1, 1, 2)
+    statuses = {m[0]: m[1] for m in store.marks}
+    assert statuses == {2: "processed", 3: "skipped"} and "re-synced after an edit" in store.marks[0][3]
+    summary = sync.format_summary(report)
+    assert "updated 1" in summary and "Removed 1 row(s)" in summary

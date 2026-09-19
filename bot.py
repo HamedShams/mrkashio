@@ -42,7 +42,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 from backfill import import_messages, parse
 from config import ConfigError, Settings
 from extractor import MAX_MESSAGES_PER_CALL, clean_categories, load_prompt
-from sheets import STATUS_EDITED_AFTER_SYNC, SheetStore
+from sheets import STATUS_PENDING_REVISION, STATUS_SKIPPED, SheetStore
 from sync import (
     STATUS_FAILED,
     STATUS_OK,
@@ -379,10 +379,10 @@ async def on_group_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 await asyncio.to_thread(app.store.add_skipped, message.message_id, sender, sent_at, "note", reason)
             else:
                 await asyncio.to_thread(app.store.add_message, message.message_id, sender, sent_at, text)
-        elif status == STATUS_EDITED_AFTER_SYNC:
+        elif status == STATUS_PENDING_REVISION:
             await message.reply_text(
-                "⚠️ This message was already turned into sheet rows. I recorded the edit but did not change the sheet; "
-                "please fix that row by hand."
+                "🗑 Noted: this message's rows in the sheet will be removed at the next sync." if note_only else
+                "✏️ Noted: this message already has rows in the sheet; they will be updated at the next sync."
             )
     except Exception:  # noqa: BLE001
         log.exception("Could not store edit of message %s", message.message_id)
@@ -650,7 +650,7 @@ def build_application(app: Kashio) -> Application:
     application.add_handler(CommandHandler("help", on_start))
     application.add_handler(CommandHandler("status", on_status))
     application.add_handler(CommandHandler("setup", on_setup))
-    application.add_handler(CommandHandler("sync", on_sync))
+    application.add_handler(CommandHandler("sync", on_sync, filters=filters.UpdateType.MESSAGE))
     application.add_handler(CommandHandler("backfill", on_backfill))
     application.add_handler(CommandHandler("done", on_done))
     application.add_handler(CommandHandler("cancel", on_cancel))
@@ -731,8 +731,10 @@ def check(settings: Settings) -> int:
     app = Kashio(settings)
     if app.store is not None:
         source = "GOOGLE_SHEET_ID" if settings.google_sheet_id else "found via the Drive API"
+        c = settings.columns
         report("Google Sheets", f"spreadsheet {app.store.spreadsheet.title!r} ({source}), tab {settings.sheet_tab!r}, "
-                                f"last used row {app.store.last_used_row()}, {len(app.store.pending_messages())} pending")
+                                f"columns date {c.date} · amount {c.amount} · currency {c.currency} · description {c.description} · "
+                                f"category {c.category}, last used row {app.store.last_used_row()}, {len(app.store.pending_messages())} pending")
         categories = clean_categories(app.store.category_options())
         report("Categories", f"{len(categories)} from the column-G dropdown: {', '.join(categories)}")
     else:

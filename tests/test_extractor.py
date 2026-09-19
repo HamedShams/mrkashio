@@ -2,7 +2,7 @@ import pytest
 from pydantic import TypeAdapter, ValidationError
 
 from config import ConfigError
-from extractor import DEFAULT_CATEGORIES, build_batch, clean_categories, load_prompt, render_prompt, result_model
+from extractor import DEFAULT_CATEGORIES, audit, build_batch, clean_categories, extract, load_prompt, render_prompt, result_model
 from sheets import InboxMessage
 from tests.conftest import at
 
@@ -28,6 +28,7 @@ def test_result_model_limits_category_to_the_sheet_list():
 def test_prompt_placeholders_are_filled(settings):
     prompt = render_prompt(load_prompt(settings), ["Groceries", "Mystery"])
     assert "{{" not in prompt
+    assert '"1,154.5" = 1154.5' in prompt  # DECIMAL_SEPARATOR "." rules
     assert "- Groceries: supermarkets" in prompt and "- Mystery\n" in prompt
     assert "TRY, TOMAN, EUR, USD, GBP" in prompt
 
@@ -44,3 +45,74 @@ def test_build_batch_wraps_each_message_with_its_metadata():
     batch = build_batch(messages)
     assert batch.startswith('<message id="41" sender="Sam \'S\'" sent="2026-07-24 21:46" edited="true">')
     assert batch.endswith("Gratis\n266 TL\n</message>")
+
+
+def test_number_rules_follow_the_decimal_separator(settings):
+    from dataclasses import replace
+    assert '"1.154,5" = 1154.5' in load_prompt(replace(settings, decimal_separator=","))
+
+
+def result(message_id, transactions=(), merged_into=None):
+    return {"message_id": message_id, "transactions": list(transactions), "merged_into": merged_into,
+            "skip_reason": None, "needs_review": False, "note": None}
+
+
+def tx(description="Cafe", amount=385.0, date=None):
+    return {"description": description, "amount": amount, "currency": "TRY", "category": "Other", "date": date}
+
+
+def parsed(*results):
+    return result_model(["Other"]).model_validate({"results": list(results)}).results
+
+
+def test_audit_rejects_damaged_answers_and_keeps_good_ones():
+    good, problems = audit(parsed(
+        result(50, [tx()]),
+        result(51, [tx("026 kU", 617.7, date=",")]),  # the corruption seen in production
+        result(99, [tx()]),  # a message that was never sent
+        result(52, [tx()], merged_into=101736),
+        result(50, [tx()]),  # answered twice
+        result(53, [tx(amount=0)]),
+    ), expected={50, 51, 52, 53})
+    assert [r.message_id for r in good] == [50]
+    assert len(problems) == 5 and any("malformed date" in p for p in problems) and any("unknown message id 99" in p for p in problems)
+
+
+class FakeClient:
+    """Answers the first call with a damaged, incomplete result and the retry with a complete one."""
+
+    def __init__(self, answers):
+        self.answers, self.requests = list(answers), []
+
+    class _Messages:
+        def __init__(self, outer):
+            self.outer = outer
+
+        def parse(self, **request):
+            self.outer.requests.append(request)
+            payload = self.outer.answers.pop(0)
+            parsed_output = request["output_format"].model_validate({"results": payload})
+            return SimpleNamespace(parsed_output=parsed_output, stop_reason="end_turn", usage=SimpleNamespace(input_tokens=100, output_tokens=50))
+
+    @property
+    def messages(self):
+        return self._Messages(self)
+
+
+def test_extract_retries_once_without_thinking_and_reports_the_rest(settings):
+    from types import SimpleNamespace as NS
+    messages = [InboxMessage(2, 50, "Alex", at(2026, 9, 8, 12), None, "Cafe 385", "pending"),
+                InboxMessage(3, 51, "Alex", at(2026, 9, 8, 13), None, "A101 300", "pending"),
+                InboxMessage(4, 52, "Sam", at(2026, 9, 8, 14), None, "Uber 100", "pending")]
+    client = FakeClient([
+        [result(50, [tx()]), result(51, [tx("026 kU", 617.7, date=",")])],  # first answer: one good, one damaged, one missing
+        [result(51, [tx("Groceries - A101", 300)])],  # retry answers only 51
+    ])
+    out = extract(client, settings, load_prompt(settings), messages, ["Other"])
+    assert [r.message_id for r in out.results] == [51, 50]  # the retry's answers first, then the surviving good one
+    assert out.unanswered == [52] and out.calls == 2 and out.input_tokens == 200
+    assert client.requests[0].get("thinking") is None and client.requests[1]["thinking"] == {"type": "disabled"}
+    assert any("malformed date" in p for p in out.problems)
+
+
+from types import SimpleNamespace  # noqa: E402  (used by FakeClient)

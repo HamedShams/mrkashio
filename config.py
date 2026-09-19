@@ -59,6 +59,13 @@ def _flag(name: str, default: bool) -> bool:
     raise ConfigError(f"{name} must be true or false, got {raw!r}")
 
 
+def _decimal_separator() -> str:
+    raw = _text("DECIMAL_SEPARATOR", ".")
+    if raw not in (".", ","):
+        raise ConfigError(f"DECIMAL_SEPARATOR must be '.' (1,154.5) or ',' (1.154,5), got {raw!r}")
+    return raw
+
+
 def _service_account() -> dict | None:
     """The Google key: the JSON itself (GOOGLE_SERVICE_ACCOUNT_JSON) or a path to the downloaded file. None when unset."""
     raw = _text("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -77,6 +84,40 @@ def _service_account() -> dict | None:
             "GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON. In a .env file, wrap the whole value in single quotes "
             "or use GOOGLE_SERVICE_ACCOUNT_FILE=path/to/key.json instead"
         ) from exc
+
+
+COLUMN_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+@dataclass(frozen=True)
+class Columns:
+    """Column letters of the transactions tab. Everything else on the tab is left alone."""
+
+    date: str
+    amount: str
+    currency: str
+    description: str
+    category: str
+
+    @property
+    def written(self) -> tuple[str, ...]:
+        return (self.date, self.amount, self.currency, self.description, self.category)
+
+    def index(self, letter: str) -> int:
+        """Zero-based column index for the Sheets API."""
+        return COLUMN_LETTERS.index(letter)
+
+    @classmethod
+    def from_env(cls) -> Columns:
+        letters = {}
+        for field_name, default in (("date", "B"), ("amount", "C"), ("currency", "D"), ("description", "E"), ("category", "G")):
+            raw = (_text(f"COLUMN_{field_name.upper()}", default) or default).strip().upper()
+            if len(raw) != 1 or raw not in COLUMN_LETTERS:
+                raise ConfigError(f"COLUMN_{field_name.upper()} must be a single column letter A-Z, got {raw!r}")
+            letters[field_name] = raw
+        if len(set(letters.values())) != len(letters):
+            raise ConfigError(f"COLUMN_* letters must all differ, got {letters}")
+        return cls(**letters)
 
 
 @dataclass(frozen=True)
@@ -107,6 +148,8 @@ class Settings:
     manual_min_messages: int
     post_summary: bool
     note_keyword: str  # text from this word to the end of a message is a private note: never stored, never sent to Claude
+    decimal_separator: str  # "." for 1,154.5 (default) or "," for 1.154,5; tells Claude how the household writes numbers
+    columns: Columns  # where each field lives on the transactions tab
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -155,4 +198,6 @@ class Settings:
             manual_min_messages=max(1, _integer("MANUAL_MIN_MESSAGES", 1)),
             post_summary=_flag("POST_SUMMARY", True),
             note_keyword=(_text("NOTE_KEYWORD", "#note") or "#note").strip(),
+            decimal_separator=_decimal_separator(),
+            columns=Columns.from_env(),
         )

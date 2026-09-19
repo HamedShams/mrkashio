@@ -54,3 +54,25 @@ def test_sheet_id_and_chat_ids_are_optional(monkeypatch):
         monkeypatch.delenv(name)
     s = Settings.from_env()
     assert s.google_sheet_id is None and s.telegram_chat_id is None and s.telegram_admin_chat_id is None
+
+
+def test_column_layout_defaults_and_validation(monkeypatch):
+    s = Settings.from_env()
+    assert s.columns.written == ("B", "C", "D", "E", "G") and s.columns.index("G") == 6
+    monkeypatch.setenv("COLUMN_CATEGORY", "h")
+    assert Settings.from_env().columns.category == "H"
+    monkeypatch.setenv("COLUMN_CATEGORY", "B")
+    with pytest.raises(ConfigError, match="must all differ"):
+        Settings.from_env()
+    monkeypatch.setenv("COLUMN_CATEGORY", "AA")
+    with pytest.raises(ConfigError, match="single column letter"):
+        Settings.from_env()
+
+
+def test_decimal_separator_is_validated(monkeypatch):
+    assert Settings.from_env().decimal_separator == "."
+    monkeypatch.setenv("DECIMAL_SEPARATOR", ",")
+    assert Settings.from_env().decimal_separator == ","
+    monkeypatch.setenv("DECIMAL_SEPARATOR", ";")
+    with pytest.raises(ConfigError, match="DECIMAL_SEPARATOR"):
+        Settings.from_env()

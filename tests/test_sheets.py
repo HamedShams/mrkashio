@@ -15,6 +15,7 @@ def test_cell_values_become_dates_or_nothing():
 def store_with(target_values, settings):
     store = SheetStore.__new__(SheetStore)
     store.settings = settings
+    store.columns = settings.columns
     store.target = SimpleNamespace(get_values=lambda *args, **kwargs: target_values)
     return store
 

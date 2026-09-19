@@ -1,6 +1,6 @@
 # Kashio — Telegram expense notes to Google Sheets
 
-Revision 8 (17 Sep 2026). Status: **live on Railway; private-note keyword, stricter private-chat privacy, review pass.** See README.md for setup and the to-do list at the end of this document.
+Revision 9 (19 Sep 2026). Status: **live on Railway; answer auditing with retry, edits re-synced into the sheet, configurable columns and number format.** See README.md for setup.
 
 Bot: `@mrkashio_bot` · Repo: `https://github.com/hamed-grantonomy/mrkashio` (linked to Railway) · Target tab: `Transactions_Trip#2` (env `SHEET_TAB`)
 
@@ -68,7 +68,7 @@ A file "as a mini database" is the one option that fails on Railway: the filesys
 |---|---|
 | Is this message an expense at all? | Date, from the message timestamp |
 | How many expenses are in it? | Day rollover before 04:00 |
-| Amount as a number, currency, category (from the sheet's own list) | Which row to write to, formatting, formula-safe text |
+| Amount as a number, currency, category (from the sheet's own list) | Which row to write to, formats, formula-safe text, answer audit and retry |
 | Light typo fix, emoji removal, "Groceries - A101" prefix | Never insert the same message twice; thresholds; one sync at a time |
 | Flag anything ambiguous | Retries, logging, the summary, the run log, the report |
 
@@ -80,9 +80,9 @@ A file "as a mini database" is the one option that fails on Railway: the filesys
 
 Haiku 4.5 ($1 / $5) would handle most messages, but its failure mode is a silent wrong row in a finance sheet, and the price difference is a few cents a month. Opus 5 ($5 / $25) is overkill. `ANTHROPIC_MODEL` is an env var.
 
-### Thinking effort: `high` (decided)
+### Thinking effort: `low` (changed on 19 Sep 2026 after a production failure)
 
-Sonnet 5 thinks adaptively; `effort` caps how much. The published gains of `xhigh` over `high` are on coding and multi-step agentic benchmarks, where the model plans across many tool calls. Our task is short-text extraction against explicit rules, where `high` already has room to reason on the traps (recaps, corrections, Turkish number formats). Estimated cost: `high` about $0.18 a month, `xhigh` about $0.30. The difference is not the money; it is that there is no evidence it changes a single row here. `ANTHROPIC_EFFORT` is an env var, and `Bot_Runs` records tokens per run, so trying `xhigh` for a month and comparing is a one-variable experiment.
+On 19 Sep 2026 a ten-message batch at `high` came back with results for only two messages: the model reasoned correctly about all ten (visible in the thinking summary) but the JSON it then wrote degenerated after about 1,800 characters into garbage (`"date":","`, a description `"026 kU"`, a `merged_into` of 101736) and stopped; the API's schema enforcement kept it syntactically valid, so it parsed as a success. Reproduced twice; `medium` even returned a server error; `low` and thinking-disabled both returned complete, coherent answers, and `low` still flagged an ambiguous amount for review. Decision: default `low`, and an audit-and-retry in `extractor.py` that catches this class of failure whatever the setting: results for unknown ids, duplicates, `merged_into` pointing outside the batch, unreadable descriptions, implausible amounts and malformed dates are rejected; if anything is rejected or any message is unanswered, the batch is asked once more with thinking disabled; whatever is still unanswered stays pending and is named in the report. Set `ANTHROPIC_EFFORT=low` in Railway too; the code default cannot override a variable that is set.
 
 ### Your traffic, priced
 
@@ -126,7 +126,7 @@ Chunks of at most 150 messages per call. Token usage from `response.usage` goes 
 - Accept messages only from the paired group. Everything else is ignored.
 - Until paired, the bot logs group messages with a hint to run `/setup` and records nothing. `/start` explains the state in any chat.
 - New message (text or photo caption): append a row to `Bot_Inbox` with `message_id, sender, sent_at, edited_at, text, status=pending`.
-- Edited message: find the row by `message_id`, replace text and `edited_at`. Still pending: text replaced. Skipped or flagged without rows: reopened as `pending`. Already turned into rows: `edited_after_sync` plus a warning in the chat (the bot never changes the sheet behind your back). Never stored (sent while the bot was offline): stored as new. An edit into a note (`NOTE_KEYWORD`) retires a pending message.
+- Edited message: still pending, the text is replaced. Skipped or flagged without rows: reopened as `pending`. Already turned into rows: `pending_revision`; at the next sync Claude re-extracts the new text and `replace_transactions` updates the message's rows in place, removes extra ones (bottom-up, each re-checked for its provenance note right before deletion) and appends missing ones. Edited into a note or emptied: a retraction, its rows are removed without asking Claude. Rows are found through the note `kashio:<message id>` on each date cell, so only rows the bot wrote are ever touched. Telegram does not report deletions; the README tells users to edit instead.
 - Sheets write fails: retry 3 times with backoff, then reply "couldn't save this message; edit it to retry".
 
 ### Sync (on `SYNC_CRON` or `/sync`)
@@ -169,30 +169,11 @@ python bot.py                 run the bot (what Railway runs)
 
 ### Cold start and history
 
-Telegram bots never receive messages sent before they joined, even when the group's history is visible to new members (that setting only affects human accounts). So the bot cannot re-process old messages by itself, and there is no risk of a giant first call. Two rules cover history anyway:
+Telegram bots never receive messages sent before they joined. History comes in through `/backfill` (paste) or `backfill FILE`, which skip everything dated on or before the sheet's last recorded day and anything already stored, and queue the rest as pending. The earlier *live* cutoff rule, which refused any row dated before the sheet's last entry at every sync, was removed on 19 Sep 2026: it rejected a legitimate multi-day dump posted late (message 52, "Sep 3 … Sep 15"), because the sheet's last date came from the bot's own previous run, not from complete hand entry.
 
-- **Live safety rule.** At each sync the bot reads the latest date in column B. A transaction dated before that date is not written; its message is flagged `needs_review` with the note "dated …, before the sheet's last entry". Same-day and later rows are written normally, so steady-state operation is unaffected.
-- **Backfill by pasting or from a file.** In a private chat, `/backfill` then the messages copied from the Telegram chat (format `Name, [1 Sep 2026 at 21:14:10]:` followed by the text; the Desktop variant `Name, [01.09.2026 21:14]` and an edit time in parentheses are understood), then `/done`; or `python bot.py backfill FILE` with a `.txt` paste or a Telegram Desktop JSON export. `backfill.py` parses both, skips everything whose effective date (after the 04:00 rollover) is on or before the sheet's last recorded date and anything already stored, and queues the rest as pending. Imported ids are negative (a hash of sender, time and text for pastes; the export id for JSON) so they can never collide with live message ids and re-imports are harmless. The Telegram path then runs a sync immediately; the CLI path leaves it to `sync --dry-run` / `sync`. 150 messages per Claude call.
+### Number format and layout
 
-### Setup guidance (no model involved)
-
-Only `TELEGRAM_BOT_TOKEN` is required to start. `Kashio.connect()` tries Google Sheets and Anthropic, remembers each failure as a plain sentence with its fix (which e-mail to share the spreadsheet with, which variable to set, which command to type), retries every minute, and `status_lines()` renders a ✅/❌ checklist. `/status`, `/start` and `/help` show it; `/sync`, `/backfill` and `/setup` show it instead of running when something is missing; a scheduled sync that cannot run sends it to the admin; group messages that cannot be stored trigger the hint at most once an hour. `python bot.py check` prints the same checklist. `GET /health` reports `status: degraded` with the open problems.
-
-### Private notes (`NOTE_KEYWORD`, default `#note`)
-
-`split_note()` cuts everything from the keyword (whole word, any case, anywhere in the message) to the end before a message is stored. A message that is only a note is acknowledged in the inbox as `[note]`, status `skipped`, with the reason "private note; its content was not stored and not sent to Claude". Editing a pending message into a note retires it the same way. Imports apply the same rule and report how many notes they skipped. The keyword is an environment variable so other households can pick their own word.
-
-### Photos, voice messages and files
-
-Only text is ever read. A non-text message in the group (photo, video, voice, audio, file, sticker, GIF, location, contact, poll) is acknowledged in the inbox with `[kind]`, status `skipped` and the note "not an expense note; the file was not downloaded, uploaded or sent to Claude". Nothing is downloaded, uploaded or forwarded anywhere. A photo with a caption is treated as the caption text. Service messages (joins, pins) are ignored.
-
-### Currency symbols in column C
-
-After writing rows, the bot sets column C's number format per row from column D: `[$₺]#,##0.0`, `[$€]#,##0.0`, `[$$]#,##0.0`, `[$£]#,##0.0`, or `#,##0 "TOMAN"`. Copying the previous row's format alone would show the previous row's symbol. Cosmetic: a failure is logged and never blocks the data write.
-
-### Health endpoint
-
-`GET /health` on `$PORT` (Railway sets it) answers 200 with `status`, `uptime_seconds`, `paired`, `syncing`, `spreadsheet`. `railway.json` sets `healthcheckPath` to it. Railway's own cron feature must stay empty: the bot is always-on and schedules itself.
+`DECIMAL_SEPARATOR` (`.` default, `,` for 1.154,5) is rendered into the prompt's amount rules. `COLUMN_DATE/AMOUNT/CURRENCY/DESCRIPTION/CATEGORY` (defaults B, C, D, E, G) drive every read and write on the transactions tab, the header row of a tab the bot creates, the guardrail and the formats; letters must be single and distinct.
 
 ### Guarantees and limits
 
@@ -355,7 +336,7 @@ Dependencies: `python-telegram-bot[job-queue]` (Telegram + scheduler), `gspread`
 
 **Live on Railway, 8 Sep 2026 15:50, first deploy:** the deployed bot consumed the nine updates queued at Telegram; three earlier `/sync` commands with nothing pending were answered "Nothing new to process" and logged as `skipped_threshold`; a fourth `/sync` processed "UBER 2 / 1,000.5 یورو" into row 154 (08/09/2026, 1000.5, EUR, Transport), so Persian currency words and comma-formatted amounts work end to end on the deployed code; a message edited after its sync was marked `edited_after_sync` with a warning, and the sheet left untouched. CI (GitHub Actions) green on the pushed commit.
 
-**Verified live by 17 Sep 2026:** the scheduled trigger (15 Sep 09:00, 10 messages → rows 159–168, 2 skipped), the media acknowledgement (`[photo]`), several manual `/sync` runs, `edited_after_sync` on real edits, and a week of production use.
+**Verified live by 19 Sep 2026:** the scheduled trigger (15 Sep), the photo acknowledgement, manual `/sync` runs, a week of production use, and the failure of 19 Sep reproduced three times with diagnostic calls before the fix.
 
 **Not exercised live:** `/setup`, `/backfill` and `/status` typed in Telegram, the note acknowledgement, a Telegram delivery failure, the guardrail's refusal path, and the health endpoint under Railway.
 

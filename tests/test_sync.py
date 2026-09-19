@@ -73,25 +73,23 @@ def test_apply_pairs_amount_messages_skips_noise_and_flags_doubt(settings):
     )
     report = report_for()
     marks = _apply(Extraction(results, 100, 50), pending, settings, report)
-    assert [(row, status) for row, status, _, _ in marks] == [(2, "processed"), (3, "merged"), (4, "skipped"), (5, "needs_review"), (6, "needs_review")]
+    # message 6 got no answer: it is not marked at all, so it stays pending for the next sync
+    assert [(row, status) for row, status, _, _ in marks] == [(2, "processed"), (3, "merged"), (4, "skipped"), (5, "needs_review")]
     assert marks[1][3] == "merged into message 2: amount for message 2"
     assert [(r.date.isoformat(), r.amount, r.description, r.category) for r in report.rows] == [("2026-09-07", 10.0, "UBER", "Transport")]
-    assert (report.skipped, report.merged, len(report.review)) == (1, 1, 2)
-    assert "no result" in report.review[1].note
+    assert (report.skipped, report.merged, len(report.review)) == (1, 1, 1)
 
 
-def test_apply_never_writes_rows_dated_before_the_sheets_last_entry(settings):
-    pending = [InboxMessage(2, -900, "Sam", at(2026, 7, 20), None, "old cafe 100", "pending")]
+def test_late_posted_history_is_written_with_its_own_dates(settings):
+    pending = [InboxMessage(2, 52, "Alex", at(2026, 9, 16, 17), None, "Sep 3\n------\nUBER ONE 250 TL", "pending")]
     report = report_for()
-    report.last_recorded = date(2026, 7, 29)
-    marks = _apply(Extraction(parsed(result(-900, [tx("old cafe", 100, "Eating Out")])), 1, 1), pending, settings, report)
-    assert report.rows == [] and marks[0][1] == "needs_review"
-    assert "before the sheet's last entry (29/07/2026)" in marks[0][3]
+    marks = _apply(Extraction(parsed(result(52, [tx("UBER ONE Subscription", 250, "Transport", when="2026-09-03")])), 1, 1), pending, settings, report)
+    assert [r.date.isoformat() for r in report.rows] == ["2026-09-03"] and marks[0][1] == "processed"
 
 
 def test_summaries_read_well_in_every_state():
     ok = report_for(); ok.status = STATUS_OK; ok.processed = 3
-    assert format_summary(ok).startswith("✅ Kashio synced 0 expense(s) from 3 message(s).")
+    assert format_summary(ok).startswith("✅ Kashio wrote nothing from 3 message(s).")
     quiet = report_for(TRIGGER_SCHEDULE); quiet.status = STATUS_SKIPPED_THRESHOLD; quiet.pending, quiet.threshold = 3, 5
     assert "below the minimum of 5" in format_summary(quiet)
     empty = report_for(); empty.status = STATUS_SKIPPED_THRESHOLD; empty.threshold = 1

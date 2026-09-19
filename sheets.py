@@ -1,7 +1,11 @@
-"""Everything that touches the Google Sheet: the inbox, the run log and the transactions tab.
+"""Everything that touches the Google Sheet: the inbox, the run log, the pairing config and the transactions tab.
 
-Layout of the transactions tab (fixed by the spreadsheet, not by this code):
-    B date · C amount · D currency · E description · F untouched · G category
+The transactions tab layout is configurable (COLUMN_* variables); by default B date, C amount, D currency,
+E description, G category. Columns not listed are never touched.
+
+Rows the bot writes carry a small note on the date cell, "kashio:<message id>", so that an edited Telegram
+message can later find and update or remove exactly its own rows and nothing else. Notes travel with the
+row when rows are sorted, moved or deleted by hand.
 """
 
 from __future__ import annotations
@@ -21,23 +25,26 @@ from config import ConfigError, Settings
 log = logging.getLogger(__name__)
 
 TIMESTAMP = "%Y-%m-%d %H:%M:%S"
+NOTE_PREFIX = "kashio:"
 
 INBOX_HEADERS = ("message_id", "sender", "sent_at", "edited_at", "text", "status", "processed_at", "rows_added", "note")
 RUNS_HEADERS = (
     "run_at", "trigger", "requested_by", "status", "pending", "processed", "rows_added", "sheet_range",
     "skipped", "needs_review", "input_tokens", "output_tokens", "cost_usd", "model", "effort", "error", "merged",
+    "unanswered", "revised", "rows_updated", "rows_deleted", "calls",
 )
+CONFIG_HEADERS = ("key", "value", "updated_at", "updated_by")
+TARGET_HEADER_NAMES = {"date": "Date", "amount": "Amount", "currency": "Currency", "description": "Description", "category": "Category"}
 
 STATUS_PENDING = "pending"
+STATUS_PENDING_REVISION = "pending_revision"  # edited after its rows were written; the rows get replaced at the next sync
 STATUS_PROCESSED = "processed"
 STATUS_SKIPPED = "skipped"
-STATUS_NEEDS_REVIEW = "needs_review"
 STATUS_MERGED = "merged"  # folded into another message's transaction (an amount sent separately, a correction)
-STATUS_EDITED_AFTER_SYNC = "edited_after_sync"
-CONFIG_HEADERS = ("key", "value", "updated_at", "updated_by")
-TARGET_HEADERS = ("", "Date", "Amount", "Currency", "Description", "By", "Category")  # A is left free
+STATUS_NEEDS_REVIEW = "needs_review"
+STATUS_EDITED_AFTER_SYNC = "edited_after_sync"  # no longer produced; kept so old inbox rows still read
 
-# Number format for column C, so the symbol shown matches the currency in column D.
+# Number format for the amount column, so the symbol shown matches the currency column.
 CURRENCY_FORMATS = {
     "TRY": ("CURRENCY", "[$₺]#,##0.0"),
     "EUR": ("CURRENCY", "[$€]#,##0.0"),
@@ -45,9 +52,6 @@ CURRENCY_FORMATS = {
     "GBP": ("CURRENCY", "[$£]#,##0.0"),
     "TOMAN": ("NUMBER", '#,##0 "TOMAN"'),
 }
-
-# Zero-based column bounds of the block we format on the transactions tab: B (1) through G (7, exclusive).
-FIRST_COLUMN_INDEX, END_COLUMN_INDEX = 1, 7
 
 T = TypeVar("T")
 
@@ -76,11 +80,16 @@ class InboxMessage:
     edited_at: datetime | None
     text: str
     status: str
+    rows_added: int = 0  # rows this message produced earlier (revisions only)
+
+    @property
+    def revision(self) -> bool:
+        return self.status == STATUS_PENDING_REVISION
 
 
 @dataclass
 class TransactionRow:
-    """One row to append to the transactions tab."""
+    """One row to write to the transactions tab."""
 
     date: date
     amount: float
@@ -90,47 +99,22 @@ class TransactionRow:
     message_id: int
 
 
-def currency_format_requests(sheet_id: int, start: int, currencies: Sequence[str]) -> list[dict]:
-    """One repeatCell request per run of equal currencies, for column C from row `start` (1-based)."""
-    requests: list[dict] = []
-    index = 0
-    while index < len(currencies):
-        last = index
-        while last + 1 < len(currencies) and currencies[last + 1] == currencies[index]:
-            last += 1
-        fmt = CURRENCY_FORMATS.get(currencies[index])
-        if fmt:
-            kind, pattern = fmt
-            requests.append({"repeatCell": {
-                "range": {"sheetId": sheet_id, "startRowIndex": start - 1 + index, "endRowIndex": start + last,
-                          "startColumnIndex": 2, "endColumnIndex": 3},
-                "cell": {"userEnteredFormat": {"numberFormat": {"type": kind, "pattern": pattern}}},
-                "fields": "userEnteredFormat.numberFormat",
-            }})
-        index = last + 1
-    return requests
+@dataclass
+class Replacement:
+    """What replace_transactions did for one message."""
 
-
-def _as_date(value: object) -> date | None:
-    """A Google Sheets cell as a date: serial numbers (days since 1899-12-30) or common text formats."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)) and 20000 < value < 80000:  # 1954 .. 2119
-        return date(1899, 12, 30) + timedelta(days=int(value))
-    if isinstance(value, str):
-        for pattern in ("%d/%m/%Y", "%Y-%m-%d", "%d.%m.%Y"):
-            try:
-                return datetime.strptime(value.strip(), pattern).date()
-            except ValueError:
-                continue
-    return None
+    updated: int = 0
+    deleted: int = 0
+    appended: int = 0
+    rows: list[int] | None = None  # row numbers now holding the message's transactions
 
 
 class SheetStore:
-    """Thin wrapper over the three tabs Kashio uses. Creates the hidden tabs if they are missing."""
+    """Thin wrapper over the tabs Kashio uses. Creates the hidden tabs, and the transactions tab, if missing."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.columns = settings.columns
         if settings.google_service_account is None:
             raise ConfigError(
                 "GOOGLE_SERVICE_ACCOUNT_JSON is not set. Create a Google service account, download its JSON key, share the "
@@ -144,6 +128,8 @@ class SheetStore:
         self.inbox = self._ensure_tab(settings.inbox_tab, INBOX_HEADERS)
         self.runs = self._ensure_tab(settings.runs_tab, RUNS_HEADERS)
         self.config = self._ensure_tab(settings.config_tab, CONFIG_HEADERS)
+
+    # ---------------------------------------------------------------- opening
 
     def _open_spreadsheet(self, client: gspread.Client) -> gspread.Spreadsheet:
         """Open GOOGLE_SHEET_ID, or find the spreadsheet shared with the service account when the id is not set."""
@@ -185,17 +171,22 @@ class SheetStore:
         except WorksheetNotFound:
             existing = ", ".join(ws.title for ws in self.spreadsheet.worksheets())
             log.warning("Tab %r not found (existing tabs: %s); creating it with a header row", title, existing)
-            sheet = self.spreadsheet.add_worksheet(title=title, rows=1000, cols=len(TARGET_HEADERS))
-            _retry(lambda: sheet.update([list(TARGET_HEADERS)], "A1"))
+            width = max(self.columns.index(letter) for letter in self.columns.written) + 1
+            sheet = self.spreadsheet.add_worksheet(title=title, rows=1000, cols=max(width, 8))
+            headers = [""] * width
+            for field_name, name in TARGET_HEADER_NAMES.items():
+                headers[self.columns.index(getattr(self.columns, field_name))] = name
+            _retry(lambda: sheet.update([headers], "A1"))
             self._format_new_target(sheet)
             return sheet
 
     def _format_new_target(self, sheet: gspread.Worksheet) -> None:
         """Date and number formats for a tab the bot created; cosmetic, never blocks."""
+        c = self.columns
         try:
-            _retry(lambda: sheet.format("B2:B", {"numberFormat": {"type": "DATE", "pattern": "dd/mm/yyyy"}}))
-            _retry(lambda: sheet.format("C2:C", {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}}))
-            _retry(lambda: sheet.format("A1:G1", {"textFormat": {"bold": True}}))
+            _retry(lambda: sheet.format(f"{c.date}2:{c.date}", {"numberFormat": {"type": "DATE", "pattern": "dd/mm/yyyy"}}))
+            _retry(lambda: sheet.format(f"{c.amount}2:{c.amount}", {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}}))
+            _retry(lambda: sheet.format("1:1", {"textFormat": {"bold": True}}))
         except APIError as exc:
             log.warning("Could not format the new tab: %s", exc)
 
@@ -222,6 +213,12 @@ class SheetStore:
         row = [str(message_id), sender, sent_at.strftime(TIMESTAMP), "", text, STATUS_PENDING, "", "", ""]
         _retry(lambda: self.inbox.append_row(row, value_input_option="RAW"))
 
+    def add_skipped(self, message_id: int, sender: str, sent_at: datetime, label: str, reason: str) -> None:
+        """Log that a message was seen and skipped without storing its content: media, or a private note."""
+        now = datetime.now(self.settings.timezone).strftime(TIMESTAMP)
+        row = [str(message_id), sender, sent_at.strftime(TIMESTAMP), "", f"[{label}]", STATUS_SKIPPED, now, 0, reason]
+        _retry(lambda: self.inbox.append_row(row, value_input_option="RAW"))
+
     def add_messages(self, rows: Sequence[tuple[int, str, datetime, datetime | None, str]]) -> None:
         """Bulk insert of (message_id, sender, sent_at, edited_at, text), used by the backfill command."""
         values = [
@@ -241,39 +238,35 @@ class SheetStore:
                 continue
         return ids
 
-    def add_skipped(self, message_id: int, sender: str, sent_at: datetime, label: str, reason: str) -> None:
-        """Log that a message was seen and skipped without storing its content: media, or a private note."""
-        now = datetime.now(self.settings.timezone).strftime(TIMESTAMP)
-        row = [str(message_id), sender, sent_at.strftime(TIMESTAMP), "", f"[{label}]", STATUS_SKIPPED, now, 0, reason]
-        _retry(lambda: self.inbox.append_row(row, value_input_option="RAW"))
-
     def update_message(self, message_id: int, text: str, edited_at: datetime, retire_reason: str | None = None) -> str | None:
         """Store an edit and return the message's resulting status, or None if it was never stored.
 
         - still pending: the text is replaced (or, with `retire_reason`, the message is closed as skipped)
         - skipped or flagged without any row written: reopened as pending, so the next sync looks at it again
-        - already turned into sheet rows: frozen as `edited_after_sync`; the sheet is never changed behind your back
+        - already turned into sheet rows: `pending_revision`, and the next sync replaces those rows with
+          whatever the edited text now says (or removes them, when the message was edited into a note)
         """
         cell = _retry(lambda: self.inbox.find(str(message_id), in_column=1))
         if cell is None:
             return None
         values = _retry(lambda: self.inbox.row_values(cell.row)) + [""] * len(INBOX_HEADERS)
         previous = values[5] or STATUS_PENDING
-        rows_added = int(values[7] or 0) if str(values[7] or "0").isdigit() else 1
+        rows_added = int(values[7]) if str(values[7]).isdigit() else 0
+        has_rows = rows_added > 0 or previous == STATUS_PENDING_REVISION
         now = datetime.now(self.settings.timezone).strftime(TIMESTAMP)
         updates = [{"range": f"D{cell.row}:E{cell.row}", "values": [[edited_at.strftime(TIMESTAMP), text]]}]
-        reopenable = previous == STATUS_PENDING or (previous in (STATUS_SKIPPED, STATUS_NEEDS_REVIEW) and rows_added == 0)
-        if reopenable and retire_reason:
+        if has_rows:
+            status = STATUS_PENDING_REVISION
+            note = "retracted after an edit; its rows will be removed" if retire_reason else "edited after its rows were written; they will be replaced"
+            updates.append({"range": f"F{cell.row}", "values": [[status]]})
+            updates.append({"range": f"I{cell.row}", "values": [[note]]})
+        elif retire_reason:
             status = STATUS_SKIPPED
             updates.append({"range": f"F{cell.row}:I{cell.row}", "values": [[status, now, 0, retire_reason]]})
-        elif reopenable:
+        else:
             status = STATUS_PENDING
             if previous != STATUS_PENDING:
                 updates.append({"range": f"F{cell.row}:I{cell.row}", "values": [[status, "", "", "reopened after an edit"]]})
-        else:
-            status = STATUS_EDITED_AFTER_SYNC
-            updates.append({"range": f"F{cell.row}", "values": [[status]]})
-            updates.append({"range": f"I{cell.row}", "values": [[f"edited after sync (was {previous}); sheet not changed"]]})
         _retry(lambda: self.inbox.batch_update(updates))
         return status
 
@@ -283,12 +276,12 @@ class SheetStore:
         pending: list[InboxMessage] = []
         for index, values in enumerate(rows[1:], start=2):
             values = list(values) + [""] * (len(INBOX_HEADERS) - len(values))
-            message_id, sender, sent_at, edited_at, text, status = values[:6]
+            message_id, sender, sent_at, edited_at, text, status, _processed, rows_added = values[:8]
             try:
                 message_id = int(message_id)  # negative ids mark messages imported from a chat export
             except ValueError:
                 continue
-            if status != STATUS_PENDING or message_id in seen:  # a retried append could store a message twice
+            if status not in (STATUS_PENDING, STATUS_PENDING_REVISION) or message_id in seen:
                 continue
             try:
                 parsed_sent = self._parse_timestamp(sent_at)
@@ -297,17 +290,10 @@ class SheetStore:
                 log.warning("Inbox row %s has an unreadable timestamp (%r); skipping it", index, sent_at)
                 continue
             seen.add(message_id)
-            pending.append(
-                InboxMessage(
-                    row=index,
-                    message_id=message_id,
-                    sender=sender,
-                    sent_at=parsed_sent,
-                    edited_at=parsed_edited,
-                    text=text,
-                    status=status,
-                )
-            )
+            pending.append(InboxMessage(
+                row=index, message_id=message_id, sender=sender, sent_at=parsed_sent, edited_at=parsed_edited,
+                text=text, status=status, rows_added=int(rows_added) if str(rows_added).isdigit() else 0,
+            ))
         return pending
 
     def mark_messages(self, marks: Sequence[tuple[int, str, int, str]]) -> None:
@@ -353,12 +339,12 @@ class SheetStore:
     # ----------------------------------------------------------- transactions
 
     def category_options(self) -> list[str]:
-        """Allowed values of the column-G dropdown on the target tab, or [] when there is no dropdown.
+        """Allowed values of the category column's dropdown on the target tab, or [] when there is no dropdown.
 
-        Handles both a fixed list and a list fed from a range (Google's budget template points G at a
+        Handles both a fixed list and a list fed from a range (Google's budget template points the column at a
         category table in its Summary tab). Reading it on every sync keeps the sheet the source of truth.
         """
-        probe = f"'{self.settings.sheet_tab}'!G{self.last_used_row()}"
+        probe = f"'{self.settings.sheet_tab}'!{self.columns.category}{self.last_used_row()}"
         meta = _retry(lambda: self.spreadsheet.fetch_sheet_metadata({"includeGridData": True, "ranges": [probe]}))
         try:
             cell = meta["sheets"][0]["data"][0]["rowData"][0]["values"][0]
@@ -375,9 +361,10 @@ class SheetStore:
         return []
 
     def last_recorded_date(self) -> date | None:
-        """The latest date in column B of the target tab, or None when the tab holds no dates yet."""
+        """The latest date in the date column of the target tab, or None when the tab holds no dates yet."""
         latest: date | None = None
-        for row in _retry(lambda: self.target.get_values("B1:B", value_render_option="UNFORMATTED_VALUE")):
+        column = self.columns.date
+        for row in _retry(lambda: self.target.get_values(f"{column}1:{column}", value_render_option="UNFORMATTED_VALUE")):
             for value in row:
                 parsed = _as_date(value)
                 if parsed and (latest is None or parsed > latest):
@@ -385,14 +372,17 @@ class SheetStore:
         return latest
 
     def last_used_row(self) -> int:
-        """Highest row with a value in B, C or E. Pre-filled currency cells in D do not count."""
-        values = _retry(lambda: self.target.get_values("B1:E"))
-        last = 1
+        """Highest row with a value in the date, amount or description column. Pre-filled currency cells do not count."""
+        c = self.columns
+        first, last = min(c.written, key=c.index), max(c.written, key=c.index)
+        keep = {c.index(letter) - c.index(first) for letter in (c.date, c.amount, c.description)}
+        values = _retry(lambda: self.target.get_values(f"{first}1:{last}"))
+        used = 1
         for index, row in enumerate(values, start=1):
-            b, c, _, e = (list(row) + [""] * 4)[:4]
-            if b or c or e:
-                last = index
-        return last
+            row = list(row) + [""] * (c.index(last) - c.index(first) + 1)
+            if any(row[offset] for offset in keep):
+                used = index
+        return used
 
     def append_transactions(self, rows: Sequence[TransactionRow]) -> tuple[int, int]:
         """Write rows under the last used row and return the (first, last) row numbers written."""
@@ -404,20 +394,77 @@ class SheetStore:
             _retry(lambda: self.target.add_rows(end - self.target.row_count))
         self._assert_empty(start, end)
         self._copy_format(source_row=last, start=start, end=end)
+        self._write_rows(start, rows)
+        return start, end
+
+    def rows_for_message(self, message_id: int) -> list[int]:
+        """Row numbers on the target tab whose date cell carries this message's note."""
+        column = self.columns.date
+        notes = _retry(lambda: self.target.get_notes(grid_range=f"{column}1:{column}"))
+        wanted = f"{NOTE_PREFIX}{message_id}"
+        return [index for index, row in enumerate(notes, start=1) if row and row[0] == wanted]
+
+    def replace_transactions(self, message_id: int, rows: Sequence[TransactionRow]) -> Replacement:
+        """Make the sheet reflect an edited message: update its rows in place, delete extra ones, append missing ones.
+
+        Only rows carrying this message's own note are touched. Rows are re-checked right before deletion.
+        """
+        old = self.rows_for_message(message_id)
+        result = Replacement()
+        keep = min(len(old), len(rows))
+        if keep:
+            for row_number, row in zip(old[:keep], rows[:keep]):
+                self._write_rows(row_number, [row])
+            result.updated = keep
+        for row_number in sorted(old[keep:], reverse=True):  # bottom-up, so earlier row numbers stay valid
+            current = _retry(lambda: self.target.get_notes(grid_range=f"{self.columns.date}{row_number}"))
+            if not current or not current[0] or current[0][0] != f"{NOTE_PREFIX}{message_id}":
+                raise RuntimeError(f"refusing to delete row {row_number}: it no longer carries the note of message {message_id}")
+            _retry(lambda: self.target.delete_rows(row_number))
+            result.deleted += 1
+        if len(rows) > keep:
+            start, _end = self.append_transactions(rows[keep:])
+            result.appended = len(rows) - keep
+            result.rows = old[:keep] + list(range(start, start + result.appended))
+        else:
+            result.rows = old[:keep]
+        return result
+
+    def _write_rows(self, start: int, rows: Sequence[TransactionRow]) -> None:
+        """Values for the configured columns, the currency formats, and the provenance notes."""
+        c = self.columns
+        end = start + len(rows) - 1
         updates = [
-            {
-                "range": f"B{start}:E{end}",
-                "values": [[r.date.isoformat(), r.amount, r.currency, r.description] for r in rows],
-            },
-            {"range": f"G{start}:G{end}", "values": [[r.category] for r in rows]},
+            {"range": f"{c.date}{start}:{c.date}{end}", "values": [[r.date.isoformat()] for r in rows]},
+            {"range": f"{c.amount}{start}:{c.amount}{end}", "values": [[r.amount] for r in rows]},
+            {"range": f"{c.currency}{start}:{c.currency}{end}", "values": [[r.currency] for r in rows]},
+            {"range": f"{c.description}{start}:{c.description}{end}", "values": [[r.description] for r in rows]},
+            {"range": f"{c.category}{start}:{c.category}{end}", "values": [[r.category] for r in rows]},
         ]
         _retry(lambda: self.target.batch_update(updates, value_input_option="USER_ENTERED"))
         self._apply_currency_formats(start, [r.currency for r in rows])
-        return start, end
+        try:
+            _retry(lambda: self.target.insert_notes({f"{c.date}{start + i}": f"{NOTE_PREFIX}{r.message_id}" for i, r in enumerate(rows)}))
+        except APIError as exc:  # provenance is needed for later edits, but must not lose the data write
+            log.warning("Could not write provenance notes for rows %s-%s: %s", start, end, exc)
+
+    def _assert_empty(self, start: int, end: int) -> None:
+        """Guardrail: the bot only ever appends. Refuse to write if the destination rows hold anything but a default currency."""
+        c = self.columns
+        first, last = min(c.written, key=c.index), max(c.written, key=c.index)
+        width = c.index(last) - c.index(first) + 1
+        check = [c.index(letter) - c.index(first) for letter in c.written if letter != c.currency]
+        existing = _retry(lambda: self.target.get_values(f"{first}{start}:{last}{end}"))
+        for offset, row in enumerate(existing):
+            row = list(row) + [""] * width
+            if any(row[i] for i in check):
+                raise RuntimeError(
+                    f"refusing to write: row {start + offset} of {self.settings.sheet_tab!r} already holds data; nothing was written"
+                )
 
     def _apply_currency_formats(self, start: int, currencies: Sequence[str]) -> None:
-        """Make the symbol in column C match column D (the copied format would show the previous row's currency)."""
-        requests = currency_format_requests(self.target.id, start, currencies)
+        """Make the symbol in the amount column match the currency column (the copied format would show the previous row's)."""
+        requests = currency_format_requests(self.target.id, start, currencies, self.columns.index(self.columns.amount))
         if not requests:
             return
         try:
@@ -425,35 +472,17 @@ class SheetStore:
         except APIError as exc:  # cosmetic; never block the data write on it
             log.warning("Could not set currency formats: %s", exc)
 
-    def _assert_empty(self, start: int, end: int) -> None:
-        """Guardrail: the bot only ever appends. Refuse to write if the destination rows hold anything but a default currency."""
-        existing = _retry(lambda: self.target.get_values(f"B{start}:G{end}"))
-        for offset, row in enumerate(existing):
-            b, c, _d, e, f, g = (list(row) + [""] * 6)[:6]
-            if any((b, c, e, f, g)):
-                raise RuntimeError(
-                    f"refusing to write: row {start + offset} of {self.settings.sheet_tab!r} already holds data; nothing was written"
-                )
-
     def _copy_format(self, source_row: int, start: int, end: int) -> None:
         """Repeat the formatting of `source_row` (borders, number and date formats, dropdowns) over the new rows."""
+        c = self.columns
+        first, last = min(c.written, key=c.index), max(c.written, key=c.index)
         sheet_id = self.target.id
         request = {
             "copyPaste": {
-                "source": {
-                    "sheetId": sheet_id,
-                    "startRowIndex": source_row - 1,
-                    "endRowIndex": source_row,
-                    "startColumnIndex": FIRST_COLUMN_INDEX,
-                    "endColumnIndex": END_COLUMN_INDEX,
-                },
-                "destination": {
-                    "sheetId": sheet_id,
-                    "startRowIndex": start - 1,
-                    "endRowIndex": end,
-                    "startColumnIndex": FIRST_COLUMN_INDEX,
-                    "endColumnIndex": END_COLUMN_INDEX,
-                },
+                "source": {"sheetId": sheet_id, "startRowIndex": source_row - 1, "endRowIndex": source_row,
+                           "startColumnIndex": c.index(first), "endColumnIndex": c.index(last) + 1},
+                "destination": {"sheetId": sheet_id, "startRowIndex": start - 1, "endRowIndex": end,
+                                "startColumnIndex": c.index(first), "endColumnIndex": c.index(last) + 1},
                 "pasteType": "PASTE_FORMAT",
                 "pasteOrientation": "NORMAL",
             }
@@ -462,3 +491,39 @@ class SheetStore:
             _retry(lambda: self.spreadsheet.batch_update({"requests": [request]}))
         except APIError as exc:  # formatting is cosmetic; never block the data write on it
             log.warning("Could not copy row formatting: %s", exc)
+
+
+def currency_format_requests(sheet_id: int, start: int, currencies: Sequence[str], column_index: int = 2) -> list[dict]:
+    """One repeatCell request per run of equal currencies, for the amount column from row `start` (1-based)."""
+    requests: list[dict] = []
+    index = 0
+    while index < len(currencies):
+        last = index
+        while last + 1 < len(currencies) and currencies[last + 1] == currencies[index]:
+            last += 1
+        fmt = CURRENCY_FORMATS.get(currencies[index])
+        if fmt:
+            kind, pattern = fmt
+            requests.append({"repeatCell": {
+                "range": {"sheetId": sheet_id, "startRowIndex": start - 1 + index, "endRowIndex": start + last,
+                          "startColumnIndex": column_index, "endColumnIndex": column_index + 1},
+                "cell": {"userEnteredFormat": {"numberFormat": {"type": kind, "pattern": pattern}}},
+                "fields": "userEnteredFormat.numberFormat",
+            }})
+        index = last + 1
+    return requests
+
+
+def _as_date(value: object) -> date | None:
+    """A Google Sheets cell as a date: serial numbers (days since 1899-12-30) or common text formats."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and 20000 < value < 80000:  # 1954 .. 2119
+        return date(1899, 12, 30) + timedelta(days=int(value))
+    if isinstance(value, str):
+        for pattern in ("%d/%m/%Y", "%Y-%m-%d", "%d.%m.%Y"):
+            try:
+                return datetime.strptime(value.strip(), pattern).date()
+            except ValueError:
+                continue
+    return None

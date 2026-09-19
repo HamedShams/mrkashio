@@ -39,7 +39,7 @@ One message may contain several transactions. Every title + amount pair is its o
 
 - Return a plain number without symbols or currency words.
 - Digits may be Persian or Arabic-Indic: ۱۰ is 10, ۲۶۶ is 266, ۱٬۲۵۰ is 1250.
-- Turkish formatting: a dot or comma followed by exactly three digits is a thousands separator ("1.250" = 1250, "12,500" = 12500). Otherwise the last separator is the decimal mark ("12,5" = 12.5, "266.50" = 266.5).
+{{NUMBER_RULES}}
 - "k", "bin", "hezar" or "هزار" means thousand ("2k" = 2000, "350k" = 350000). "m", "million", "milyon" or "میلیون" means million ("1.5m" = 1500000).
 - If the amount is missing or genuinely ambiguous, do not guess: return no transaction for that item, set needs_review to true and explain in note.
 
