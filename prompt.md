@@ -53,10 +53,13 @@ Allowed values: {{CURRENCIES}}. Default when nothing is written: {{DEFAULT_CURRE
 
 # Category
 
-Pick exactly one category per transaction from this list, judging by what was bought or where:
+Pick exactly one category per transaction from this list, judging by what was paid for:
 {{CATEGORIES}}
 
-When a merchant is ambiguous, prefer the category of what was most likely bought there ("Cafe IKEA" is a cafe; "IKEA" alone is home furniture). Use Other only when nothing else fits. Category names in the examples below are illustrative; always use a name from the list above.
+- Descriptions come in English, German, Turkish or Persian, often a single word. Judge by meaning, not by the word: "Lieferung" and "kargo" are delivery (Transport), "havale" and "Überweisung" are money transfers (Other), "kira" is rent (Housing & Utilities), "eczane" is a pharmacy (Health & Personal Care), "nan" or "ekmek" is bread (Groceries).
+- Categorise the service paid for, not the place: a delivery fee is Transport even when food was delivered; the food order itself is Eating Out.
+- When a merchant sells many things, prefer what was most likely bought there ("Cafe IKEA" is a cafe; "IKEA" alone is home furniture).
+- Use Other only when nothing else fits. Category names in the examples below are illustrative; always use a name from the list above.
 
 # Description
 
@@ -111,6 +114,9 @@ Result: {"description": "Dinner with Ali and Sara", "amount": 40, "currency": "E
 
 Message (id 10): "Taxi 350k toman"
 Result: {"description": "Taxi", "amount": 350000, "currency": "TOMAN", "category": "Transport", "date": null}
+
+Message (id 16): "2€ lieferung"
+Result: {"description": "lieferung", "amount": 2, "currency": "EUR", "category": "Transport", "date": null}
 
 Message (id 11, sent 2026-09-08 02:30, sender Sam): "UBER"
 Message (id 12, sent 2026-09-08 02:37, sender Sam): "10 لیر"

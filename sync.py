@@ -72,7 +72,9 @@ class RunReport:
     rows_updated: int = 0
     rows_deleted: int = 0
     unanswered: list[int] = field(default_factory=list)  # message ids Claude gave no usable answer for; they stay pending
+    held: list[ReviewItem] = field(default_factory=list)  # edited messages whose rows were left untouched because the new answer looked incomplete
     problems: list[str] = field(default_factory=list)  # what was wrong with rejected answers
+    suspicious: dict[int, str] = field(default_factory=dict)  # message id → why its answer looks cut short
     calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
@@ -168,6 +170,7 @@ def run_sync(
             report.cost_usd = extraction.cost_usd(settings)
             report.unanswered = list(extraction.unanswered)
             report.problems = list(extraction.problems)
+            report.suspicious = dict(extraction.suspicious)
             marks = _apply(extraction, to_extract, settings, report)
             report.processed = len(pending) - len(report.unanswered)
             if dry_run:
@@ -224,13 +227,21 @@ def _apply(
             for t in result.transactions
         ]
         note = result.note or result.skip_reason or ""
-        if result.needs_review:
-            report.review.append(ReviewItem(message.message_id, message.sender, message.sent_at, message.text, result.note or "needs a look"))
+        short = report.suspicious.get(message.message_id)
         if message.revision:
+            hold = _hold_reason(message, rows, result, short)
+            if hold:
+                # Never let a doubtful re-extraction delete rows: keep the sheet as it is and ask the human.
+                report.held.append(ReviewItem(message.message_id, message.sender, message.sent_at, message.text, hold))
+                marks.append((message.row, STATUS_NEEDS_REVIEW, message.rows_added, f"rows left unchanged: {hold}; edit the message again to retry"))
+                continue
             report.revisions.append((message, rows))  # marked after the sheet has been updated
-            if result.needs_review:
-                marks.append((message.row, STATUS_NEEDS_REVIEW, len(rows), note))
             continue
+        if short:
+            result.needs_review = True
+            note = f"answer may be incomplete: {short}" + (f"; {note}" if note else "")
+        if result.needs_review:
+            report.review.append(ReviewItem(message.message_id, message.sender, message.sent_at, message.text, result.note or note or "needs a look"))
         report.rows.extend(rows)
         if result.needs_review:
             status = STATUS_NEEDS_REVIEW
@@ -245,6 +256,17 @@ def _apply(
             status = STATUS_PROCESSED
         marks.append((message.row, status, len(rows), note))
     return marks
+
+
+def _hold_reason(message: InboxMessage, rows: list[TransactionRow], result, short: str | None) -> str | None:
+    """Why an edited message's rows must not be replaced yet. None means the replacement is safe."""
+    if short:
+        return f"the new answer looks cut short ({short})"
+    if result.needs_review and len(rows) < message.rows_added:
+        return f"Claude was unsure ({result.note or 'needs a look'}) and returned fewer items ({len(rows)}) than the {message.rows_added} rows already written"
+    if message.rows_added >= 2 and len(rows) * 2 < message.rows_added and not result.skip_reason:
+        return f"the new answer has {len(rows)} item(s) for a message that had {message.rows_added} rows"
+    return None
 
 
 # ------------------------------------------------------------------ reporting
@@ -294,6 +316,10 @@ def format_summary(report: RunReport) -> str:
             lines.append(f"  • {_excerpt(item)} — {item.note}")
         if len(report.review) > MAX_REVIEW_ITEMS_IN_SUMMARY:
             lines.append(f"  • … and {len(report.review) - MAX_REVIEW_ITEMS_IN_SUMMARY} more, see the report")
+    if report.held:
+        lines.append(f"✋ {len(report.held)} edited message(s) left unchanged in the sheet, because the new answer looked incomplete:")
+        for item in report.held[:MAX_REVIEW_ITEMS_IN_SUMMARY]:
+            lines.append(f"  • {_excerpt(item)} — {item.note}. Edit it again to retry.")
     if report.unanswered:
         lines.append(f"🔁 {len(report.unanswered)} message(s) got no usable answer from Claude and stay pending; "
                      "they will be retried at the next sync.")
@@ -314,7 +340,7 @@ def format_report(report: RunReport, include_rows: bool = False) -> str:
         lines.append(f"Totals: {format_totals(report)}")
     if report.revised:
         lines.append(f"Edited messages re-synced: {report.revised} · rows updated {report.rows_updated} · rows removed {report.rows_deleted}")
-    lines.append(f"Skipped: {report.skipped} · merged: {report.merged} · needs review: {len(report.review)} · unanswered: {len(report.unanswered)}")
+    lines.append(f"Skipped: {report.skipped} · merged: {report.merged} · needs review: {len(report.review)} · held: {len(report.held)} · unanswered: {len(report.unanswered)}")
     if report.calls or report.input_tokens:
         lines.append(f"Claude: {report.calls} call(s), {report.input_tokens:,} in / {report.output_tokens:,} out · "
                      f"cost ${report.cost_usd:.4f} ({report.model}, effort {report.effort})")
@@ -322,6 +348,10 @@ def format_report(report: RunReport, include_rows: bool = False) -> str:
         lines.append("Rejected answers: " + "; ".join(report.problems[:4]) + (" …" if len(report.problems) > 4 else ""))
     if report.unanswered:
         lines.append(f"Still pending, no usable answer (retried next sync): message ids {', '.join(map(str, report.unanswered))}")
+    if report.held:
+        lines.append("Edited messages held (sheet unchanged):")
+        for item in report.held:
+            lines.append(f"• {_excerpt(item)} — {item.note}")
     if report.review:
         lines.append("Needs review:")
         for item in report.review[:MAX_REVIEW_ITEMS_IN_REPORT]:

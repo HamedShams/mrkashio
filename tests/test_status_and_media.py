@@ -119,10 +119,11 @@ class FakeStore:
         self.runs.append(values)
 
 
-def fake_extract(results, unanswered=()):
+def fake_extract(results, unanswered=(), suspicious=None):
     def _extract(client, settings, prompt, messages, categories):
         model = result_model(categories)
-        return Extraction(model.model_validate({"results": results}).results, 1000, 100, calls=1, unanswered=list(unanswered))
+        return Extraction(model.model_validate({"results": results}).results, 1000, 100, calls=1,
+                          unanswered=list(unanswered), suspicious=dict(suspicious or {}))
     return _extract
 
 
@@ -186,3 +187,34 @@ def test_edited_messages_are_re_synced_and_retractions_remove_rows(settings, mon
     assert statuses == {2: "processed", 3: "skipped"} and "re-synced after an edit" in store.marks[0][3]
     summary = sync.format_summary(report)
     assert "updated 1" in summary and "Removed 1 row(s)" in summary
+
+
+def test_a_doubtful_re_extraction_never_deletes_rows(settings, monkeypatch):
+    from sheets import STATUS_PENDING_REVISION, InboxMessage
+    dump = "Sep 3 UBER ONE 250 TL Sep 8 Havale 1,158.4 TL Portakal su 160 TL UBER 174 TL Lunch 370 TL A101 722 TL"
+    pending = [InboxMessage(2, 52, "Alex", at(2026, 9, 16, 17), at(2026, 9, 19), dump, STATUS_PENDING_REVISION, rows_added=12)]
+    one_item = [{"message_id": 52, "transactions": [
+        {"description": "UBER ONE Subscription", "amount": 250, "currency": "TRY", "category": "Transport", "date": "2026-09-03"}],
+        "merged_into": None, "skip_reason": None, "needs_review": True, "note": "amount unclear"}]
+    store = FakeStore(pending)
+    monkeypatch.setattr(sync, "extract", fake_extract(one_item, suspicious={52: "only 1 transaction(s) for a text that lists about 8 amounts"}))
+    report = sync.run_sync(settings, store, object(), "prompt", trigger=sync.TRIGGER_MANUAL, requested_by="Alex")
+    assert report.status == sync.STATUS_OK and not hasattr(store, "replaced") and store.written == []
+    assert report.rows_deleted == 0 and len(report.held) == 1 and store.marks[0][1] == "needs_review"
+    assert "rows left unchanged" in store.marks[0][3] and store.marks[0][2] == 12  # rows_added preserved
+    assert "left unchanged" in sync.format_summary(report)
+
+    # the same shrinkage without the suspicious flag is still held by the count rule
+    monkeypatch.setattr(sync, "extract", fake_extract(one_item))
+    store = FakeStore(pending)
+    report = sync.run_sync(settings, store, object(), "prompt", trigger=sync.TRIGGER_MANUAL, requested_by="Alex")
+    assert not hasattr(store, "replaced") and len(report.held) == 1
+
+    # a clean, complete answer replaces normally
+    full = [{"message_id": 52, "transactions": [
+        {"description": f"item {i}", "amount": 100, "currency": "TRY", "category": "Other", "date": None} for i in range(12)],
+        "merged_into": None, "skip_reason": None, "needs_review": False, "note": None}]
+    monkeypatch.setattr(sync, "extract", fake_extract(full))
+    store = FakeStore(pending)
+    report = sync.run_sync(settings, store, object(), "prompt", trigger=sync.TRIGGER_MANUAL, requested_by="Alex")
+    assert [(mid, len(rows)) for mid, rows in store.replaced] == [(52, 12)] and report.held == []

@@ -1,6 +1,6 @@
 # Kashio — Telegram expense notes to Google Sheets
 
-Revision 9 (19 Sep 2026). Status: **live on Railway; answer auditing with retry, edits re-synced into the sheet, configurable columns and number format.** See README.md for setup.
+Revision 10 (19 Sep 2026). Status: **live on Railway; audited answers with a low-effort retry, truncation detection, edits re-synced with a hold rule that never deletes on a doubtful answer, multilingual category rules.** See README.md for setup.
 
 Bot: `@mrkashio_bot` · Repo: `https://github.com/hamed-grantonomy/mrkashio` (linked to Railway) · Target tab: `Transactions_Trip#2` (env `SHEET_TAB`)
 
@@ -80,9 +80,9 @@ A file "as a mini database" is the one option that fails on Railway: the filesys
 
 Haiku 4.5 ($1 / $5) would handle most messages, but its failure mode is a silent wrong row in a finance sheet, and the price difference is a few cents a month. Opus 5 ($5 / $25) is overkill. `ANTHROPIC_MODEL` is an env var.
 
-### Thinking effort: `low` (changed on 19 Sep 2026 after a production failure)
+### Thinking effort: `high` first, `low` on retry (settled 19 Sep 2026)
 
-On 19 Sep 2026 a ten-message batch at `high` came back with results for only two messages: the model reasoned correctly about all ten (visible in the thinking summary) but the JSON it then wrote degenerated after about 1,800 characters into garbage (`"date":","`, a description `"026 kU"`, a `merged_into` of 101736) and stopped; the API's schema enforcement kept it syntactically valid, so it parsed as a success. Reproduced twice; `medium` even returned a server error; `low` and thinking-disabled both returned complete, coherent answers, and `low` still flagged an ambiguous amount for review. Decision: default `low`, and an audit-and-retry in `extractor.py` that catches this class of failure whatever the setting: results for unknown ids, duplicates, `merged_into` pointing outside the batch, unreadable descriptions, implausible amounts and malformed dates are rejected; if anything is rejected or any message is unanswered, the batch is asked once more with thinking disabled; whatever is still unanswered stays pending and is named in the report. Set `ANTHROPIC_EFFORT=low` in Railway too; the code default cannot override a variable that is set.
+On 19 Sep 2026 a ten-message batch at `high` came back with results for only two messages: the model reasoned correctly about all ten (visible in the thinking summary) but the JSON it then wrote degenerated after about 1,800 characters into garbage (`"date":","`, a description `"026 kU"`, a `merged_into` of 101736) and stopped; the API's schema enforcement kept it syntactically valid, so it parsed as a success. Reproduced twice; `medium` even returned a server error; `low` and thinking-disabled both returned complete, coherent answers, and `low` still flagged an ambiguous amount for review. The same afternoon, at `high` on Railway, the corrected version of that message came back with one transaction and a needs-review flag, and the revision logic replaced twelve rows with one. Decisions: the first attempt runs at the configured effort (`high` by default, as the owner prefers); `extractor.audit()` rejects results for unknown ids, duplicates, `merged_into` outside the batch, unreadable descriptions, implausible amounts and malformed dates, and flags an answer as *cut short* when a message lists at least three amounts but came back with fewer than half as many transactions and no reason; any rejection, missing message or cut-short answer triggers one retry at `low`; whatever is still unanswered stays pending, whatever still looks cut short is flagged instead of trusted. For an edited message, `sync._hold_reason` refuses to touch its rows when the new answer looks cut short, when Claude is unsure and returned fewer items than the rows already written, or when the count fell below half; the message is flagged with "rows left unchanged" and the owner edits again to retry.
 
 ### Your traffic, priced
 
@@ -170,6 +170,10 @@ python bot.py                 run the bot (what Railway runs)
 ### Cold start and history
 
 Telegram bots never receive messages sent before they joined. History comes in through `/backfill` (paste) or `backfill FILE`, which skip everything dated on or before the sheet's last recorded day and anything already stored, and queue the rest as pending. The earlier *live* cutoff rule, which refused any row dated before the sheet's last entry at every sync, was removed on 19 Sep 2026: it rejected a legitimate multi-day dump posted late (message 52, "Sep 3 … Sep 15"), because the sheet's last date came from the bot's own previous run, not from complete hand entry.
+
+### Categories across languages (19 Sep 2026)
+
+"2€ lieferung" was filed under Eating Out because the category hints named "food delivery" under Eating Out and nothing about delivery under Transport, so the model matched the German word to the only delivery it had been given. Fix: the Transport hint now reads "moving people or things: … courier, shipping and delivery fees (Lieferung, kargo)", Eating Out is "a food order (the food itself; a separate delivery fee is Transport)", Other names money transfers (havale, Überweisung), and the prompt's Category section tells the model that descriptions come in English, German, Turkish or Persian, often as a single word, to judge by meaning with a few worked equivalences, and to categorise the service paid for rather than the place. One example ("2€ lieferung" → Transport) was added.
 
 ### Number format and layout
 

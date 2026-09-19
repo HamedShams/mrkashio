@@ -52,9 +52,9 @@ def test_number_rules_follow_the_decimal_separator(settings):
     assert '"1.154,5" = 1154.5' in load_prompt(replace(settings, decimal_separator=","))
 
 
-def result(message_id, transactions=(), merged_into=None):
+def result(message_id, transactions=(), merged_into=None, skip_reason=None):
     return {"message_id": message_id, "transactions": list(transactions), "merged_into": merged_into,
-            "skip_reason": None, "needs_review": False, "note": None}
+            "skip_reason": skip_reason, "needs_review": False, "note": None}
 
 
 def tx(description="Cafe", amount=385.0, date=None):
@@ -66,7 +66,7 @@ def parsed(*results):
 
 
 def test_audit_rejects_damaged_answers_and_keeps_good_ones():
-    good, problems = audit(parsed(
+    good, problems, suspicious = audit(parsed(
         result(50, [tx()]),
         result(51, [tx("026 kU", 617.7, date=",")]),  # the corruption seen in production
         result(99, [tx()]),  # a message that was never sent
@@ -74,8 +74,18 @@ def test_audit_rejects_damaged_answers_and_keeps_good_ones():
         result(50, [tx()]),  # answered twice
         result(53, [tx(amount=0)]),
     ), expected={50, 51, 52, 53})
-    assert [r.message_id for r in good] == [50]
+    assert [r.message_id for r in good] == [50] and suspicious == {}
     assert len(problems) == 5 and any("malformed date" in p for p in problems) and any("unknown message id 99" in p for p in problems)
+
+
+def test_audit_flags_an_answer_that_is_cut_short():
+    dump = "Sep 3\n------\nUBER ONE 250 TL\n\nSep 8\n------\nHavale 1,158.4 TL\n\nPortakal su 160 TL\n\nUBER 174 TL\n\nLunch 370 TL\n\nA101 722 TL"
+    good, problems, suspicious = audit(parsed(result(52, [tx("UBER ONE", 250)])), expected={52}, texts={52: dump})
+    assert good and problems == [] and "only 1 transaction(s)" in suspicious[52]
+    complete = result(52, [tx(f"item {i}", 100) for i in range(6)])
+    assert audit(parsed(complete), {52}, {52: dump})[2] == {}
+    recap = result(4, skip_reason="spending recap")
+    assert audit(parsed(recap), {4}, {4: "we spent 10,871 in 36 days, 120 per day"})[2] == {}  # a reason given: not suspicious
 
 
 class FakeClient:
@@ -111,8 +121,21 @@ def test_extract_retries_once_without_thinking_and_reports_the_rest(settings):
     out = extract(client, settings, load_prompt(settings), messages, ["Other"])
     assert [r.message_id for r in out.results] == [51, 50]  # the retry's answers first, then the surviving good one
     assert out.unanswered == [52] and out.calls == 2 and out.input_tokens == 200
-    assert client.requests[0].get("thinking") is None and client.requests[1]["thinking"] == {"type": "disabled"}
+    assert client.requests[0]["output_config"] == {"effort": "high"} and client.requests[1]["output_config"] == {"effort": "low"}
+    assert "thinking" not in client.requests[1]
     assert any("malformed date" in p for p in out.problems)
+
+
+def test_extract_retries_a_truncated_answer_and_keeps_the_flag_if_it_stays_short(settings):
+    dump = "Sep 3\n------\nUBER ONE 250 TL\n\nSep 8\n------\nHavale 1,158.4 TL\n\nPortakal su 160 TL\n\nUBER 174 TL\n\nLunch 370 TL\n\nA101 722 TL"
+    messages = [InboxMessage(2, 52, "Alex", at(2026, 9, 16, 17), None, dump, "pending")]
+    complete = [result(52, [tx(f"item {i}", 100) for i in range(6)])]
+    client = FakeClient([[result(52, [tx("UBER ONE", 250)])], complete])
+    out = extract(client, settings, load_prompt(settings), messages, ["Other"])
+    assert out.calls == 2 and len(out.results[0].transactions) == 6 and out.suspicious == {}
+    client = FakeClient([[result(52, [tx("UBER ONE", 250)])], [result(52, [tx("UBER ONE", 250)])]])
+    out = extract(client, settings, load_prompt(settings), messages, ["Other"])
+    assert out.calls == 2 and 52 in out.suspicious
 
 
 from types import SimpleNamespace  # noqa: E402  (used by FakeClient)

@@ -2,8 +2,9 @@
 
 The deterministic parts (dates, row placement, formatting) live in `sync.py` and `sheets.py`.
 Every answer is audited: a result for an unknown message, an unreadable description, a malformed date,
-or a missing message means the answer is incomplete or damaged, and the batch is asked again once
-without extended thinking. Messages that still have no usable result are reported, never invented.
+a missing message, or far fewer items than the text visibly contains means the answer is incomplete or
+damaged, and the batch is asked again once at low effort (long reasoning at high effort is where damaged
+answers were traced to). Messages that still look incomplete are flagged, never trusted blindly.
 """
 
 from __future__ import annotations
@@ -28,7 +29,9 @@ MAX_MESSAGES_PER_CALL = 150
 MAX_OUTPUT_TOKENS = 16000
 DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 A_LETTER = re.compile(r"[^\W\d_]")  # any letter in any script
+AMOUNT_LIKE = re.compile(r"(?<![\w.,])\d[\d.,]*\d(?![\w.,])|(?<![\w.,])\d{2,}(?![\w.,])")  # numbers with 2+ digits, incl. 1,158.4
 MAX_PLAUSIBLE_AMOUNT = 1e12
+RETRY_EFFORT = "low"  # complete, coherent answers in every reproduction of the 19 Sep 2026 failure
 
 # Currencies the spreadsheet accepts in the currency column. TOMAN is Iranian toman, kept as the household writes it.
 Currency = Literal["TRY", "TOMAN", "EUR", "USD", "GBP"]
@@ -46,13 +49,13 @@ DEFAULT_CATEGORIES: tuple[str, ...] = (
 CATEGORY_HINTS: dict[str, str] = {
     # the eight defaults
     "groceries": "supermarkets, markets, bakeries, water and other food for home (A101, Migros, Şok, BİM)",
-    "eating out": "restaurants, cafes, coffee, bars, takeaway, food delivery",
-    "transport": "taxi, Uber, Istanbulkart and public transport, fuel, parking",
+    "eating out": "restaurants, cafes, coffee, bars, takeaway, a food order (the food itself; a separate delivery fee is Transport)",
+    "transport": "moving people or things: taxi, Uber, bus, metro, Istanbulkart, fuel, parking, tolls, courier, shipping and delivery fees (Lieferung, kargo)",
     "housing & utilities": "rent, electricity, water, gas, internet, phone bills, home supplies, furniture, repairs",
     "health & personal care": "pharmacy, doctor, dentist, hospital, tests, health insurance, barber, hairdresser, cosmetics, hygiene, gym",
     "shopping": "clothes, shoes, electronics, gifts, malls and general retail not covered elsewhere",
     "leisure & travel": "entertainment, cinema, concerts, subscriptions, hobbies, hotels, flights, tours, trips",
-    "other": "fees, bank and government charges, documents, services, anything that fits nowhere else",
+    "other": "money transfers to people (havale, Überweisung), bank and government charges, documents, services, anything that fits nowhere else",
     # finer names some sheets use
     "health": "pharmacy, doctor, dentist, hospital, tests, health insurance",
     "personal care": "barber, hairdresser, cosmetics and hygiene products, spa, gym",
@@ -64,7 +67,7 @@ CATEGORY_HINTS: dict[str, str] = {
     "gifts": "presents, flowers, donations",
     "health/medical": "pharmacy, doctor, dentist, hospital, health insurance",
     "home": "rent, furniture, home supplies, repairs, cleaning",
-    "transportation": "taxi, Uber, Istanbulkart and public transport, fuel, parking",
+    "transportation": "moving people or things: taxi, Uber, public transport, fuel, parking, courier, shipping and delivery fees",
     "personal": "barber, cosmetics and hygiene, clothes, hobbies, subscriptions",
     "pets": "pet food, vet, pet supplies",
     "utilities": "electricity, water, gas, internet, phone bills",
@@ -116,6 +119,7 @@ class Extraction:
     calls: int = 0
     unanswered: list[int] = field(default_factory=list)  # message ids with no usable result even after the retry
     problems: list[str] = field(default_factory=list)  # what was wrong with the answers that were rejected
+    suspicious: dict[int, str] = field(default_factory=dict)  # message id → why its (retried) answer still looks incomplete
 
     def cost_usd(self, settings: Settings) -> float:
         return (
@@ -178,14 +182,19 @@ def build_batch(messages: Sequence[InboxMessage]) -> str:
     return "\n\n".join(blocks)
 
 
-def audit(results: Sequence[MessageResult], expected: set[int]) -> tuple[list[MessageResult], list[str]]:
-    """Keep the results that make sense; say what was wrong with the others.
+def audit(
+    results: Sequence[MessageResult], expected: set[int], texts: dict[int, str] | None = None
+) -> tuple[list[MessageResult], list[str], dict[int, str]]:
+    """Keep the results that make sense; say what was wrong with the others; flag answers that look cut short.
 
     A damaged answer (seen in production: descriptions like "026 kU", a date of ",", a merged_into pointing
-    at a message that does not exist) must never reach the sheet.
+    at a message that does not exist) must never reach the sheet. A truncated one (one transaction returned for
+    a message that visibly lists thirteen amounts) is kept but reported as suspicious, so the caller can retry
+    and, if it stays that way, refuse to act on it destructively.
     """
     good: list[MessageResult] = []
     problems: list[str] = []
+    suspicious: dict[int, str] = {}
     seen: set[int] = set()
     for result in results:
         why = _problem_with(result, expected, seen)
@@ -194,7 +203,20 @@ def audit(results: Sequence[MessageResult], expected: set[int]) -> tuple[list[Me
             continue
         seen.add(result.message_id)
         good.append(result)
-    return good, problems
+        short = looks_truncated(result, (texts or {}).get(result.message_id, ""))
+        if short:
+            suspicious[result.message_id] = short
+    return good, problems, suspicious
+
+
+def looks_truncated(result: MessageResult, text: str) -> str | None:
+    """A message that lists many amounts but came back with far fewer transactions, and no reason why."""
+    if result.skip_reason or result.merged_into is not None:
+        return None
+    amounts = len(AMOUNT_LIKE.findall(text))
+    if amounts >= 3 and len(result.transactions) * 2 < amounts:
+        return f"only {len(result.transactions)} transaction(s) for a text that lists about {amounts} amounts"
+    return None
 
 
 def _problem_with(result: MessageResult, expected: set[int], seen: set[int]) -> str | None:
@@ -228,19 +250,23 @@ def extract(
     for start in range(0, len(messages), MAX_MESSAGES_PER_CALL):
         chunk = messages[start : start + MAX_MESSAGES_PER_CALL]
         expected = {m.message_id for m in chunk}
-        good, problems = audit(_ask(client, settings, system_prompt, chunk, schema, out, retry=False), expected)
+        texts = {m.message_id: m.text for m in chunk}
+        good, problems, suspicious = audit(_ask(client, settings, system_prompt, chunk, schema, out, retry=False), expected, texts)
         missing = expected - {r.message_id for r in good}
-        if problems or missing:
-            log.warning("Claude's answer was incomplete or damaged (%d problem(s), %d message(s) unanswered); "
-                        "asking once more without extended thinking", len(problems), len(missing))
+        if problems or missing or suspicious:
+            log.warning("Claude's answer was incomplete or damaged (%d problem(s), %d unanswered, %d cut short); "
+                        "asking once more at effort %s", len(problems), len(missing), len(suspicious), RETRY_EFFORT)
             out.problems.extend(problems)
-            retried, problems = audit(_ask(client, settings, system_prompt, chunk, schema, out, retry=True), expected)
+            out.problems.extend(f"message {mid}: {why}" for mid, why in suspicious.items())
+            retried, problems, still = audit(_ask(client, settings, system_prompt, chunk, schema, out, retry=True), expected, texts)
             out.problems.extend(problems)
             answered = {r.message_id for r in retried}
             good = retried + [r for r in good if r.message_id not in answered]  # the retry wins where it answered
             missing = expected - {r.message_id for r in good}
+            suspicious = {mid: why for mid, why in still.items()} | {mid: why for mid, why in suspicious.items() if mid not in answered}
         out.results.extend(good)
         out.unanswered.extend(sorted(missing))
+        out.suspicious.update(suspicious)
     return out
 
 
@@ -254,7 +280,7 @@ def _ask(
     *,
     retry: bool,
 ) -> list[MessageResult]:
-    """One API call. The retry runs without extended thinking, which is where damaged answers were traced to."""
+    """One API call. The retry runs at low effort: every reproduction of the damaged-answer failure was clean there."""
     request: dict = dict(
         model=settings.anthropic_model,
         max_tokens=MAX_OUTPUT_TOKENS,
@@ -262,11 +288,7 @@ def _ask(
         messages=[{"role": "user", "content": build_batch(chunk)}],
         output_format=schema,
     )
-    if retry:
-        request["thinking"] = {"type": "disabled"}
-        request["output_config"] = {"effort": "high" if settings.anthropic_effort in ("xhigh", "max") else settings.anthropic_effort}
-    else:
-        request["output_config"] = {"effort": settings.anthropic_effort}
+    request["output_config"] = {"effort": RETRY_EFFORT if retry else settings.anthropic_effort}
     response = client.messages.parse(**request)
     out.calls += 1
     out.input_tokens += response.usage.input_tokens
