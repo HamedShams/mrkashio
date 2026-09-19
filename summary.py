@@ -4,8 +4,9 @@ Everything on it is a spreadsheet formula, so it updates by itself: spend and sh
 the categorised rows; rows without a category, typically older hand-entered ones, are shown as one line for
 information), spend per month, totals per currency, the ten largest expenses, plus a pie chart and a column chart. The category list
 at the top of the tab is also what the category dropdown on the transactions tab offers, so adding a
-category is one cell. Totals count rows in the base currency (cell B3, editable); other currencies are
-listed separately rather than summed together.
+category is one cell. Every figure and chart counts rows in the base currency chosen in the dropdown in
+B3, so switching that cell switches the whole report; other currencies are listed separately, never
+converted or summed together.
 """
 
 from __future__ import annotations
@@ -55,7 +56,7 @@ def build_summary(store: SheetStore, settings: Settings, rewrite: bool = False) 
     return (f"Built the {title!r} tab over {settings.sheet_tab!r}: spend and share by category ({len(categories)} categories), "
             f"by month, by currency, the {TOP_COUNT} largest expenses, and two charts. The category dropdown on "
             f"{settings.sheet_tab!r} now lists the categories in {title!r}!A{FIRST_CATEGORY_ROW}:A{CATEGORY_TOTAL_ROW - 1}; "
-            f"edit that column to change categories. Base currency for the totals: cell B3.")
+            f"edit that column to change categories. The dropdown in B3 picks the base currency of the whole report.")
 
 
 def _tab(name: str) -> str:
@@ -70,7 +71,8 @@ def _write_cells(sheet, settings: Settings, categories: list[str]) -> None:
     rows: dict[str, list[list[object]]] = {}
 
     rows["A1"] = [["Kashio · Summary"], ["Source tab", settings.sheet_tab], ["Base currency", settings.default_currency],
-                  ["Totals count rows in the base currency; other currencies are listed separately."]]
+                  ["Pick the base currency in B3: every total, share, month, top expense and chart follows it. "
+                   "Other currencies are listed separately, never converted."]]
     rows["A5"] = [["By category"], ["Category", "Total", "Share", "Transactions"]]
     cat_rows = []
     for offset in range(CATEGORY_SLOTS):
@@ -182,6 +184,10 @@ def _apply_layout(store: SheetStore, sheet, settings: Settings) -> None:
                          "horizontalAlignment": "CENTER"}, "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)"),
         {"updateBorders": {"range": rng(3, 3, 1, 2), "top": {"style": "SOLID", "color": ACCENT}, "bottom": {"style": "SOLID", "color": ACCENT},
                            "left": {"style": "SOLID", "color": ACCENT}, "right": {"style": "SOLID", "color": ACCENT}}},
+        # B3 is a dropdown of the supported currencies: choosing one switches every figure and chart on the tab
+        {"setDataValidation": {"range": rng(3, 3, 1, 2),
+                               "rule": {"condition": {"type": "ONE_OF_LIST", "values": [{"userEnteredValue": code} for code in CURRENCIES]},
+                                        "showCustomUi": True, "strict": True}}},
         {"mergeCells": {"range": rng(4, 4, 0, 4), "mergeType": "MERGE_ALL"}},
         fmt(4, 4, 0, 4, {"textFormat": {"italic": True, "foregroundColor": GREY, "fontSize": 9}}, "userEnteredFormat.textFormat"),
         # by category

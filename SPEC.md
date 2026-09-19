@@ -124,7 +124,7 @@ Chunks of at most 150 messages per call. Token usage from `response.usage` goes 
 - Accept messages only from the paired group. Everything else is ignored.
 - Until paired, the bot logs group messages with a hint to run `/setup` and records nothing. `/start` explains the state in any chat.
 - New message (text or photo caption): append a row to `Bot_Inbox` with `message_id, sender, sent_at, edited_at, text, status=pending`.
-- Edited message: still pending, the text is replaced. Skipped or flagged without rows: reopened as `pending`. Already turned into rows: `pending_revision`; at the next sync Claude re-extracts the new text and `replace_transactions` updates the message's rows in place, removes extra ones (bottom-up, each re-checked for its provenance note right before deletion) and appends missing ones. Edited into a note or emptied: a retraction, its rows are removed without asking Claude. Rows are found through the note `kashio:<message id>` on each date cell, so only rows the bot wrote are ever touched. Telegram does not report deletions; the README tells users to edit instead.
+- Edited message: a new inbox row with the edited text (the earlier rows stay). Still pending: `pending` again. Skipped, flagged or closed without rows: reopened as `pending`. Already turned into rows: `pending_revision`; at the next sync Claude re-extracts the new text and `replace_transactions` updates the message's rows in place, removes extra ones (bottom-up, each re-checked for its provenance note right before deletion) and appends missing ones. Edited into a note or emptied: a retraction, its rows are removed without asking Claude. Rows are found through the note `kashio:<message id>` on each date cell, so only rows the bot wrote are ever touched. Telegram does not report deletions; the README tells users to edit instead.
 - Sheets write fails: retry 3 times with backoff, then reply "couldn't save this message; edit it to retry".
 
 ### Sync (on `SYNC_CRON` or `/sync`)
@@ -135,7 +135,7 @@ Chunks of at most 150 messages per call. Token usage from `response.usage` goes 
 4. For every returned transaction: `date = transaction.date or rollover(message.sent_at)`; `rollover` moves anything before `DAY_ROLLOVER_HOUR` (04:00) to the previous day. Descriptions that start with `=`, `+`, `-` or `@` get a leading apostrophe so the spreadsheet never reads them as formulas.
 5. Find the last used row of the target tab: the highest row with any value in B, C or E (pre-filled "TRY" cells in D do not count).
 6. **Guardrail:** re-read the destination rows and refuse to write if any of B, C, E, F or G already holds data (only the pre-filled default currency in D is tolerated). Then copy the formatting of the last row onto the new rows (borders, ₺ and date formats, the column-F dropdown) and write B:E and G in one batch with `USER_ENTERED`; dates are written as ISO strings, which every sheet locale parses as a date. Column F is never written.
-7. Mark inbox rows `processed`, `merged`, `skipped` or `needs_review` with a timestamp and rows added.
+7. Append one inbox row per message with its new status (`processed`, `merged`, `skipped` or `needs_review`), the time, the rows added and a note; the inbox is never updated in place.
 8. Append one row to `Bot_Runs`: time, trigger, requested by, status, pending, processed, rows added, sheet range, skipped, needs review, input tokens, output tokens, cost, model, effort, error.
 9. Send the full report to `TELEGRAM_ADMIN_CHAT_ID` (or the group if unset). If `POST_SUMMARY=true`, post a one-line summary in the group.
 10. Any failure: status `failed`, rows stay `pending`, the report still goes out with the error, and if even the run log could not be written the report says so.
@@ -156,7 +156,8 @@ python bot.py                 run the bot (what Railway runs)
 |---|---|---|---|
 | `/setup` | group | group admin | pair the bot with the group and the admin |
 | `/sync` (also `@botname /sync`) | group or private | group members | process everything pending; summary in the group, full report in private |
-| `/backfill` … (`/done` / `/cancel`) | private | group members | paste older messages; Telegram splits long pastes into several messages, so the import starts 20 s after the last part or at once on `/done`; the reply lists every dismissed message; then a sync runs |
+| `/backfill` … (`/done` / `/cancel`) | private | group members | paste older messages; Telegram splits long pastes into several messages, so the import starts 20 s after the last part or at once on `/done`; the reply lists what was held as a possible duplicate; then a sync runs |
+| `/review` (`keep <n>`, `done <n>` or `done all`) | group or private | group members | list what waits for a person (imports held as duplicates, Claude's doubts), queue an item anyway, or close it |
 | `/status`, `/start`, `/help` | anywhere | anyone | integration checklist with fixes, and the command list |
 
 ### Messy input the prompt handles
@@ -167,7 +168,7 @@ python bot.py                 run the bot (what Railway runs)
 
 ### Cold start and history
 
-Telegram bots never receive messages sent before they joined. History comes in through `/backfill` (paste) or `backfill FILE`, which skip everything dated on or before the sheet's last recorded day and anything already stored, and queue the rest as pending. The earlier *live* cutoff rule, which refused any row dated before the sheet's last entry at every sync, was removed on 19 Sep 2026: it rejected a legitimate multi-day dump posted late (message 52, "Sep 3 … Sep 15"), because the sheet's last date came from the bot's own previous run, not from complete hand entry.
+Telegram bots never receive messages sent before they joined. History comes in through `/backfill` (paste) or `backfill FILE`. An import queues nothing that is already there: a message the inbox has (same id, or the same send time and text as a live message) is skipped; a message whose day and wording match a row on the transactions tab (`SheetStore.transaction_index`, compared by `backfill.same_wording`: amounts, currency words, digits, symbols and case ignored, the prompt's "Groceries - " prefix stripped, a multi-item message matching any one of its items; the day after midnight is checked against both calendar days) is stored as `duplicate` and never queued, whatever its amount, until a person decides in `/review`. Nothing is dismissed by date unless `--from` is given. The earlier *live* cutoff rule, which refused any row dated before the sheet's last entry at every sync, was removed on 19 Sep 2026: it rejected a legitimate multi-day dump posted late (message 52, "Sep 3 … Sep 15"), because the sheet's last date came from the bot's own previous run, not from complete hand entry.
 
 ### Categories across languages (19 Sep 2026)
 
@@ -175,11 +176,11 @@ Telegram bots never receive messages sent before they joined. History comes in t
 
 ### The inbox as an audit trail
 
-An edit never overwrites an inbox row: the previous row is marked `superseded` (its text, status and rows kept) and a new row is appended with the edited text and the status the next sync should act on (`pending`, `pending_revision`, or `skipped` for a note). A deletion marks the latest row `pending_deletion`, then `deleted`, text kept. So the chain of edits and deletions of any message can be read from the tab. Status changes made by a sync (`processed`, `merged`, `skipped`, `needs_review`) are written in place on the row they concern.
+`Bot_Inbox` is append-only: `SheetStore` has no code path that updates or deletes a row there (the header row is completed once if a hand-made tab lacks it). Storing a message, an edit (new text), a sync mark (`processed`, `merged`, `skipped`, `needs_review`), a noticed deletion (`pending_deletion`, then `deleted`), a held import (`duplicate`) and a `/review` decision (`pending`, `pending_revision` or `resolved`) each append one row for the message id, with `logged_at`, the text and times carried over. `SheetStore.latest_rows` reads the tab once and keeps the newest row per message id; `pending_messages`, `review_items` and `messages_with_rows` are filters over it. So the whole chain of what happened to a message can be read top to bottom, and a row's original values are never lost.
 
 ### The Summary report tab (`init-sheet`)
 
-`python bot.py init-sheet` builds a report tab (`SUMMARY_TAB`, default `Summary`) over the transactions tab, all formulas, styled with green header bands, tinted column headers, alternating row shading, a donut chart and a column chart: spend, share and count per category, spend per month (months found with `SORT(UNIQUE(EOMONTH(…)))`), totals per currency, the ten largest expenses, a pie chart by category and a column chart by month. Totals count rows in a base currency (cell B3, prefilled from `DEFAULT_CURRENCY`); other currencies are listed separately, never summed together. The category names in `A7:A25` of that tab are what the category dropdown on the transactions tab offers, because `init-sheet` points the dropdown's data validation there, so a category is added by typing it in the next free cell. An existing tab of that name is kept unless `--rewrite` is given, in which case it is deleted and rebuilt (the transactions tab is never touched).
+`python bot.py init-sheet` builds a report tab (`SUMMARY_TAB`, default `Summary`) over the transactions tab, all formulas, styled with green header bands, tinted column headers, alternating row shading, a donut chart and a column chart: spend, share and count per category, spend per month (months found with `SORT(UNIQUE(EOMONTH(…)))`), totals per currency, the ten largest expenses, a pie chart by category and a column chart by month. Cell B3 is a dropdown (`ONE_OF_LIST` over the supported currencies, prefilled from `DEFAULT_CURRENCY`); every formula and both charts filter on `$B$3`, so choosing another entry switches the whole report, while other currencies are listed separately, never summed together. The category names in `A7:A25` of that tab are what the category dropdown on the transactions tab offers, because `init-sheet` points the dropdown's data validation there, so a category is added by typing it in the next free cell. An existing tab of that name is kept unless `--rewrite` is given, in which case it is deleted and rebuilt (the transactions tab is never touched).
 
 ### Who can talk to the bot
 
@@ -199,9 +200,10 @@ Anthropic calls: the SDK retries 408/409/429/5xx and connection errors up to 3 t
 
 ### Guarantees and limits
 
-- A message is inserted at most once (status column plus de-duplication by message id).
+- A message is inserted at most once (status column plus de-duplication by message id; imports also match against the sheet's own rows).
+- The inbox tab is only ever appended to; nothing there is updated or deleted.
 - Messages sent before the bot joined the group are invisible to it.
-- Deleted messages: Telegram sends no event, so before each sync `Kashio.detect_deletions` calls `setMessageReaction(reaction=[])` on every live message that has rows in the sheet (`SheetStore.messages_with_rows`); an existing message answers `Reaction_empty`, a deleted one `Message to react not found` (verified live on 19 Sep 2026 with messages 73 and 78). Deleted ones are queued as `pending_deletion`; the sync removes their rows through the provenance note and marks them `deleted`, keeping text and history in the inbox. Safety: a "chat not found" aborts the check, unexpected answers are ignored, and if every probed message looks deleted the check is discarded. Deletions and note-only edits are applied even below the scheduled threshold; only Claude is gated by it.
+- Deleted messages: Telegram sends no event, so before each sync `Kashio.detect_deletions` calls `setMessageReaction(reaction=[])` on every live message that has rows in the sheet (`SheetStore.messages_with_rows`); an existing message answers `Reaction_empty` (or plainly succeeds), a deleted one `Message to react not found` (verified live on 19 Sep 2026 with messages 73 and 78). The call touches only the bot's own reaction, so reactions people put on messages are neither read nor changed, and a reacted-to message is detected like any other. Deleted ones are queued as `pending_deletion`; the sync removes their rows through the provenance note and marks them `deleted`, keeping text and history in the inbox. Safety: a "chat not found" aborts the check, unexpected answers are ignored, and if every probed message looks deleted the check is discarded. Deletions and note-only edits are applied even below the scheduled threshold; only Claude is gated by it.
 - If Telegram upgrades your group to a supergroup, the chat id changes. Update the env var.
 
 ---
@@ -299,7 +301,7 @@ If you want those extra details in the sheet, write them in the Telegram message
 - Thinking effort `high`.
 - Messages stored in `Bot_Inbox`; runs in `Bot_Runs`; every run report also sent to your private chat with the bot. No database, no file.
 - Column F (the "By" dropdown: member names) left empty as asked; column G gets a category read from the sheet's own dropdown, now the eight names above; column D one of TRY, TOMAN, EUR, USD, GBP.
-- History: older messages come in through `/backfill` (paste) or `backfill FILE`, strictly after the last recorded day by default; live messages are written whatever their date.
+- History: older messages come in through `/backfill` (paste) or `backfill FILE`; anything the inbox or the sheet already has is skipped or held for `/review`; live messages are written whatever their date.
 - Guardrail: new rows only ever go below the last used row, after the destination cells are verified empty; rows the bot wrote are updated or removed only through their provenance note when their message is edited or deleted, each re-checked before deletion; other rows and columns are never touched.
 - Pairing via `/setup`, stored in the sheet; env vars are optional overrides.
 - Day rollover at 04:00. Grocery prefix list and name-dropping rule in `prompt.md`. Formatting copied from the previous row.
@@ -355,7 +357,7 @@ Dependencies: `python-telegram-bot[job-queue]` (Telegram + scheduler), `gspread`
 - One sync (the only paid call): 3 pending → 1 row at `Transactions_Trip#2!B153:G153` as a real date 07/09/2026 (02:30 rolled back a day), numeric ₺10.0, TRY, "UBER", F empty, G "Transport"; "10 TL" folded into that row; the greeting skipped; inbox statuses and run log correct; report delivered. 4,600 input / 234 output tokens, $0.0115.
 - Sheet discovery without `GOOGLE_SHEET_ID`: exercised; see the README for the Drive API requirement.
 
-**Unit tests (`pytest`, offline, run in CI):** configuration defaults and every validation message, prompt rendering and the exact output schema (dynamic category enum, `merged_into`), date rollover, the cutoff rule, message pairing and inbox statuses, all report texts, the paste parser on the real samples and its tolerant variants, the JSON export parser, import filters with their explanations, `_as_date`, `last_used_row`, and the append-only guardrail.
+**Unit tests (`pytest`, 90, offline, run in CI):** configuration defaults and every validation message, prompt rendering and the exact output schema (dynamic category enum, `merged_into`), date rollover, message pairing and inbox statuses, the append-only inbox log (a stub that fails on any call but append), all report texts, the paste parser on the real samples and its tolerant variants, the JSON export parser, the import's inbox and sheet duplicate checks with their explanations, `/review`, the B3 dropdown, `_as_date`, `last_used_row`, and the append-only guardrail.
 
 **Live on Railway, 8 Sep 2026 15:50, first deploy:** the deployed bot consumed the nine updates queued at Telegram; three earlier `/sync` commands with nothing pending were answered "Nothing new to process" and logged as `skipped_threshold`; a fourth `/sync` processed "UBER 2 / 1,000.5 یورو" into row 154 (08/09/2026, 1000.5, EUR, Transport), so Persian currency words and comma-formatted amounts work end to end on the deployed code; a message edited after its sync was marked `edited_after_sync` with a warning, and the sheet left untouched. CI (GitHub Actions) green on the pushed commit.
 

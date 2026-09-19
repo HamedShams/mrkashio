@@ -12,12 +12,18 @@ Telegram commands:
     /sync      process everything pending now (also accepted as "@botname /sync")
     /backfill  in a private chat with the bot: paste copied messages; the import starts by itself after a short
                pause, or immediately on /done (/cancel discards)
+    /review    what waits for a person: imports held as possible duplicates and Claude's doubts;
+               /review keep <n> queues an item for the next sync anyway, /review done <n> (or all) closes it
     /status    what is connected and what still needs setting up
     /start     who am I talking to, and the commands
 
 Deleted messages: Telegram sends bots no event for a deletion, so before each sync the bot asks Telegram to
 clear its (non-existent) reaction on every message that has rows in the sheet; a deleted message answers
-"not found" and its rows are removed at that sync. No visible side effect on existing messages.
+"not found" and its rows are removed at that sync. No visible side effect on existing messages, and the
+reactions people put on messages are never touched (a bot can only change its own).
+
+The inbox tab is a log: the bot appends a row for every change of a message's status and never updates
+or deletes a row there; the newest row of a message is its current state.
 
 The bot starts with nothing but a Telegram token. Anything else that is missing or broken (Google Sheets,
 the Anthropic key, the group pairing) is reported in plain words to whoever talks to it, with the fix.
@@ -51,7 +57,7 @@ from backfill import import_messages, parse
 from summary import build_summary
 from config import ConfigError, Settings
 from extractor import MAX_MESSAGES_PER_CALL, clean_categories, load_prompt
-from sheets import STATUS_PENDING_REVISION, STATUS_SKIPPED, SheetStore
+from sheets import STATUS_PENDING, STATUS_PENDING_REVISION, STATUS_RESOLVED, STATUS_SKIPPED, InboxMessage, SheetStore
 from sync import (
     STATUS_FAILED,
     STATUS_OK,
@@ -79,6 +85,8 @@ HELP = (
     "Commands:\n"
     "/sync — process everything pending now\n"
     "/backfill — paste older messages (private chat); import starts after a short pause or on /done\n"
+    "/review — what waits for a look: imports held as possible duplicates, Claude's doubts; "
+    "/review keep <n> queues one anyway, /review done <n> closes it\n"
     "/setup — in the group, once, to pair me with it\n"
     "/status — what is connected and what is still missing\n"
     "/start — this message"
@@ -251,32 +259,32 @@ class Kashio:
         if self.store is None or self.group_id is None:
             return []
         candidates = await asyncio.to_thread(self.store.messages_with_rows)
-        deleted: list[tuple[int, int]] = []
+        deleted: list[InboxMessage] = []
         unknown = 0
-        for inbox_row, message_id in candidates:
+        for message in candidates:
             try:
-                await bot.set_message_reaction(self.group_id, message_id, reaction=[])
+                await bot.set_message_reaction(self.group_id, message.message_id, reaction=[])  # only the bot's own reaction
             except BadRequest as exc:
                 text = str(exc).lower()
                 if "chat not found" in text:
                     log.warning("Deletion check aborted: Telegram cannot find the group (%s)", exc)
                     return []
                 if "message to react not found" in text or "message not found" in text:
-                    deleted.append((inbox_row, message_id))
+                    deleted.append(message)
                 elif "reaction_empty" not in text and "reaction is invalid" not in text:
                     unknown += 1
-                    log.warning("Deletion check: unexpected answer for message %s: %s", message_id, exc)
+                    log.warning("Deletion check: unexpected answer for message %s: %s", message.message_id, exc)
             except TelegramError as exc:
                 unknown += 1
-                log.warning("Deletion check: could not probe message %s: %s", message_id, exc)
+                log.warning("Deletion check: could not probe message %s: %s", message.message_id, exc)
             await asyncio.sleep(DELETION_PROBE_PAUSE)
         if deleted and len(deleted) == len(candidates) and len(candidates) >= 3:
             log.warning("Deletion check: every one of %d messages looks deleted; that cannot be right, ignoring", len(candidates))
             return []
         if deleted:
-            await asyncio.to_thread(self.store.mark_deleted, [row for row, _ in deleted])
-            log.info("Deleted in Telegram: message ids %s", [mid for _, mid in deleted])
-        return [mid for _, mid in deleted]
+            await asyncio.to_thread(self.store.mark_deleted, deleted)
+            log.info("Deleted in Telegram: message ids %s", [m.message_id for m in deleted])
+        return [m.message_id for m in deleted]
 
     async def is_household_member(self, bot: Bot, user: User | None) -> bool:
         """The admin, or anyone who is a member of the paired group."""
@@ -558,6 +566,66 @@ async def on_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await app.notify(context.bot, report, already_informed=frozenset({chat.id}))
 
 
+async def on_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List what waits for a person, or act on the last list: `/review`, `/review keep 2 3`, `/review done 1` or `done all`."""
+    app = kashio_of(context)
+    chat, message, user = update.effective_chat, update.effective_message, update.effective_user
+    if chat is None or message is None or not message.text:
+        return
+    app.connect()
+    if chat.type == Chat.PRIVATE:
+        if not await app.is_household_member(context.bot, user):
+            await message.reply_text("I only work for members of my paired group." if app.group_id else
+                                     "I'm not paired with a group yet: a group admin has to type /setup in the group first.")
+            return
+    elif chat.id != app.group_id:
+        return
+    if app.store is None:
+        await deliver(context.bot, chat.id, "I can't read the inbox right now.\n" + app.status_text(context.bot.username))
+        return
+    words = message.text.split()[1:]
+    action = words[0].lower() if words else ""
+    if action in ("keep", "done"):
+        listed = context.chat_data.get("review") or []
+        if not listed:
+            await message.reply_text("Send /review first, then refer to the numbers in that list.")
+            return
+        if len(words) > 1 and words[1].lower() == "all":
+            chosen = list(range(1, len(listed) + 1))
+        else:
+            chosen = [int(w) for w in words[1:] if w.isdigit() and 1 <= int(w) <= len(listed)]
+        if not chosen:
+            await message.reply_text(f"Say which ones: /review {action} 1 3, or /review {action} all.")
+            return
+        items = [listed[n - 1] for n in chosen]
+        marks = []
+        for item in items:
+            if action == "keep":
+                status = STATUS_PENDING_REVISION if item.rows_added > 0 else STATUS_PENDING
+                marks.append((item, status, item.rows_added if item.rows_added else "", f"queued again through /review by {_name(user)}"))
+            else:
+                marks.append((item, STATUS_RESOLVED, item.rows_added if item.rows_added else "", f"closed through /review by {_name(user)}"))
+        await asyncio.to_thread(app.store.mark_messages, marks)
+        context.chat_data["review"] = [item for item in listed if item not in items]
+        if action == "keep":
+            await message.reply_text(f"Queued {len(items)} message(s) for the next sync; /sync runs it now.")
+        else:
+            await message.reply_text(f"Closed {len(items)} item(s).")
+        return
+    items = await asyncio.to_thread(app.store.review_items)
+    context.chat_data["review"] = items
+    if not items:
+        await message.reply_text("Nothing waits for a look.")
+        return
+    lines = [f"<b>🔎 {len(items)} item(s) waiting for a look</b>"]
+    for number, item in enumerate(items, start=1):
+        excerpt = " | ".join(part.strip() for part in item.text.splitlines() if part.strip())[:60]
+        label = "possible duplicate" if item.status == "duplicate" else "needs review"
+        lines.append(html.escape(f"{number}. {item.sender} · {item.sent_at:%d %b %H:%M} · “{excerpt}” — {label}: {item.note}", quote=False))
+    lines += ["", "/review done <n> closes an item (or /review done all); /review keep <n> queues it for the next sync anyway."]
+    await deliver(context.bot, chat.id, "\n".join(lines), as_html=True)
+
+
 async def on_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     app = kashio_of(context)
     chat, message, user = update.effective_chat, update.effective_message, update.effective_user
@@ -723,6 +791,7 @@ def build_application(app: Kashio) -> Application:
     application.add_handler(CommandHandler("setup", on_setup))
     application.add_handler(CommandHandler("sync", on_sync, filters=filters.UpdateType.MESSAGE))
     application.add_handler(CommandHandler("backfill", on_backfill))
+    application.add_handler(CommandHandler("review", on_review))
     application.add_handler(CommandHandler("done", on_done))
     application.add_handler(CommandHandler("cancel", on_cancel))
     # "@botname /sync" is not a Telegram command (commands start with "/"), but people type it; treat it as /sync.
@@ -894,7 +963,7 @@ def main() -> None:
     backfill_parser = commands.add_parser("backfill", help="queue older messages from a pasted dump or a Telegram Desktop export; no Claude call")
     backfill_parser.add_argument("file", help="text file with copied messages, or result.json from Telegram Desktop")
     backfill_parser.add_argument("--from", dest="since", type=date.fromisoformat, metavar="YYYY-MM-DD",
-                                 help="import from this day on (default: the day after the sheet's last recorded date)")
+                                 help="dismiss everything dated before this day (default: import every day; duplicates are held)")
     init_parser = commands.add_parser("init-sheet", help="build the Summary report tab over the transactions tab")
     init_parser.add_argument("--rewrite", action="store_true", help="replace an existing Summary tab (its contents are lost)")
     args = parser.parse_args()

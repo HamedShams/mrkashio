@@ -32,20 +32,35 @@ class ProbeBot:
 
 class ProbeStore:
     def __init__(self, candidates):
-        self.candidates, self.marked = candidates, []
+        self.candidates = [InboxMessage(row, mid, "Alex", at(2026, 9, 19, 14), None, "x", "processed", rows_added=1) for row, mid in candidates]
+        self.marked = []
 
     def messages_with_rows(self):
         return list(self.candidates)
 
-    def mark_deleted(self, rows):
-        self.marked.extend(rows)
+    def mark_deleted(self, messages):
+        self.marked.extend(m.message_id for m in messages)
 
 
 def test_deleted_messages_are_found_and_queued(settings):
     app = stub_kashio(settings, store=ProbeStore([(10, 73), (11, 78), (12, 61)]), claude=object())
     probe = ProbeBot(existing={73, 61}, deleted={78})
     assert asyncio.run(app.detect_deletions(probe)) == [78]
-    assert probe.probed == [73, 78, 61] and app.store.marked == [11]
+    assert probe.probed == [73, 78, 61] and app.store.marked == [78]
+
+
+def test_a_reacted_to_message_still_counts_as_existing(settings):
+    """People's reactions never matter: the probe only clears the bot's own, and any answer but 'not found' means the message exists."""
+
+    class Reacted(ProbeBot):
+        async def set_message_reaction(self, chat_id, message_id, reaction=None):
+            self.probed.append(message_id)
+            if message_id == 61:
+                return True  # Telegram answered plainly, as it may for a message people reacted to
+            return await super().set_message_reaction(chat_id, message_id, reaction)
+
+    app = stub_kashio(settings, store=ProbeStore([(10, 73), (11, 78), (12, 61)]), claude=object())
+    assert asyncio.run(app.detect_deletions(Reacted(existing={73}, deleted={78}))) == [78]
 
 
 def test_unexpected_answers_are_not_deletions_and_a_total_wipe_is_refused(settings):
@@ -63,7 +78,7 @@ def test_deletion_removes_rows_even_below_the_scheduled_threshold(settings, monk
     report = sync.run_sync(settings, store, object(), "prompt", trigger=sync.TRIGGER_SCHEDULE, requested_by="schedule")
     assert report.status == sync.STATUS_OK and report.calls == 0
     assert store.replaced == [(78, [])] and report.rows_deleted == 1
-    assert store.marks == [(2, STATUS_DELETED, 0, "deleted in Telegram: 1 row(s) removed from the sheet")]
+    assert store.marks == [(pending[0], STATUS_DELETED, 0, "deleted in Telegram: 1 row(s) removed from the sheet")]
     summary = sync.format_summary(report)
     assert "made no Claude call" in summary and "Removed 1 row(s) (1 message(s) deleted in Telegram)" in summary
 
@@ -74,7 +89,7 @@ def test_text_messages_still_wait_for_the_threshold_while_deletions_go_through(s
     store = FakeStore(pending)
     monkeypatch.setattr(sync, "extract", lambda *a, **k: (_ for _ in ()).throw(AssertionError("below threshold: no call")))
     report = sync.run_sync(settings, store, object(), "prompt", trigger=sync.TRIGGER_SCHEDULE, requested_by="schedule")
-    assert report.status == sync.STATUS_OK and report.rows_deleted == 1 and [m[0] for m in store.marks] == [2]
+    assert report.status == sync.STATUS_OK and report.rows_deleted == 1 and [m[0].message_id for m in store.marks] == [78]
     assert "1 pending message(s), below the minimum of 5" in sync.format_summary(report)
 
 

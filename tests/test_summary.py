@@ -55,6 +55,17 @@ def test_dropdown_points_at_the_category_list(settings):
     assert rule["range"]["startColumnIndex"] == 6 and rule["rule"]["condition"]["values"][0]["userEnteredValue"] == "='Summary'!$A$7:$A$25"
 
 
+def test_base_currency_cell_is_a_dropdown_of_the_supported_currencies(settings):
+    requests = []
+    store = SimpleNamespace(spreadsheet=SimpleNamespace(batch_update=lambda body: requests.append(body)))
+    summary._apply_layout(store, StubSheet(), settings)
+    validations = [r["setDataValidation"] for r in requests[0]["requests"] if "setDataValidation" in r]
+    assert len(validations) == 1
+    rule, cell = validations[0]["rule"], validations[0]["range"]
+    assert (cell["startRowIndex"], cell["endRowIndex"], cell["startColumnIndex"], cell["endColumnIndex"]) == (2, 3, 1, 2)  # B3
+    assert [v["userEnteredValue"] for v in rule["condition"]["values"]] == ["TRY", "TOMAN", "EUR", "USD", "GBP"] and rule["strict"] is True
+
+
 def test_existing_tab_is_kept_unless_rewrite(settings, monkeypatch):
     store = SimpleNamespace(category_options=lambda: ["Groceries"], spreadsheet=SimpleNamespace(worksheet=lambda title: object()))
     with pytest.raises(FileExistsError):

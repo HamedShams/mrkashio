@@ -1,7 +1,8 @@
 import json
 from datetime import date
 
-from backfill import import_messages, parse, parse_dump
+from backfill import import_messages, parse, parse_dump, same_wording
+from sheets import STATUS_DUPLICATE, SheetEntry
 from tests.conftest import at
 
 SAMPLE = """Sam ❤️, [1 Sep 2026 at 21:14:10]:
@@ -23,17 +24,21 @@ Istanbul card
 
 
 class StubStore:
-    def __init__(self, last=date(2026, 9, 2), known=()):
-        self.last, self.known, self.rows = last, set(known), []
-
-    def last_recorded_date(self):
-        return self.last
+    def __init__(self, known=(), keys=(), on_sheet=()):
+        self.known, self.keys, self.on_sheet = set(known), set(keys), list(on_sheet)
+        self.rows, self.held = [], []
 
     def stored_message_ids(self):
         return set(self.known)
 
-    def add_messages(self, rows):
-        self.rows.extend(rows)
+    def stored_message_keys(self):
+        return set(self.keys)
+
+    def transaction_index(self):
+        return list(self.on_sheet)
+
+    def add_messages(self, rows, status="pending"):
+        (self.held if status == STATUS_DUPLICATE else self.rows).extend(rows)
 
 
 def test_macos_copy_format_is_parsed(settings):
@@ -73,19 +78,50 @@ def test_telegram_desktop_json_export_is_parsed(settings):
     assert [(m.message_id, m.sender, m.text) for m in parsed.messages] == [(-5, "Sam", "Migros 1.250")]
 
 
-def test_import_skips_covered_days_and_duplicates_and_explains(settings):
+def test_import_skips_what_the_inbox_has_by_id_or_by_time_and_text(settings):
     messages = parse(SAMPLE, settings).messages
-    store = StubStore(known=[messages[1].message_id])
+    store = StubStore(known=[messages[1].message_id], keys=[("2026-09-03 15:36", "istanbul card 400")])
     result = import_messages(store, settings, messages)
-    assert (result.found, result.imported, result.before_start, result.duplicates) == (4, 2, 1, 1)
-    assert result.start == date(2026, 9, 3)
+    assert (result.found, result.imported, result.before_start, result.duplicates, result.held) == (4, 2, 0, 2, [])
+    assert [r[4] for r in store.rows] == ["A101\n2045", "295 TL"] and result.start is None
+    assert "Skipped 2 already in the inbox" in result.describe() and "Dismissed" not in result.describe()
+
+
+def test_a_message_matching_a_sheet_row_of_the_same_day_is_held_not_queued(settings):
+    messages = parse(SAMPLE, settings).messages
+    on_sheet = [SheetEntry(161, date(2026, 9, 3), "UBER to Metro Station", 84, "TRY"),
+                SheetEntry(140, date(2026, 9, 1), "Groceries - A101", 1999, "TRY")]  # different amount: still a duplicate
+    store = StubStore(on_sheet=on_sheet)
+    result = import_messages(store, settings, messages)
+    assert result.imported == 2 and len(result.held) == 2 and len(store.held) == 2
+    assert [r[4] for r in store.rows] == ["295 TL", "Istanbul card \n400"]
+    held = {r[4]: r[5] for r in store.held}
+    assert "row 161: 03/09/2026 · UBER to Metro Station · ₺84" in held["UBER to Metro Station\n84 TL"]
+    assert "row 140" in held["A101\n2045"] and "the amount was not compared" in held["A101\n2045"]
+    text = result.describe()
+    assert "Held back 2 that look already in the sheet" in text and "/review keep" in text and "≈ row 161" in text
+
+
+def test_the_day_after_midnight_is_checked_against_both_calendar_days(settings):
+    late = parse_dump("Alex, [4 Sep 2026 at 01:30:00]:\nkebab 300", settings).messages
+    store = StubStore(on_sheet=[SheetEntry(170, date(2026, 9, 4), "kebab", 300, "TRY")])  # entered by hand under the 4th
+    assert import_messages(store, settings, late).held and store.rows == []
+
+
+def test_same_wording_ignores_amounts_symbols_digits_and_the_groceries_prefix():
+    assert same_wording("Migros 450 tl", "Groceries - Migros")
+    assert same_wording("Barbershop 💈 (arash)\n604 TL", "Barbershop")
+    assert same_wording("Gratis\n266 TL\n\nCafe\n385 TL", "Cafe")  # one item of a multi-item message
+    assert same_wording("نان ۴۵ لیر", "نان")
+    assert same_wording("2€ lieferung", "lieferung")
+    assert not same_wording("Migros 450", "Cafe")
+    assert not same_wording("450 TL", "Cafe")  # nothing describing on one side: never a match
+    assert not same_wording("UBER to Metro Station 84", "Istanbul card")
+
+
+def test_import_can_dismiss_everything_before_a_day_on_request(settings):
+    messages = parse(SAMPLE, settings).messages
+    result = import_messages(StubStore(), settings, messages, since=date(2026, 9, 3))
+    assert result.imported == 3 and result.before_start == 1 and result.start == date(2026, 9, 3)
     text = result.describe()
     assert "Dismissed 1 dated before 03/09/2026" in text and "01/09/2026 21:14 Sam: A101 | 2045" in text
-    assert "Skipped 1 already queued" in text
-    assert len(store.rows) == 2
-
-
-def test_import_can_start_earlier_on_request(settings):
-    messages = parse(SAMPLE, settings).messages
-    result = import_messages(StubStore(), settings, messages, since=date(2026, 9, 1))
-    assert result.imported == 4 and result.before_start == 0

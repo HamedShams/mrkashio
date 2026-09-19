@@ -1,7 +1,6 @@
 """The private-note keyword: what is kept, what is dropped, and how imports treat it."""
 
 from dataclasses import replace
-from datetime import date
 
 from backfill import import_messages, parse
 from sync import split_note
@@ -27,7 +26,7 @@ def test_imports_skip_note_only_messages_and_trim_mixed_ones(settings):
     dump = ("Sam, [3 Sep 2026 at 09:00:00]:\n#note we should check the budget\n\n"
             "Sam, [3 Sep 2026 at 10:00:00]:\nA101 300 #note oil for the week\n")
     messages = parse(dump, settings).messages
-    store = StubStore(last=date(2026, 9, 1))
+    store = StubStore()
     result = import_messages(store, settings, messages)
     assert result.notes == 1 and result.imported == 1
     assert store.rows[0][4] == "A101 300"  # the note part never reaches the inbox

@@ -74,7 +74,7 @@ def test_apply_pairs_amount_messages_skips_noise_and_flags_doubt(settings):
     report = report_for()
     marks = _apply(Extraction(results, 100, 50), pending, settings, report)
     # message 6 got no answer: it is not marked at all, so it stays pending for the next sync
-    assert [(row, status) for row, status, _, _ in marks] == [(2, "processed"), (3, "merged"), (4, "skipped"), (5, "needs_review")]
+    assert [(m.message_id, status) for m, status, _, _ in marks] == [(2, "processed"), (3, "merged"), (4, "skipped"), (5, "needs_review")]
     assert marks[1][3] == "merged into message 2: amount for message 2"
     assert [(r.date.isoformat(), r.amount, r.description, r.category) for r in report.rows] == [("2026-09-07", 10.0, "UBER", "Transport")]
     assert (report.skipped, report.merged, len(report.review)) == (1, 1, 1)

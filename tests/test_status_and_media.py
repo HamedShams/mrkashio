@@ -169,7 +169,7 @@ def test_unanswered_messages_stay_pending_and_are_reported(settings, monkeypatch
         {"description": "Groceries - A101", "amount": 300, "currency": "TRY", "category": "Groceries", "date": None}],
         "merged_into": None, "skip_reason": None, "needs_review": False, "note": None}], unanswered=[3]))
     report = sync.run_sync(settings, store, object(), "prompt", trigger=sync.TRIGGER_MANUAL, requested_by="Alex")
-    assert report.unanswered == [3] and [m[0] for m in store.marks] == [2]  # message 3 is not marked: still pending
+    assert report.unanswered == [3] and [m[0].message_id for m in store.marks] == [2]  # message 3 is not marked: still pending
     summary = sync.format_summary(report)
     assert "1 message(s) got no usable answer" in summary and "stay pending" in summary
     assert "unanswered: 1" in sync.format_report(report)
@@ -187,7 +187,7 @@ def test_edited_messages_are_re_synced_and_retractions_remove_rows(settings, mon
     assert report.status == sync.STATUS_OK and store.written == []  # nothing appended: the edit updated its own row
     assert [(mid, len(rows)) for mid, rows in store.replaced] == [(2, 1), (3, 0)]
     assert (report.rows_updated, report.rows_deleted, report.revised) == (1, 1, 2)
-    statuses = {m[0]: m[1] for m in store.marks}
+    statuses = {m[0].message_id: m[1] for m in store.marks}
     assert statuses == {2: "processed", 3: "skipped"} and "re-synced after an edit" in store.marks[0][3]
     summary = sync.format_summary(report)
     assert "updated 1" in summary and "Removed 1 row(s)" in summary

@@ -173,7 +173,7 @@ def run_sync(
             report.status = STATUS_SKIPPED_THRESHOLD
         else:
             extraction = Extraction(results=[])
-            marks: list[tuple[int, str, int, str]] = []
+            marks: list[tuple[InboxMessage, str, int, str]] = []  # appended to the inbox log once the sheet is updated
             if ask_claude:
                 report.categories = clean_categories(store.category_options())
                 log.info("Categories in force: %s", ", ".join(report.categories))
@@ -197,16 +197,16 @@ def run_sync(
                     outcome = store.replace_transactions(message.message_id, rows)
                     report.rows_updated += outcome.updated
                     report.rows_deleted += outcome.deleted
-                    marks.append((message.row, STATUS_PROCESSED if rows else STATUS_SKIPPED, len(rows),
+                    marks.append((message, STATUS_PROCESSED if rows else STATUS_SKIPPED, len(rows),
                                   f"re-synced after an edit: {outcome.updated} updated, {outcome.deleted} removed, {outcome.appended} added"))
                 for message in report.retractions:
                     outcome = store.replace_transactions(message.message_id, [])
                     report.rows_deleted += outcome.deleted
-                    marks.append((message.row, STATUS_SKIPPED, 0, f"retracted after an edit: {outcome.deleted} row(s) removed"))
+                    marks.append((message, STATUS_SKIPPED, 0, f"retracted after an edit: {outcome.deleted} row(s) removed"))
                 for message in report.deletions:
                     outcome = store.replace_transactions(message.message_id, [])
                     report.rows_deleted += outcome.deleted
-                    marks.append((message.row, STATUS_DELETED, 0, f"deleted in Telegram: {outcome.deleted} row(s) removed from the sheet"))
+                    marks.append((message, STATUS_DELETED, 0, f"deleted in Telegram: {outcome.deleted} row(s) removed from the sheet"))
                 store.mark_messages(marks)
                 report.status = STATUS_OK
     except Exception as exc:  # noqa: BLE001 - the report must be delivered whatever failed
@@ -228,10 +228,10 @@ def _apply(
     pending: list[InboxMessage],
     settings: Settings,
     report: RunReport,
-) -> list[tuple[int, str, int, str]]:
+) -> list[tuple[InboxMessage, str, int, str]]:
     """Turn Claude's results into transaction rows and inbox status marks. Unanswered messages get no mark: they stay pending."""
     by_id = {message.message_id: message for message in pending}
-    marks: list[tuple[int, str, int, str]] = []
+    marks: list[tuple[InboxMessage, str, int, str]] = []
     for result in extraction.results:
         message = by_id.get(result.message_id)
         if message is None:
@@ -251,7 +251,7 @@ def _apply(
             if hold:
                 # Never let a doubtful re-extraction delete rows: keep the sheet as it is and ask the human.
                 report.held.append(ReviewItem(message.message_id, message.sender, message.sent_at, message.text, hold))
-                marks.append((message.row, STATUS_NEEDS_REVIEW, message.rows_added, f"rows left unchanged: {hold}; edit the message again to retry"))
+                marks.append((message, STATUS_NEEDS_REVIEW, message.rows_added, f"rows left unchanged: {hold}; edit the message again to retry"))
                 continue
             report.revisions.append((message, rows))  # marked after the sheet has been updated
             continue
@@ -272,7 +272,7 @@ def _apply(
             report.skipped += 1
         else:
             status = STATUS_PROCESSED
-        marks.append((message.row, status, len(rows), note))
+        marks.append((message, status, len(rows), note))
     return marks
 
 

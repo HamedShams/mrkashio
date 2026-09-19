@@ -84,7 +84,13 @@ Telegram bots never receive messages sent before they joined, even when the grou
 - **Paste them to the bot.** In a private chat with the bot, send `/backfill`, then paste the messages copied from the Telegram chat (select messages → Copy). Telegram splits a long paste into several messages by itself, so the bot cannot know when the last part has arrived: it waits 20 seconds after the last part, or starts at once when you send `/done`. `/cancel` discards. You can also put the paste right after `/backfill` in one message. The bot queues the messages and runs a sync immediately.
 - **From a file.** `python bot.py backfill result.json` for a Telegram Desktop export (chat menu → Export chat history → JSON), or a `.txt` with the copied messages. Then `python bot.py sync --dry-run` and `python bot.py sync`.
 
-Both skip everything dated on or before the sheet's last recorded date (those rows were entered by hand already) and anything already stored, so repeating an import is harmless. The reply lists every dismissed message with its date and text, so nothing disappears silently. `--from 2026-07-29` starts from an earlier day if the last recorded day was only partly entered. Imported messages are processed 150 per Claude call.
+An import never inserts what is already there, so you can paste any range you are unsure about:
+
+- A message the inbox already has (same id, or the same send time and text as a message the bot recorded live) is skipped and counted.
+- A message whose day and wording match a row already on the transactions tab is **held as a possible duplicate**, whatever its amount says: it is not queued, the reply lists it with the sheet row it matches, and it waits in `/review`. Wording is compared without amounts, currency words, digits, symbols and case, so "Migros 450 tl" matches a row "Groceries - Migros" on the same day; a message listing several items matches a row for any one of them.
+- Everything else is queued as pending.
+
+`/review` lists what is held; `/review keep 2` queues item 2 for the next sync anyway (it was not a duplicate after all), `/review done 2` (or `done all`) closes it. Nothing is dismissed by date unless you ask: `python bot.py backfill FILE --from 2026-07-29` drops everything before that day. Imported messages are processed 150 per Claude call.
 
 The recognised paste format is what Telegram produces when you copy messages; a missing comma or colon, a 12-hour clock, and the Desktop variant (`Name, [01.09.2026 21:14]`) are all accepted:
 
@@ -154,6 +160,7 @@ In Telegram:
 | `/setup` | in the group, by a group admin | Pairs the bot with that group and with you. Once. |
 | `/sync` (or `@botname /sync`) | group or private chat | Processes everything pending now. In the group you get the one-line summary; in the private chat the full report. |
 | `/backfill` | private chat | Start pasting older messages. The import starts 20 s after the last part, or at once on `/done`; `/cancel` discards. Members of the paired group only. |
+| `/review` | group or private chat | What waits for a person: imports held as possible duplicates and messages Claude was unsure about, numbered. `/review keep 2` queues item 2 for the next sync anyway; `/review done 2` (or `done all`) closes it. |
 | `/status` | anywhere | What is connected and what still needs setting up. |
 | `/start`, `/help` | anywhere | Who the bot is talking to, the same status, and this list. |
 
@@ -176,7 +183,7 @@ python bot.py                 # run the bot locally (stop it before deploying: t
 - spend per month, with a column chart;
 - totals per currency, and the ten largest expenses.
 
-Totals count rows in a base currency (cell B3 on that tab, prefilled from `DEFAULT_CURRENCY`); other currencies are listed separately rather than mixed in. The category names in column A of that tab are what the category dropdown on the transactions tab offers, so adding a category is typing it in the next free cell. An existing tab of that name is left alone unless you pass `--rewrite`, which deletes and rebuilds it; the transactions tab is never touched. Starting from a blank spreadsheet, `init-sheet` plus the tab the bot creates by itself gives you the whole layout.
+Cell B3 on that tab is a dropdown of the supported currencies, prefilled from `DEFAULT_CURRENCY`: every total, share, month figure, top expense and chart counts the rows in that currency, so picking another entry switches the whole report. Other currencies are listed separately in their own table, never converted or mixed in. The category names in column A of that tab are what the category dropdown on the transactions tab offers, so adding a category is typing it in the next free cell. An existing tab of that name is left alone unless you pass `--rewrite`, which deletes and rebuilds it; the transactions tab is never touched. Starting from a blank spreadsheet, `init-sheet` plus the tab the bot creates by itself gives you the whole layout.
 
 ## Private notes
 
@@ -213,8 +220,8 @@ What leaves your Telegram group, and where it goes:
 - Descriptions are written formula-safe: a leading `=`, `+`, `-` or `@` is neutralised.
 - Column C gets the number format of its own currency (₺, €, $, £, or a TOMAN suffix), so the symbol always matches column D.
 - Rows the bot wrote carry a provenance note; only rows with the right note are ever updated or removed, and a row is re-checked immediately before deletion.
-- Only one sync runs at a time, and a message is inserted at most once (status column plus de-duplication by id).
-- The bot updates cells only in its own hidden tabs (`Bot_Inbox`, `Bot_Runs`, `Bot_Config`). Share the spreadsheet with the service account and nothing else.
+- Only one sync runs at a time, and a message is inserted at most once (status column plus de-duplication by id); imports also check the sheet itself for a matching row.
+- `Bot_Inbox` is a log the bot only appends to: every change of a message's status is a new row, nothing there is ever updated or deleted, and the newest row of a message is its current state. Outside the transactions tab the bot writes only to its own hidden tabs (`Bot_Inbox`, `Bot_Runs`, `Bot_Config`). Share the spreadsheet with the service account and nothing else.
 - Every failure is reported in words: a missing variable names the variable, an unreadable key file says how to fix it, a spreadsheet that cannot be opened says which e-mail address to share it with, and a sync that fails posts the error to you while the messages stay pending.
 
 ## When Claude or Telegram fail
@@ -232,9 +239,11 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-The tests run offline and cover configuration validation, prompt rendering and the exact output schema, date rollover and the cutoff rule, message pairing and inbox statuses, report texts, the paste and JSON parsers, the import filters, and the append-only guardrail. GitHub Actions runs them on every push.
+The tests run offline and cover configuration validation, prompt rendering and the exact output schema, date rollover, message pairing and inbox statuses, the append-only inbox log, report texts, the paste and JSON parsers, the import's duplicate checks, `/review`, and the append-only guardrail. GitHub Actions runs them on every push.
 
 ### Reading the inbox tab
+
+The tab is a log. The bot never edits or deletes a row there: storing a message, marking it after a sync, recording an edit, noticing a deletion, holding an import or closing an item each append a new row for the same message id, with `logged_at` set. The newest row of a message is its current state; the rows above it are its history.
 
 | Status | Meaning |
 |---|---|
@@ -244,8 +253,9 @@ The tests run offline and cover configuration validation, prompt rendering and t
 | `skipped` | Not an expense (chit-chat, a recap, a test message). |
 | `needs_review` | Claude was not sure about something in it; the note says what. Rows it was sure about are still written. |
 | `pending_revision` | The message was edited after its rows were written; the next sync updates or removes those rows, unless the new answer looks incomplete, in which case the rows stay and the message is flagged. |
-| `pending_deletion`, `deleted` | The message was deleted in Telegram after its rows were written; the next sync removes the rows and the inbox row stays, with the text, for tracing. |
-| `superseded` | An earlier version of a message that was edited later. Edits never overwrite a row: the old row stays with this status and the new text gets a new row, so the chain of edits can be read. |
+| `pending_deletion`, `deleted` | The message was deleted in Telegram after its rows were written; the next sync removes the rows and the history stays, with the text, for tracing. |
+| `duplicate` | An imported message that matches a row already on the sheet (same day, same wording). Not queued; waits in `/review`. |
+| `resolved` | Closed by a person with `/review done`. |
 
 ## Cost
 
@@ -260,7 +270,7 @@ Only `TELEGRAM_BOT_TOKEN` is needed to start the bot. Add the rest in any order 
 - Bots cannot read chat history: messages sent before the bot joined are not seen. Use `backfill` with a Telegram Desktop export for those.
 - Telegram does not notify bots about deleted messages. To retract a note before a sync, edit it to say "ignore" or "cancelled".
 - Edits follow through, carefully. Editing a pending message replaces its text. Editing a message that was skipped or flagged makes it pending again. Editing a message that already produced sheet rows re-syncs it at the next sync: its rows are updated in place, extra rows removed, missing rows added. Editing it into `#note` (or “cancelled”) removes its rows. The bot finds its own rows through a small note it leaves on each date cell (“kashio:<message id>”), so it never touches rows it did not write. If the new answer looks incomplete (Claude unsure, or far fewer items than before or than the text lists), the rows are left exactly as they were and you are told; edit the message again to retry.
-- Deletions follow through too. Telegram sends bots no event for a deleted message, so before each sync the bot asks Telegram to clear its (non-existent) reaction on every message that has rows in the sheet; a deleted message answers "not found", and its rows are removed at that sync. Existing messages are unaffected, nothing visible happens in the group, and the inbox keeps the message's text and history with the status `deleted` so you can trace it later. Deletions and note-edits are applied even when the scheduled minimum is not met, since they cost no Claude call.
+- Deletions follow through too. Telegram sends bots no event for a deleted message, so before each sync the bot asks Telegram to clear its own (non-existent) reaction on every message that has rows in the sheet; a deleted message answers "not found", and its rows are removed at that sync. Existing messages are unaffected whether or not people have reacted to them (a bot can only change its own reaction, so theirs are never touched), nothing visible happens in the group, and the inbox keeps the message's text and history with the status `deleted` so you can trace it later. Deletions and note-edits are applied even when the scheduled minimum is not met, since they cost no Claude call.
 - If Telegram upgrades your group to a supergroup, its id changes; update `TELEGRAM_CHAT_ID`.
 - Two people writing a few notes a day stay far below Google Sheets API quotas.
 

@@ -6,6 +6,10 @@ E description, G category. Columns not listed are never touched.
 Rows the bot writes carry a small note on the date cell, "kashio:<message id>", so that an edited Telegram
 message can later find and update or remove exactly its own rows and nothing else. Notes travel with the
 row when rows are sorted, moved or deleted by hand.
+
+The inbox tab is a log: the bot only ever appends to it. Every change of status (stored, processed, edited,
+deleted, flagged, closed) is a new row for the same message id, and the newest row of a message is its
+current state. Nothing in that tab is updated or deleted, so the whole history of a message can be read.
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ log = logging.getLogger(__name__)
 TIMESTAMP = "%Y-%m-%d %H:%M:%S"
 NOTE_PREFIX = "kashio:"
 
-INBOX_HEADERS = ("message_id", "sender", "sent_at", "edited_at", "text", "status", "processed_at", "rows_added", "note")
+INBOX_HEADERS = ("message_id", "sender", "sent_at", "edited_at", "text", "status", "logged_at", "rows_added", "note")
 RUNS_HEADERS = (
     "run_at", "trigger", "requested_by", "status", "pending", "processed", "rows_added", "sheet_range",
     "skipped", "needs_review", "input_tokens", "output_tokens", "cost_usd", "model", "effort", "error", "merged",
@@ -39,14 +43,17 @@ TARGET_HEADER_NAMES = {"date": "Date", "amount": "Amount", "currency": "Currency
 STATUS_PENDING = "pending"
 STATUS_PENDING_REVISION = "pending_revision"  # edited after its rows were written; the rows get replaced at the next sync
 STATUS_PENDING_DELETION = "pending_deletion"  # deleted in Telegram after its rows were written; the rows go at the next sync
-STATUS_DELETED = "deleted"  # rows removed because the message was deleted in Telegram; the inbox row stays for tracing
-STATUS_SUPERSEDED = "superseded"  # an earlier version of a message that was edited later; kept so the chain of edits can be read
+STATUS_DELETED = "deleted"  # rows removed because the message was deleted in Telegram; the history stays for tracing
 PENDING_STATUSES = (STATUS_PENDING, STATUS_PENDING_REVISION, STATUS_PENDING_DELETION)
 STATUS_PROCESSED = "processed"
 STATUS_SKIPPED = "skipped"
 STATUS_MERGED = "merged"  # folded into another message's transaction (an amount sent separately, a correction)
 STATUS_NEEDS_REVIEW = "needs_review"
-STATUS_EDITED_AFTER_SYNC = "edited_after_sync"  # no longer produced; kept so old inbox rows still read
+STATUS_DUPLICATE = "duplicate"  # an imported message that looks already present in the sheet; waits for /review
+STATUS_RESOLVED = "resolved"  # closed by a person through /review done
+REVIEW_STATUSES = (STATUS_NEEDS_REVIEW, STATUS_DUPLICATE)
+WITH_ROWS_STATUSES = (STATUS_PROCESSED, STATUS_NEEDS_REVIEW, STATUS_PENDING_REVISION, STATUS_RESOLVED,
+                      "edited_after_sync")  # may still own sheet rows; the last one is no longer produced, kept for old inboxes
 
 # Number format for the amount column, so the symbol shown matches the currency column.
 CURRENCY_FORMATS = {
@@ -75,16 +82,17 @@ def _retry(call: Callable[[], T], attempts: int = 3) -> T:
 
 @dataclass
 class InboxMessage:
-    """One raw Telegram message as stored in the inbox tab."""
+    """The current state of one Telegram message: its newest row in the inbox log."""
 
-    row: int  # 1-based row number in the inbox tab
+    row: int  # 1-based row number of that newest row in the inbox tab
     message_id: int
     sender: str
     sent_at: datetime  # aware, in the configured time zone
     edited_at: datetime | None
     text: str
     status: str
-    rows_added: int = 0  # rows this message produced earlier (revisions only)
+    rows_added: int = 0  # rows this message owns in the sheet
+    note: str = ""
 
     @property
     def revision(self) -> bool:
@@ -105,6 +113,17 @@ class TransactionRow:
     description: str
     category: str
     message_id: int
+
+
+@dataclass
+class SheetEntry:
+    """One existing row of the transactions tab, as far as an import needs it to spot a duplicate."""
+
+    row: int
+    date: date
+    description: str
+    amount: object
+    currency: str
 
 
 @dataclass
@@ -216,26 +235,30 @@ class SheetStore:
         return sheet
 
     # ------------------------------------------------------------------ inbox
+    # Append-only. Every method here adds rows; none updates or deletes one.
+
+    def _now(self) -> str:
+        return datetime.now(self.settings.timezone).strftime(TIMESTAMP)
+
+    def _append(self, rows: Sequence[list[object]]) -> None:
+        for start in range(0, len(rows), 500):
+            chunk = [list(row) for row in rows[start : start + 500]]
+            _retry(lambda: self.inbox.append_rows(chunk, value_input_option="RAW"))
 
     def add_message(self, message_id: int, sender: str, sent_at: datetime, text: str, note: str = "") -> None:
-        row = [str(message_id), sender, sent_at.strftime(TIMESTAMP), "", text, STATUS_PENDING, "", "", note]
-        _retry(lambda: self.inbox.append_row(row, value_input_option="RAW"))
+        self._append([[str(message_id), sender, sent_at.strftime(TIMESTAMP), "", text, STATUS_PENDING, self._now(), "", note]])
 
     def add_skipped(self, message_id: int, sender: str, sent_at: datetime, label: str, reason: str) -> None:
         """Log that a message was seen and skipped without storing its content: media, or a private note."""
-        now = datetime.now(self.settings.timezone).strftime(TIMESTAMP)
-        row = [str(message_id), sender, sent_at.strftime(TIMESTAMP), "", f"[{label}]", STATUS_SKIPPED, now, 0, reason]
-        _retry(lambda: self.inbox.append_row(row, value_input_option="RAW"))
+        self._append([[str(message_id), sender, sent_at.strftime(TIMESTAMP), "", f"[{label}]", STATUS_SKIPPED, self._now(), 0, reason]])
 
-    def add_messages(self, rows: Sequence[tuple[int, str, datetime, datetime | None, str]]) -> None:
-        """Bulk insert of (message_id, sender, sent_at, edited_at, text), used by the backfill command."""
-        values = [
-            [str(mid), sender, sent.strftime(TIMESTAMP), edited.strftime(TIMESTAMP) if edited else "", text, STATUS_PENDING, "", "", ""]
-            for mid, sender, sent, edited, text in rows
-        ]
-        for start in range(0, len(values), 500):
-            chunk = values[start : start + 500]
-            _retry(lambda: self.inbox.append_rows(chunk, value_input_option="RAW"))
+    def add_messages(self, rows: Sequence[tuple[int, str, datetime, datetime | None, str, str]], status: str = STATUS_PENDING) -> None:
+        """Bulk insert of (message_id, sender, sent_at, edited_at, text, note), used by the backfill command."""
+        now = self._now()
+        self._append([
+            [str(mid), sender, sent.strftime(TIMESTAMP), edited.strftime(TIMESTAMP) if edited else "", text, status, now, "", note]
+            for mid, sender, sent, edited, text, note in rows
+        ])
 
     def stored_message_ids(self) -> set[int]:
         ids: set[int] = set()
@@ -246,61 +269,23 @@ class SheetStore:
                 continue
         return ids
 
-    def latest_row(self, message_id: int) -> tuple[int, list[str]] | None:
-        """The newest inbox row for a message (edits append rows), as (row number, values), or None."""
-        found: tuple[int, list[str]] | None = None
-        for index, values in enumerate(_retry(self.inbox.get_all_values)[1:], start=2):
-            if values and values[0] == str(message_id):
-                found = (index, list(values) + [""] * (len(INBOX_HEADERS) - len(values)))
-        return found
-
-    def update_message(self, message_id: int, text: str, edited_at: datetime, retire_reason: str | None = None) -> str | None:
-        """Record an edit as a new inbox row and return the new row's status, or None if the message was never stored.
-
-        The inbox is an audit trail: the previous row is kept and marked `superseded`, the new row carries the
-        edited text. Its status says what the next sync should do:
-        - the message was still pending: `pending` again (or `skipped`, with `retire_reason`, when edited into a note)
-        - it was skipped or flagged without any row written: `pending`, so the next sync looks at it again
-        - it already has rows in the sheet: `pending_revision`, and the sync replaces those rows with what the
-          edited text now says (or removes them, when the message was edited into a note)
-        """
-        latest = self.latest_row(message_id)
-        if latest is None:
-            return None
-        index, values = latest
-        previous = values[5] or STATUS_PENDING
-        rows_added = int(values[7]) if str(values[7]).isdigit() else 0
-        has_rows = rows_added > 0 or previous in (STATUS_PENDING_REVISION, STATUS_PENDING_DELETION)
-        now = datetime.now(self.settings.timezone).strftime(TIMESTAMP)
-        if has_rows:
-            status = STATUS_PENDING_REVISION
-            note = "retracted after an edit; its rows will be removed" if retire_reason else "edited after its rows were written; they will be replaced"
-            processed_at, carried = "", rows_added
-        elif retire_reason:
-            status, note, processed_at, carried = STATUS_SKIPPED, retire_reason, now, 0
-        else:
-            status, processed_at, carried = STATUS_PENDING, "", ""
-            note = "edited" if previous == STATUS_PENDING else "reopened after an edit"
-        new_row = [str(message_id), values[1], values[2], edited_at.strftime(TIMESTAMP), text, status, processed_at, carried, note]
-        _retry(lambda: self.inbox.batch_update([
-            {"range": f"F{index}", "values": [[STATUS_SUPERSEDED]]},
-            {"range": f"I{index}", "values": [[f"superseded by an edit at {edited_at.strftime(TIMESTAMP)}; was {previous}"]]},
-        ]))
-        _retry(lambda: self.inbox.append_row(new_row, value_input_option="RAW"))
-        return status
-
-    def pending_messages(self) -> list[InboxMessage]:
-        rows = _retry(self.inbox.get_all_values)
-        seen: set[int] = set()
-        pending: list[InboxMessage] = []
-        for index, values in enumerate(rows[1:], start=2):
+    def stored_message_keys(self) -> set[tuple[str, str]]:
+        """(send time to the minute, normalised text) of every row, so a pasted copy of a live message is recognised."""
+        keys: set[tuple[str, str]] = set()
+        for values in _retry(self.inbox.get_all_values)[1:]:
             values = list(values) + [""] * (len(INBOX_HEADERS) - len(values))
-            message_id, sender, sent_at, edited_at, text, status, _processed, rows_added = values[:8]
+            keys.add(message_key(values[2], values[4]))
+        return keys
+
+    def latest_rows(self) -> dict[int, InboxMessage]:
+        """The newest row of every message, keyed by message id: the current state of each message."""
+        latest: dict[int, InboxMessage] = {}
+        for index, values in enumerate(_retry(self.inbox.get_all_values)[1:], start=2):
+            values = list(values) + [""] * (len(INBOX_HEADERS) - len(values))
+            message_id, sender, sent_at, edited_at, text, status, _logged, rows_added, note = values[:9]
             try:
                 message_id = int(message_id)  # negative ids mark messages imported from a chat export
             except ValueError:
-                continue
-            if status not in PENDING_STATUSES or message_id in seen:
                 continue
             try:
                 parsed_sent = self._parse_timestamp(sent_at)
@@ -308,46 +293,70 @@ class SheetStore:
             except ValueError:
                 log.warning("Inbox row %s has an unreadable timestamp (%r); skipping it", index, sent_at)
                 continue
-            seen.add(message_id)
-            pending.append(InboxMessage(
-                row=index, message_id=message_id, sender=sender, sent_at=parsed_sent, edited_at=parsed_edited,
-                text=text, status=status, rows_added=int(rows_added) if str(rows_added).isdigit() else 0,
-            ))
-        return pending
+            latest[message_id] = InboxMessage(
+                row=index, message_id=message_id, sender=sender, sent_at=parsed_sent, edited_at=parsed_edited, text=text,
+                status=status or STATUS_PENDING, rows_added=int(rows_added) if str(rows_added).isdigit() else 0, note=note,
+            )
+        return latest
 
-    def messages_with_rows(self) -> list[tuple[int, int]]:
-        """(inbox row, message id) of live Telegram messages whose rows are in the sheet: the ones a deletion could orphan."""
-        found: list[tuple[int, int]] = []
-        for index, values in enumerate(_retry(self.inbox.get_all_values)[1:], start=2):
-            values = list(values) + [""] * (len(INBOX_HEADERS) - len(values))
-            try:
-                message_id = int(values[0])
-            except ValueError:
-                continue
-            rows_added = int(values[7]) if str(values[7]).isdigit() else 0
-            if message_id > 0 and rows_added > 0 and values[5] in (STATUS_PROCESSED, STATUS_NEEDS_REVIEW, STATUS_PENDING_REVISION):
-                found.append((index, message_id))
-        return found
+    def latest_row(self, message_id: int) -> InboxMessage | None:
+        return self.latest_rows().get(message_id)
 
-    def mark_deleted(self, rows: Sequence[int]) -> None:
-        """Queue messages deleted in Telegram for row removal. Text and history stay in the inbox for tracing."""
-        if not rows:
-            return
-        when = datetime.now(self.settings.timezone).strftime(TIMESTAMP)
-        updates = [{"range": f"F{row}", "values": [[STATUS_PENDING_DELETION]]} for row in rows]
-        updates += [{"range": f"I{row}", "values": [[f"deleted in Telegram, noticed {when}; its rows will be removed"]]} for row in rows]
-        _retry(lambda: self.inbox.batch_update(updates))
+    def pending_messages(self) -> list[InboxMessage]:
+        return sorted((m for m in self.latest_rows().values() if m.status in PENDING_STATUSES), key=lambda m: m.row)
 
-    def mark_messages(self, marks: Sequence[tuple[int, str, int, str]]) -> None:
-        """Set status, processed_at, rows_added and note for the given inbox rows: (row, status, rows_added, note)."""
+    def review_items(self) -> list[InboxMessage]:
+        """Messages waiting for a person: Claude's doubts and imports that look like duplicates."""
+        return sorted((m for m in self.latest_rows().values() if m.status in REVIEW_STATUSES), key=lambda m: m.row)
+
+    def messages_with_rows(self) -> list[InboxMessage]:
+        """Live Telegram messages whose rows are in the sheet: the ones a deletion could orphan."""
+        return sorted((m for m in self.latest_rows().values() if m.message_id > 0 and m.rows_added > 0 and m.status in WITH_ROWS_STATUSES),
+                      key=lambda m: m.row)
+
+    def update_message(self, message_id: int, text: str, edited_at: datetime, retire_reason: str | None = None) -> str | None:
+        """Record an edit as a new inbox row and return its status, or None if the message was never stored.
+
+        The earlier rows are left as they are (the log keeps every version). The new row carries the edited
+        text and the status that tells the next sync what to do:
+        - the message was still pending: `pending` again (or `skipped`, with `retire_reason`, when edited into a note)
+        - it was skipped, flagged or closed without any row written: `pending`, so the next sync looks at it again
+        - it already has rows in the sheet: `pending_revision`, and the sync replaces those rows with what the
+          edited text now says (or removes them, when the message was edited into a note)
+        """
+        latest = self.latest_row(message_id)
+        if latest is None:
+            return None
+        has_rows = latest.rows_added > 0 or latest.status in (STATUS_PENDING_REVISION, STATUS_PENDING_DELETION)
+        if has_rows:
+            status = STATUS_PENDING_REVISION
+            note = "retracted after an edit; its rows will be removed" if retire_reason else "edited after its rows were written; they will be replaced"
+            carried: object = latest.rows_added
+        elif retire_reason:
+            status, note, carried = STATUS_SKIPPED, retire_reason, 0
+        else:
+            status, carried = STATUS_PENDING, ""
+            note = "edited" if latest.status == STATUS_PENDING else f"reopened after an edit (was {latest.status})"
+        self._append([[str(message_id), latest.sender, latest.sent_at.strftime(TIMESTAMP), edited_at.strftime(TIMESTAMP), text,
+                       status, self._now(), carried, note]])
+        return status
+
+    def mark_deleted(self, messages: Sequence[InboxMessage]) -> None:
+        """Queue messages deleted in Telegram for row removal: one new row each, text and history kept."""
+        when = self._now()
+        self.mark_messages([(m, STATUS_PENDING_DELETION, m.rows_added, f"deleted in Telegram, noticed {when}; its rows will be removed")
+                            for m in messages])
+
+    def mark_messages(self, marks: Sequence[tuple[InboxMessage, str, int, str]]) -> None:
+        """Append one row per (message, new status, rows_added, note). The message's text and times are carried over."""
         if not marks:
             return
-        now = datetime.now(self.settings.timezone).strftime(TIMESTAMP)
-        updates = [
-            {"range": f"F{row}:I{row}", "values": [[status, now, rows_added, note]]}
-            for row, status, rows_added, note in marks
-        ]
-        _retry(lambda: self.inbox.batch_update(updates))
+        now = self._now()
+        self._append([
+            [str(m.message_id), m.sender, m.sent_at.strftime(TIMESTAMP), m.edited_at.strftime(TIMESTAMP) if m.edited_at else "",
+             m.text, status, now, rows_added, note]
+            for m, status, rows_added, note in marks
+        ])
 
     def _parse_timestamp(self, value: str) -> datetime:
         return datetime.strptime(value, TIMESTAMP).replace(tzinfo=self.settings.timezone)
@@ -401,6 +410,21 @@ class SheetStore:
             rows = _retry(lambda: self.spreadsheet.values_get(source)).get("values", [])
             return [value for row in rows for value in row if value]
         return []
+
+    def transaction_index(self) -> list[SheetEntry]:
+        """Every row of the target tab that has a date and a description, for the import's duplicate check."""
+        c = self.columns
+        first, last = min(c.written, key=c.index), max(c.written, key=c.index)
+        offset = {name: c.index(getattr(c, name)) - c.index(first) for name in ("date", "amount", "currency", "description")}
+        width = c.index(last) - c.index(first) + 1
+        entries: list[SheetEntry] = []
+        values = _retry(lambda: self.target.get_values(f"{first}1:{last}", value_render_option="UNFORMATTED_VALUE"))
+        for index, row in enumerate(values, start=1):
+            row = list(row) + [""] * (width - len(row))
+            when, description = _as_date(row[offset["date"]]), str(row[offset["description"]]).strip()
+            if when and description:
+                entries.append(SheetEntry(index, when, description, row[offset["amount"]], str(row[offset["currency"]])))
+        return entries
 
     def last_recorded_date(self) -> date | None:
         """The latest date in the date column of the target tab, or None when the tab holds no dates yet."""
@@ -533,6 +557,11 @@ class SheetStore:
             _retry(lambda: self.spreadsheet.batch_update({"requests": [request]}))
         except APIError as exc:  # formatting is cosmetic; never block the data write on it
             log.warning("Could not copy row formatting: %s", exc)
+
+
+def message_key(sent_at: str, text: str) -> tuple[str, str]:
+    """What makes two inbox rows the same message when ids differ (a live message pasted back later)."""
+    return sent_at[:16], " ".join(text.split()).casefold()
 
 
 def currency_format_requests(sheet_id: int, start: int, currencies: Sequence[str], column_index: int = 2) -> list[dict]:
