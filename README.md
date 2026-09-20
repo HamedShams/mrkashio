@@ -87,7 +87,7 @@ Telegram bots never receive messages sent before they joined, even when the grou
 An import never inserts what is already there, so you can paste any range you are unsure about:
 
 - A message the inbox already has (same id, or the same send time and text as a message the bot recorded live) is skipped and counted.
-- A message whose day and wording match a row already on the transactions tab is **held as a possible duplicate**, whatever its amount says: it is not queued, the reply lists it with the sheet row it matches, and it waits in `/review`. Wording is compared without amounts, currency words, digits, symbols and case, so "Migros 450 tl" matches a row "Groceries - Migros" on the same day; a message listing several items matches a row for any one of them.
+- A message that repeats a row already on the transactions tab, **same day, same wording, same amount and same currency**, is held as a duplicate: it is not queued, the reply lists it with the sheet row it repeats, and it waits in `/review`. Wording is compared without amounts, currency words, digits, symbols and case, and without the "Groceries - " prefix the bot adds, so "Migros 450 tl" and "Migros 450" both repeat a row "Groceries - Migros · ₺450" of the same day, while "Migros - Water 400 TL" and "Migros 400 TL" are two different purchases and both go through. A message listing several items (blank line between them) is held when any one of its items repeats a row.
 - Everything else is queued as pending.
 
 `/review` lists what is held; `/review keep 2` queues item 2 for the next sync anyway (it was not a duplicate after all), `/review done 2` (or `done all`) closes it. Nothing is dismissed by date unless you ask: `python bot.py backfill FILE --from 2026-07-29` drops everything before that day. Imported messages are processed 150 per Claude call.
@@ -171,7 +171,8 @@ python bot.py check           # verifies Telegram, Sheets, Anthropic, pairing an
 python bot.py sync --dry-run  # calls Claude, prints the rows it would write, writes nothing
 python bot.py sync            # one real sync from the terminal
 python bot.py backfill FILE   # queue older messages from a paste (.txt) or a Telegram Desktop export (.json)
-python bot.py init-sheet      # build the Summary report tab; --rewrite replaces an existing one
+python bot.py init-sheet      # build the Summary report tab; --rewrite replaces an existing one, keeping its exchange rates
+python bot.py categorise --rows 5:152 --dry-run   # propose categories for hand-entered rows that have none; drop --dry-run to write them
 python bot.py                 # run the bot locally (stop it before deploying: two pollers on one token conflict)
 ```
 
@@ -179,11 +180,16 @@ python bot.py                 # run the bot locally (stop it before deploying: t
 
 `python bot.py init-sheet` builds a report tab over your transactions tab, made only of formulas so it stays live:
 
-- spend, share and number of transactions per category, with a pie chart;
+- spend, share and number of transactions per category, with a donut chart;
 - spend per month, with a column chart;
-- totals per currency, and the ten largest expenses.
+- totals per currency, as logged and converted;
+- an exchange-rate table, and the ten largest expenses.
 
-Cell B3 on that tab is a dropdown of the supported currencies, prefilled from `DEFAULT_CURRENCY`: every total, share, month figure, top expense and chart counts the rows in that currency, so picking another entry switches the whole report. Other currencies are listed separately in their own table, never converted or mixed in. The category names in column A of that tab are what the category dropdown on the transactions tab offers, so adding a category is typing it in the next free cell. An existing tab of that name is left alone unless you pass `--rewrite`, which deletes and rebuilds it; the transactions tab is never touched. Starting from a blank spreadsheet, `init-sheet` plus the tab the bot creates by itself gives you the whole layout.
+Cell B3 on that tab is a dropdown of the supported currencies, prefilled from `DEFAULT_CURRENCY`. Every amount on the tab is converted into that currency, so picking another entry switches the whole report, charts included. The conversion uses the **Exchange rates** table lower on the tab: one editable cell per currency holding the value of one unit, all measured in the same currency of your choice (only the ratios matter). `init-sheet` prefills it with 1 for the default currency and Google Finance formulas for the others; the Iranian toman has no reliable feed and is entered by hand (an empty rate makes that currency count as 0 and the per-currency table says "rate missing"). You can replace any rate with a number or a reference to your own rates table. Rows whose amount is not a number (a note typed across a row) are ignored by every formula. The category names in column A of that tab are what the category dropdown on the transactions tab offers, so adding a category is typing it in the next free cell. An existing tab of that name is left alone unless you pass `--rewrite`, which deletes and rebuilds it but keeps the exchange rates you entered; the transactions tab is never touched. Starting from a blank spreadsheet, `init-sheet` plus the tab the bot creates by itself gives you the whole layout.
+
+## Categorising rows you entered by hand
+
+Rows that existed before the bot usually have no category, so the Summary shows them on one line instead of in the shares. `python bot.py categorise --rows 5:152 --dry-run` sends every row in that range that has a description but no category to Claude in one call (plain JSON at the configured effort, categories limited to the sheet's own list), prints the proposed category per row and the per-category counts, and writes nothing. Without `--dry-run` it writes those category cells and nothing else: each cell is re-checked to be still empty right before the write, rows without a description (a note typed across a row, a blank line) are never touched, and every other column stays as it is. Rows Claude does not answer are named so you can run it again.
 
 ## Private notes
 
@@ -254,7 +260,7 @@ The tab is a log. The bot never edits or deletes a row there: storing a message,
 | `needs_review` | Claude was not sure about something in it; the note says what. Rows it was sure about are still written. |
 | `pending_revision` | The message was edited after its rows were written; the next sync updates or removes those rows, unless the new answer looks incomplete, in which case the rows stay and the message is flagged. |
 | `pending_deletion`, `deleted` | The message was deleted in Telegram after its rows were written; the next sync removes the rows and the history stays, with the text, for tracing. |
-| `duplicate` | An imported message that matches a row already on the sheet (same day, same wording). Not queued; waits in `/review`. |
+| `duplicate` | An imported message that repeats a row already on the sheet (same day, wording, amount and currency). Not queued; waits in `/review`. |
 | `resolved` | Closed by a person with `/review done`. |
 
 ## Cost

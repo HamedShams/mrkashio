@@ -6,6 +6,7 @@
     python bot.py sync --dry-run  call Claude and print the rows, but write nothing and message nobody
     python bot.py backfill FILE   queue older messages from a pasted dump or a Telegram Desktop JSON export
     python bot.py init-sheet      build the Summary report tab (add --rewrite to replace an existing one)
+    python bot.py categorise      fill in the empty category cells of hand-entered rows (--rows 5:152, --dry-run)
 
 Telegram commands:
     /setup     in the group, once, by a group admin: pairs the bot with that group and with you
@@ -54,6 +55,7 @@ from telegram.error import BadRequest, TelegramError
 from telegram.ext import Application, ChatMemberHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from backfill import import_messages, parse
+from categorise import apply as apply_categories, candidates as category_candidates, plan as plan_categories
 from summary import build_summary
 from config import ConfigError, Settings
 from extractor import MAX_MESSAGES_PER_CALL, clean_categories, load_prompt
@@ -939,6 +941,38 @@ def cli_backfill(settings: Settings, path: str, since: date | None) -> int:
     return 0
 
 
+def cli_categorise(settings: Settings, rows: str | None, dry_run: bool) -> int:
+    """Categorise rows that have a description but no category; writes only those category cells."""
+    app = Kashio(settings)
+    if not app.can_sync:
+        print(app.status_text())
+        return 1
+    try:
+        first, last = (int(part) for part in rows.split(":")) if rows else (2, app.store.last_used_row())
+    except ValueError:
+        print("--rows expects FIRST:LAST, for example 5:152")
+        return 1
+    if first < 2 or last < first:
+        print("--rows must start at 2 or later and end at or after its start")
+        return 1
+    found = category_candidates(app.store, first, last)
+    if not found:
+        print(f"Every row in {first}:{last} with a description already has a category. Nothing to do.")
+        return 0
+    categories = clean_categories(app.store.category_options())
+    print(f"{len(found)} row(s) in {first}:{last} have a description but no category. Categories: {', '.join(categories)}")
+    result = plan_categories(app.claude, settings, found, categories)
+    print(result.describe())
+    cost = (result.input_tokens * settings.price_input_per_million + result.output_tokens * settings.price_output_per_million) / 1_000_000
+    print(f"Claude: {result.calls} call(s), {result.input_tokens:,} in / {result.output_tokens:,} out, about ${cost:.4f} (effort {settings.anthropic_effort})")
+    if dry_run:
+        print("Dry run: nothing written. Run again without --dry-run to write these category cells.")
+        return 0
+    written = apply_categories(app.store, result.mapping)
+    print(f"Wrote {len(result.mapping)} category cell(s) within {settings.sheet_tab!r}!{written}; no other cell was touched.")
+    return 0 if not result.unanswered else 1
+
+
 def cli_init_sheet(settings: Settings, rewrite: bool) -> int:
     """Create (or rewrite) the Summary report tab and point the category dropdown at its category list."""
     app = Kashio(settings)
@@ -965,7 +999,10 @@ def main() -> None:
     backfill_parser.add_argument("--from", dest="since", type=date.fromisoformat, metavar="YYYY-MM-DD",
                                  help="dismiss everything dated before this day (default: import every day; duplicates are held)")
     init_parser = commands.add_parser("init-sheet", help="build the Summary report tab over the transactions tab")
-    init_parser.add_argument("--rewrite", action="store_true", help="replace an existing Summary tab (its contents are lost)")
+    init_parser.add_argument("--rewrite", action="store_true", help="replace an existing Summary tab (its exchange rates are kept)")
+    cat_parser = commands.add_parser("categorise", help="fill in the empty category cells of rows that have a description; one Claude call")
+    cat_parser.add_argument("--rows", metavar="FIRST:LAST", help="row range to look at (default: every row of the tab)")
+    cat_parser.add_argument("--dry-run", action="store_true", help="print the proposed categories, write nothing")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -982,6 +1019,8 @@ def main() -> None:
             sys.exit(cli_backfill(settings, args.file, args.since))
         elif args.command == "init-sheet":
             sys.exit(cli_init_sheet(settings, args.rewrite))
+        elif args.command == "categorise":
+            sys.exit(cli_categorise(settings, args.rows, args.dry_run))
         else:
             run_bot(settings)
     except ConfigError as exc:

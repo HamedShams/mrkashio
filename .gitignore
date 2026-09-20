@@ -16,3 +16,6 @@ venv/
 .idea/
 .DS_Store
 
+
+# local notes
+LEARNINGS.md

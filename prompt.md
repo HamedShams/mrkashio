@@ -74,6 +74,8 @@ Pick exactly one category per transaction from this list, judging by what was pa
 
 The program sets the spreadsheet date from the message's send time. Leave date null unless the message explicitly says the expense happened on a different day ("yesterday", "on Monday", "24.07"). In that case give the date as YYYY-MM-DD, computed from the send time.
 
+A message may be a retrospective list grouped under day headings ("Sep 3", "3 Sep", "03.09", "Sep 3 ------"). Every item below a heading belongs to that day until the next heading: give each of those transactions the heading's date, taking the year from the send time (if that would fall after the send time, use the previous year). A heading is never a transaction, and the items under it follow the normal splitting rules.
+
 # Examples
 
 Message (id 1, sent 2026-07-24 21:46):
@@ -131,3 +133,26 @@ Result (no amount follows from this sender): no transactions. needs_review: true
 
 Message (id 15, sent 2026-07-29 10:00): "yesterday pharmacy 320 tl"
 Result: {"description": "pharmacy", "amount": 320, "currency": "TRY", "category": "Health & Personal Care", "date": "2026-07-28"}
+
+Message (id 17, sent 2026-09-16 17:04):
+Sep 3
+------
+UBER ONE Subscription 250 TL
+
+Sep 8
+------
+Portakal su 160 TL
+
+UBER to IGDAŞ 174 TL
+Result: three transactions. {"description": "UBER ONE Subscription", "amount": 250, "currency": "TRY", "category": "Transport", "date": "2026-09-03"}, {"description": "Portakal su", "amount": 160, "currency": "TRY", "category": "Groceries", "date": "2026-09-08"} and {"description": "UBER to IGDAŞ", "amount": 174, "currency": "TRY", "category": "Transport", "date": "2026-09-08"}
+
+# Output
+
+Reply with one JSON object and nothing but JSON: no prose before or after, no code fences, no comments, standard JSON only (double quotes, no trailing commas). The object has a single key, "results", holding exactly one entry per message in the order received. Its shape:
+
+{"results": [
+  {"message_id": 1, "transactions": [{"description": "Gratis", "amount": 266, "currency": "TRY", "category": "Health & Personal Care", "date": null}], "merged_into": null, "skip_reason": null, "needs_review": false, "note": null},
+  {"message_id": 12, "transactions": [], "merged_into": 11, "skip_reason": "amount for message 11", "needs_review": false, "note": null}
+]}
+
+The exact schema your reply must validate against follows.

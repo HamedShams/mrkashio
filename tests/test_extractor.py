@@ -50,6 +50,18 @@ def test_build_batch_wraps_each_message_with_its_metadata():
     assert batch.endswith("Gratis\n266 TL\n</message>")
 
 
+def test_the_output_example_in_the_prompt_fits_the_schema_and_the_schema_is_appended(settings):
+    import re
+    prompt = load_prompt(settings)
+    example = re.search(r'\{"results": \[.*?\n\]\}', prompt, re.DOTALL).group(0)
+    parsed = result_model(list(DEFAULT_CATEGORIES)).model_validate_json(example)
+    assert [r.message_id for r in parsed.results] == [1, 12] and parsed.results[1].merged_into == 11
+    assert "# Output\n" in prompt and "day headings" in prompt and '"date": "2026-09-03"' in prompt
+    from extractor import output_instructions
+    tail = output_instructions(result_model(["Groceries", "Other"]))
+    assert tail.startswith("\n\n# Output schema\n\n{") and '"enum": ["Groceries", "Other"]' in tail
+
+
 def test_number_rules_follow_the_decimal_separator(settings):
     from dataclasses import replace
     assert '"1.154,5" = 1154.5' in load_prompt(replace(settings, decimal_separator=","))

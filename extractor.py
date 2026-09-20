@@ -177,10 +177,7 @@ def render_prompt(template: str, categories: Sequence[str]) -> str:
 
 def output_instructions(schema: type[SyncResult]) -> str:
     """Appended to the system prompt: answer as one JSON object matching this schema, nothing else."""
-    return (
-        "\n\n# Output\n\nReply with one JSON object and nothing else: no code fences, no commentary before or after. "
-        "It must validate against this JSON schema:\n" + json.dumps(schema.model_json_schema(), ensure_ascii=False)
-    )
+    return "\n\n# Output schema\n\n" + json.dumps(schema.model_json_schema(), ensure_ascii=False)
 
 
 def parse_answer(text: str, schema: type[SyncResult]) -> list[MessageResult] | None:

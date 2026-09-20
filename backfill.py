@@ -5,9 +5,9 @@ a Telegram client (the "Name, [date]:" dump format) or as a Telegram Desktop JSO
 here into plain messages and queued in the inbox; the normal sync then processes them.
 
 An import never inserts what is already there. A message already in the inbox (same id, or the same send
-time and text as a message the bot recorded live) is skipped. A message whose day and wording match a row
-that is already on the transactions tab is held as a possible duplicate, whatever its amount says, and
-waits for a person: /review lists such messages, /review keep queues one anyway, /review done closes it.
+time and text as a message the bot recorded live) is skipped. A message that repeats a row already on the
+transactions tab (same day, same wording, same amount and currency) is held as a duplicate and waits for a
+person: /review lists such messages, /review keep queues one anyway, /review done closes it.
 """
 
 from __future__ import annotations
@@ -21,6 +21,14 @@ from datetime import date, datetime, timezone
 from config import Settings
 from sheets import STATUS_DUPLICATE, SheetEntry, SheetStore, message_key
 from sync import format_amount, rollover_date, split_note
+
+CURRENCY_WORDS = {
+    "TRY": ("tl", "try", "lira", "lir", "₺", "لیر", "لیره"),
+    "EUR": ("eur", "euro", "euros", "€", "یورو"),
+    "USD": ("usd", "dollar", "dollars", "$", "دلار"),
+    "GBP": ("gbp", "pound", "pounds", "£", "پوند"),
+    "TOMAN": ("toman", "tuman", "تومان", "تومن"),
+}
 
 # "Hamed Shams, [24 Jul 2026 at 21:46:10 (24 Jul 2026 at 23:45:01)]:"  (the part in parentheses is the edit time)
 # Tolerant on purpose: the comma, the spaces and the trailing colon are all optional.
@@ -40,6 +48,8 @@ AMOUNT_WORDS = frozenset((
     "k", "bin", "hezar", "m", "million", "milyon", "لیر", "لیره", "تومان", "تومن", "یورو", "دلار", "پوند", "هزار", "میلیون",
 ))
 AMOUNT_TOKEN = re.compile(r"[\d.,]+(tl|try|k|m|eur|usd|gbp)?")
+NUMBER = re.compile(r"(?<![\w.,])(\d[\d.,]*)\s*(k|bin|hezar|m|milyon|million)?(?![\w.,])", re.IGNORECASE)
+MULTIPLIER = {"k": 1000, "bin": 1000, "hezar": 1000, "m": 1_000_000, "milyon": 1_000_000, "million": 1_000_000}
 DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
 GROCERIES_PREFIX = "groceries - "  # the prefix the prompt adds to grocery stores
 
@@ -79,7 +89,7 @@ class ImportResult:
     def describe(self) -> str:
         lines = [f"Found {self.found} message(s); queued {self.imported} for the next sync."]
         if self.held:
-            lines.append(f"⚠️ Held back {len(self.held)} that look already in the sheet (same day, same wording; the amount is not compared). "
+            lines.append(f"⚠️ Held back {len(self.held)} that are already in the sheet (same day, same wording, same amount and currency). "
                          "Nothing was queued for them. /review lists them; /review keep <n> queues one anyway, /review done <n> closes it:")
             lines.extend(f"  • {item}" for item in self.held[:MAX_LISTED])
             if len(self.held) > MAX_LISTED:
@@ -184,11 +194,11 @@ def import_messages(
         known_ids.add(message.message_id)
         known_keys.add(key)
         candidates = on_sheet.get(day, []) + (on_sheet.get(message.sent_at.date(), []) if message.sent_at.date() != day else [])
-        match = find_duplicate(message.text, candidates)
+        match = find_duplicate(message.text, candidates, settings)
         if match is not None:
             where = f"row {match.row}: {match.date:%d/%m/%Y} · {match.description} · {_amount(match)}"
             held.append((message.message_id, message.sender, message.sent_at, message.edited_at, message.text,
-                         f"looks already in the sheet ({where}); the amount was not compared. /review keep queues it anyway"))
+                         f"already in the sheet ({where}): same day, wording, amount and currency. /review keep queues it anyway"))
             held_lines.append(f"{message.sent_at:%d/%m/%Y %H:%M} {message.sender}: “{_excerpt(message.text)}” ≈ {where}")
             continue
         rows.append((message.message_id, message.sender, message.sent_at, message.edited_at, message.text, ""))
@@ -206,31 +216,86 @@ def by_day(entries: list[SheetEntry]) -> dict[date, list[SheetEntry]]:
     return index
 
 
-def find_duplicate(text: str, entries: list[SheetEntry]) -> SheetEntry | None:
-    """The first sheet row of the same day whose description matches the message's wording, or None."""
-    for entry in entries:
-        if same_wording(text, entry.description):
-            return entry
+def find_duplicate(text: str, entries: list[SheetEntry], settings: Settings) -> SheetEntry | None:
+    """The first sheet row of the same day that one of the message's items repeats, or None."""
+    for item in text.split("\n\n"):  # a message may list several items, separated by blank lines
+        for entry in entries:
+            if same_item(item, entry, settings.default_currency):
+                return entry
     return None
 
 
-def same_wording(text: str, description: str) -> bool:
-    """True when the words that describe the purchase are the same, ignoring amounts, currencies, digits, case and symbols.
+def same_item(item: str, entry: SheetEntry, default_currency: str) -> bool:
+    """True when an item of a message and a sheet row say the same thing: same describing words, same amount, same currency.
 
-    "Migros 450 tl" matches "Groceries - Migros"; "Barbershop 💈 (arash) 604 TL" matches "Barbershop"; a message that
-    lists several items matches a row for any one of them. Amounts are deliberately not compared.
+    Words are compared without amounts, currency words, digits, symbols and case, and without the "Groceries - " prefix
+    the prompt adds, so "Migros 450 tl" and "Migros 450" both repeat a row "Groceries - Migros · 450 TRY", while
+    "Migros - Water 400 TL" does not repeat "Migros · 400 TRY" and "Migros 400" does not repeat "Migros · 450 TRY".
     """
-    if description.casefold().startswith(GROCERIES_PREFIX):
-        description = description[len(GROCERIES_PREFIX):]
-    ours, theirs = set(_describing_words(text)), set(_describing_words(description))
-    if not ours or not theirs:
+    ours, theirs = _describing_words(item), _describing_words(entry.description)
+    if not ours or not theirs or set(ours) != set(theirs):
         return False
-    return theirs <= ours or ours <= theirs
+    if _currency_of(item, default_currency) != entry.currency.strip().upper():
+        return False
+    amount = _amount_value(entry.amount)
+    return amount is not None and any(abs(candidate - amount) < 0.005 for candidate in _amounts_in(item))
 
 
 def _describing_words(text: str) -> list[str]:
-    cleaned = re.sub(r"[^\w\s]", " ", text.translate(DIGITS).casefold())
+    lowered = text.translate(DIGITS).casefold().strip()
+    if lowered.startswith(GROCERIES_PREFIX):
+        lowered = lowered[len(GROCERIES_PREFIX):]
+    cleaned = re.sub(r"[^\w\s]", " ", lowered)
     return [word for word in cleaned.split() if word not in AMOUNT_WORDS and not AMOUNT_TOKEN.fullmatch(word)]
+
+
+def _currency_of(text: str, default_currency: str) -> str:
+    lowered = text.casefold()
+    words = set(re.sub(r"[^\w\s€$£₺]", " ", lowered).split())
+    for code, markers in CURRENCY_WORDS.items():
+        if any(marker in words or (not marker.isalpha() and marker in lowered) for marker in markers):
+            return code
+    return default_currency
+
+
+def _amounts_in(text: str) -> set[float]:
+    """Every number in the text, times k or m, read every way its separators can be meant.
+
+    "1,158.4" is 1158.4 (the last separator is the decimal point when both appear); "266.50" is 266.5; "1.250" and
+    "1,250" are 1250 or 1.25, so both readings count; "1.234.567" groups thousands.
+    """
+    found: set[float] = set()
+    for digits, suffix in NUMBER.findall(text.translate(DIGITS)):
+        factor = MULTIPLIER.get(suffix.lower(), 1) if suffix else 1
+        separators = [ch for ch in digits if ch in ".,"]
+        if not separators:
+            readings = {digits}
+        elif len(set(separators)) == 2:
+            decimal = separators[-1]
+            readings = {digits.replace("," if decimal == "." else ".", "").replace(decimal, ".")}
+        elif len(separators) > 1:
+            readings = {digits.replace(",", "").replace(".", "")}
+        else:
+            after = len(digits) - digits.index(separators[0]) - 1
+            readings = {digits.replace(",", ".")} if after != 3 else {digits.replace(",", "."), digits.replace(",", "").replace(".", "")}
+        for reading in readings:
+            try:
+                found.add(float(reading) * factor)
+            except ValueError:
+                continue
+    return found
+
+
+def _amount_value(value: object) -> float | None:
+    """A sheet amount as a number; text such as "₺674" is read too, a note across the row is not."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    match = NUMBER.search(str(value).translate(DIGITS))
+    if not match or len(str(value)) > 24:
+        return None
+    return next(iter(sorted(_amounts_in(match.group(0)))), None)
 
 
 def _amount(entry: SheetEntry) -> str:
