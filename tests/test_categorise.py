@@ -61,12 +61,29 @@ def test_a_wrong_answer_is_reported_and_the_row_stays_unanswered(settings):
     assert result.mapping == {} and result.unanswered == [5] and len(result.problems) == 2
 
 
+def test_all_mode_rechecks_every_row_and_writes_only_what_changes(settings):
+    found = candidates(store_with(settings, ROWS), 5, 9, everything=True)
+    assert [(c.row, c.current) for c in found] == [(5, ""), (7, ""), (8, "Eating Out")]
+    client = FakeClient(['{"rows": [{"row": 5, "category": "Leisure & Travel"}, {"row": 7, "category": "Groceries"}, {"row": 8, "category": "Eating Out"}]}'])
+    result = plan(client, settings, found, ["Groceries", "Eating Out", "Leisure & Travel"])
+    assert result.changes() == {5: "Leisure & Travel", 7: "Groceries"}  # row 8 already says Eating Out
+    text = result.describe()
+    assert "3 row(s) re-checked" in text and "2 would change" in text and "G8" not in text
+    store = store_with(settings, ROWS, categories={8: "Eating Out"})
+    assert apply(store, result.changes(), {c.row: c.current for c in found}) == "G5:G7"
+    # a re-check that would overwrite a cell someone changed meanwhile is refused
+    store = store_with(settings, ROWS, categories={7: "Shopping"})
+    with pytest.raises(RuntimeError, match="G7 holds 'Shopping'"):
+        apply(store, {7: "Groceries"}, {7: ""})
+    assert store.target.batches == []
+
+
 def test_apply_writes_only_the_category_cells_and_refuses_a_filled_one(settings):
     store = store_with(settings, ROWS)
     assert apply(store, {5: "Leisure & Travel", 7: "Groceries"}) == "G5:G7"
     assert store.target.batches == [[{"range": "G5", "values": [["Leisure & Travel"]]}, {"range": "G7", "values": [["Groceries"]]}]]
     store = store_with(settings, ROWS, categories={7: "Eating Out"})
-    with pytest.raises(RuntimeError, match="G7 already holds 'Eating Out'"):
+    with pytest.raises(RuntimeError, match="G7 holds 'Eating Out'"):
         apply(store, {5: "Leisure & Travel", 7: "Groceries"})
     assert store.target.batches == []  # nothing at all was written
     assert apply(store, {}) == ""

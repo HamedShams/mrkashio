@@ -6,7 +6,8 @@
     python bot.py sync --dry-run  call Claude and print the rows, but write nothing and message nobody
     python bot.py backfill FILE   queue older messages from a pasted dump or a Telegram Desktop JSON export
     python bot.py init-sheet      build the Summary report tab (add --rewrite to replace an existing one)
-    python bot.py categorise      fill in the empty category cells of hand-entered rows (--rows 5:152, --dry-run)
+    python bot.py categorise      fill in the empty category cells of hand-entered rows (--rows 5:152, --dry-run);
+                                  --all re-checks every row and rewrites only the categories that change
     python bot.py resync          re-extract messages that already have rows, so the rows follow the current prompt
                                   rules (--since 2026-07-30, --dry-run); rows are updated in place
 
@@ -964,8 +965,8 @@ def cli_backfill(settings: Settings, path: str, since: date | None) -> int:
     return 0
 
 
-def cli_categorise(settings: Settings, rows: str | None, dry_run: bool) -> int:
-    """Categorise rows that have a description but no category; writes only those category cells."""
+def cli_categorise(settings: Settings, rows: str | None, dry_run: bool, everything: bool = False) -> int:
+    """Categorise rows that have a description but no category (or, with `everything`, re-check all); writes only category cells."""
     app = Kashio(settings)
     if not app.can_sync:
         print(app.status_text())
@@ -978,12 +979,13 @@ def cli_categorise(settings: Settings, rows: str | None, dry_run: bool) -> int:
     if first < 2 or last < first:
         print("--rows must start at 2 or later and end at or after its start")
         return 1
-    found = category_candidates(app.store, first, last)
+    found = category_candidates(app.store, first, last, everything)
     if not found:
         print(f"Every row in {first}:{last} with a description already has a category. Nothing to do.")
         return 0
     categories = clean_categories(app.store.category_options())
-    print(f"{len(found)} row(s) in {first}:{last} have a description but no category. Categories: {', '.join(categories)}")
+    print(f"{len(found)} row(s) in {first}:{last} {'to re-check' if everything else 'have a description but no category'}. "
+          f"Categories: {', '.join(categories)}")
     result = plan_categories(app.claude, settings, found, categories)
     print(result.describe())
     cost = (result.input_tokens * settings.price_input_per_million + result.output_tokens * settings.price_output_per_million) / 1_000_000
@@ -991,8 +993,9 @@ def cli_categorise(settings: Settings, rows: str | None, dry_run: bool) -> int:
     if dry_run:
         print("Dry run: nothing written. Run again without --dry-run to write these category cells.")
         return 0
-    written = apply_categories(app.store, result.mapping)
-    print(f"Wrote {len(result.mapping)} category cell(s) within {settings.sheet_tab!r}!{written}; no other cell was touched.")
+    changes = result.changes()
+    written = apply_categories(app.store, changes, {c.row: c.current for c in found})
+    print(f"Wrote {len(changes)} category cell(s) within {settings.sheet_tab!r}!{written or '-'}; no other cell was touched.")
     return 0 if not result.unanswered else 1
 
 
@@ -1053,6 +1056,7 @@ def main() -> None:
     cat_parser = commands.add_parser("categorise", help="fill in the empty category cells of rows that have a description; one Claude call")
     cat_parser.add_argument("--rows", metavar="FIRST:LAST", help="row range to look at (default: every row of the tab)")
     cat_parser.add_argument("--dry-run", action="store_true", help="print the proposed categories, write nothing")
+    cat_parser.add_argument("--all", dest="everything", action="store_true", help="re-check every row that has a description; rewrite only the categories that change")
     resync_parser = commands.add_parser("resync", help="re-extract messages that already have rows so the rows follow the current prompt rules")
     resync_parser.add_argument("--since", type=date.fromisoformat, metavar="YYYY-MM-DD", help="only messages sent on or after this day")
     resync_parser.add_argument("--dry-run", action="store_true", help="list what would be re-extracted, change nothing")
@@ -1073,7 +1077,7 @@ def main() -> None:
         elif args.command == "init-sheet":
             sys.exit(cli_init_sheet(settings, args.rewrite))
         elif args.command == "categorise":
-            sys.exit(cli_categorise(settings, args.rows, args.dry_run))
+            sys.exit(cli_categorise(settings, args.rows, args.dry_run, args.everything))
         elif args.command == "resync":
             sys.exit(cli_resync(settings, args.since, args.dry_run))
         else:

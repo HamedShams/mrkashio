@@ -519,7 +519,7 @@ class SheetStore:
         keep = min(len(old), len(rows))
         if keep:
             for row_number, row in zip(old[:keep], rows[:keep]):
-                self._write_rows(row_number, [row])
+                self._write_rows(row_number, [row], notes=False)  # the row already carries this message's note
             result.updated = keep
         for row_number in sorted(old[keep:], reverse=True):  # bottom-up, so earlier row numbers stay valid
             current = _retry(lambda: self.target.get_notes(grid_range=f"{self.columns.date}{row_number}"))
@@ -535,8 +535,8 @@ class SheetStore:
             result.rows = old[:keep]
         return result
 
-    def _write_rows(self, start: int, rows: Sequence[TransactionRow]) -> None:
-        """Values for the configured columns, the currency formats, and the provenance notes."""
+    def _write_rows(self, start: int, rows: Sequence[TransactionRow], notes: bool = True) -> None:
+        """Values for the configured columns, the currency formats, and (for new rows) the provenance notes."""
         c = self.columns
         end = start + len(rows) - 1
         updates = [
@@ -548,6 +548,8 @@ class SheetStore:
         ]
         _retry(lambda: self.target.batch_update(copy.deepcopy(updates), value_input_option="USER_ENTERED"))
         self._apply_currency_formats(start, [r.currency for r in rows])
+        if not notes:
+            return
         try:
             _retry(lambda: self.target.insert_notes({f"{c.date}{start + i}": f"{NOTE_PREFIX}{r.message_id}" for i, r in enumerate(rows)}))
         except APIError as exc:  # provenance is needed for later edits, but must not lose the data write

@@ -43,7 +43,7 @@ CURRENCY_SYMBOLS = {"TRY": "₺", "EUR": "€", "USD": "$", "GBP": "£"}
 MAX_REVIEW_ITEMS_IN_REPORT = 12
 MAX_REVIEW_ITEMS_IN_SUMMARY = 5
 NOTE_ONLY_TEXT = "[note]"
-REVISION_PAUSE_SECONDS = 2.0  # between revisions when there are many: each takes a few writes and Google counts writes per minute
+REVISION_PAUSE_SECONDS = 2.5  # between revisions when there are many: two writes each, Google allows 60 writes a minute per user
 MANY_REVISIONS = 5
 
 

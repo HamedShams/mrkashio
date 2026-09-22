@@ -139,18 +139,21 @@ All settings are environment variables. Defaults in **bold**.
 
 ### Categories and currencies
 
-Column G receives a category. The allowed names are read from **the sheet itself** at every sync: the bot looks at the dropdown on column G of the target tab and uses exactly those values, so the dropdown, your Summary formulas and the bot can never disagree. In Google's budget template that dropdown is fed from the category table in the Summary tab (`Summary!B28:B35`), so editing that table is all it takes to change categories. Placeholders such as "Custom category 1" are ignored; if the column has no dropdown, the same eight names below are the built-in fallback (`DEFAULT_CATEGORIES` in `extractor.py`). Short hints for common names live in `CATEGORY_HINTS` in the same file.
+Column G receives a category. The allowed names are read from **the sheet itself** at every sync: the bot looks at the dropdown on column G of the target tab and uses exactly those values, so the dropdown, your Summary formulas and the bot can never disagree. In Google's budget template that dropdown is fed from the category table in the Summary tab (`Summary!B28:B35`), so editing that table is all it takes to change categories. Placeholders such as "Custom category 1" are ignored; if the column has no dropdown, the same nine names below are the built-in fallback (`DEFAULT_CATEGORIES` in `extractor.py`). Short hints for common names live in `CATEGORY_HINTS` in the same file.
 
 | Category | Covers |
 |---|---|
 | Groceries | supermarkets, markets, bakeries, water and other food for home |
 | Eating Out | restaurants, cafes, coffee, bars, takeaway, delivery |
 | Transport | taxi, Uber, Istanbulkart and public transport, fuel, parking |
-| Housing & Utilities | rent, electricity, water, gas, internet, phone bills, home supplies, furniture (an IKEA desk), repairs |
+| Housing & Utilities | rent, deposit, building fees, electricity, water, gas, the home internet (WiFi) bill, home supplies, furniture (an IKEA desk), repairs |
 | Health & Personal Care | pharmacy, doctor, dentist, hospital, tests, insurance, barber, cosmetics, hygiene, gym |
 | Shopping | clothes, shoes, electronics, gifts, malls and general retail not covered elsewhere |
-| Leisure & Travel | entertainment, cinema, concerts, subscriptions, hobbies, hotels, flights, tours, trips |
-| Other | fees, bank and government charges, documents, services, anything that fits nowhere else |
+| Leisure & Travel | going out and going away: cinema, concerts, events, hobbies, games, hotels, flights, tours, trips |
+| Subscriptions | recurring paid services that are not a home utility: mobile data packages and SIM top-ups, app and software plans (Cursor, ChatGPT, Apple One), memberships such as Uber One |
+| Other | fees, bank and government charges, documents, services, money transfers, anything that fits nowhere else |
+
+The line between the last three matters: a recurring charge (a Turkcell data package, Cursor, Apple One) is a Subscription, the home WiFi bill is a utility, an Istanbulkart top-up is Transport, and Leisure & Travel never takes a recurring service. To add a category, type its name in the next free cell of the Summary tab's category list; to re-check the whole history against a changed list, run `python bot.py categorise --all --dry-run` and then without `--dry-run` (only the category cells that change are written).
 
 Column D receives one of TRY, TOMAN, EUR, USD, GBP (`Currency` in `extractor.py`); Turkish, English, German and Persian currency words and Persian digits are understood. Wording rules, store names and examples live in `prompt.md`.
 
@@ -176,6 +179,7 @@ python bot.py sync            # one real sync from the terminal
 python bot.py backfill FILE   # queue older messages from a paste (.txt) or a Telegram Desktop export (.json)
 python bot.py init-sheet      # build the Summary report tab; --rewrite replaces an existing one, keeping its exchange rates
 python bot.py categorise --rows 5:152 --dry-run   # propose categories for hand-entered rows that have none; drop --dry-run to write them
+python bot.py categorise --all --dry-run          # re-check every row against the current category list; writes only what changes
 python bot.py resync --since 2026-07-30           # re-extract messages that already have rows so the rows follow the current prompt rules
 python bot.py                 # run the bot locally (stop it before deploying: two pollers on one token conflict)
 ```

@@ -68,6 +68,7 @@ Pick exactly one category per transaction from this list, judging by what was pa
 
 - Descriptions come in English, German, Turkish or Persian, often a single word. Judge by meaning, not by the word: "Lieferung" and "kargo" are delivery (Transport), "havale" and "Überweisung" are money transfers (Other), "kira" is rent (Housing & Utilities), "eczane" is a pharmacy (Health & Personal Care), "nan" or "ekmek" is bread (Groceries).
 - Categorise the service paid for, not the place: a delivery fee is Transport even when food was delivered; the food order itself is Eating Out.
+- A recurring paid service that is not a home utility is a subscription: mobile data packages and SIM top-ups (Turkcell), app and software plans (Cursor, ChatGPT, Apple One), memberships (Uber One). The home WiFi or internet bill stays with the home utilities, and a transport card top-up (Istanbulkart) is Transport. Leisure & Travel is for going out and going away, never for a recurring service.
 - When a merchant sells many things, prefer what was most likely bought there ("Cafe IKEA" is a cafe; "IKEA" alone is home furniture).
 - Use Other only when nothing else fits. Category names in the examples below are illustrative; always use a name from the list above.
 
@@ -152,6 +153,14 @@ Message (id 18, sent 2026-08-02 13:20): "🍆
 54 TL"
 Result: {"description": "Eggplant 🍆", "amount": 54, "currency": "TRY", "category": "Groceries", "date": null}
 
+Message (id 25): "Apple one
+26 euro"
+Result: {"description": "Apple one", "amount": 26, "currency": "EUR", "category": "Subscriptions", "date": null}
+
+Message (id 26): "Turkcell Internet Package (30GB) Shiva's line
+400 TL"
+Result: {"description": "Turkcell Internet Package (30GB) Shiva's line", "amount": 400, "currency": "TRY", "category": "Subscriptions", "date": null}
+
 Message (id 22): "Trendyol (Lamp + Nespresso)
 2192-1200
 = 992 TL"
@@ -188,7 +197,7 @@ Sep 8
 Portakal su 160 TL
 
 UBER to IGDAŞ 174 TL
-Result: three transactions. {"description": "UBER ONE Subscription", "amount": 250, "currency": "TRY", "category": "Transport", "date": "2026-09-03"}, {"description": "Portakal su", "amount": 160, "currency": "TRY", "category": "Groceries", "date": "2026-09-08"} and {"description": "UBER to IGDAŞ", "amount": 174, "currency": "TRY", "category": "Transport", "date": "2026-09-08"}
+Result: three transactions. {"description": "UBER ONE Subscription", "amount": 250, "currency": "TRY", "category": "Subscriptions", "date": "2026-09-03"}, {"description": "Portakal su", "amount": 160, "currency": "TRY", "category": "Groceries", "date": "2026-09-08"} and {"description": "UBER to IGDAŞ", "amount": 174, "currency": "TRY", "category": "Transport", "date": "2026-09-08"}
 
 # Output
 

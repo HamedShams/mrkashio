@@ -259,20 +259,21 @@ Sheet columns written: **B** date, **C** amount (number), **D** currency, **E** 
 
 ### Categories (column G): read from the sheet at every sync
 
-Column G carries a dropdown fed from the category table in `Summary!B28:B35`, which the Summary's SUMIF formulas also use. The bot imposes no list: at each sync it reads the dropdown's allowed values, drops template placeholders, builds the output schema with exactly those names, and lists them in the prompt with a one-line hint where one is known. Editing the Summary table is all it takes to change categories. On 8 Sep 2026 the list was reduced, with the operator's approval, to eight MECE names (the planned £750 stays on the housing row):
+Column G carries a dropdown fed from the category table in `Summary!B28:B35`, which the Summary's SUMIF formulas also use. The bot imposes no list: at each sync it reads the dropdown's allowed values, drops template placeholders, builds the output schema with exactly those names, and lists them in the prompt with a one-line hint where one is known. Editing the Summary table is all it takes to change categories. On 8 Sep 2026 the list was reduced, with the operator's approval, to eight MECE names (the planned £750 stays on the housing row); on 22 Sep 2026 a ninth, Subscriptions, was added after Cursor and Apple One landed in Leisure & Travel (root cause: the Leisure & Travel hint listed "subscriptions", so the model followed the list it was given; the hint now excludes recurring services and Housing & Utilities no longer names phone bills):
 
 | Category | Covers |
 |---|---|
 | Groceries | supermarkets, markets, bakeries, water and other food for home |
 | Eating Out | restaurants, cafes, coffee, bars, takeaway, delivery |
 | Transport | taxi, Uber, Istanbulkart and public transport, fuel, parking |
-| Housing & Utilities | rent, electricity, water, gas, internet, phone bills, home supplies, furniture (an IKEA desk), repairs |
+| Housing & Utilities | rent, deposit, building fees, electricity, water, gas, the home internet (WiFi) bill, home supplies, furniture (an IKEA desk), repairs |
 | Health & Personal Care | pharmacy, doctor, dentist, hospital, tests, insurance, barber, cosmetics, hygiene, gym |
 | Shopping | clothes, shoes, electronics, gifts, malls and general retail not covered elsewhere |
-| Leisure & Travel | entertainment, cinema, concerts, subscriptions, hobbies, hotels, flights, tours, trips |
-| Other | fees, bank and government charges, documents, services, anything that fits nowhere else |
+| Leisure & Travel | going out and going away: cinema, concerts, events, hobbies, games, hotels, flights, tours, trips |
+| Subscriptions | recurring paid services that are not a home utility: mobile data packages and SIM top-ups, app and software plans (Cursor, ChatGPT, Apple One), memberships such as Uber One |
+| Other | fees, bank and government charges, documents, services, money transfers, anything that fits nowhere else |
 
-If column G ever has no dropdown, this same list is the built-in fallback (`DEFAULT_CATEGORIES` in `extractor.py`). Adding a ninth row to the Summary table (for example "Fees & Services") is all it takes to split one out again.
+If column G ever has no dropdown, this same list is the built-in fallback (`DEFAULT_CATEGORIES` in `extractor.py`). Adding a row to the Summary table's category list is all it takes to split a category out; `python bot.py categorise --all` then re-checks every row and rewrites only the category cells that change (each cell is verified to still hold the value that was read before it is overwritten).
 
 ---
 
@@ -308,7 +309,7 @@ If you want those extra details in the sheet, write them in the Telegram message
 - `/sync` processes everything pending when ≥ `MANUAL_MIN_MESSAGES` (1); otherwise "nothing new".
 - Thinking effort `high`.
 - Messages stored in `Bot_Inbox`; runs in `Bot_Runs`; every run report also sent to your private chat with the bot. No database, no file.
-- Column F (the "By" dropdown: member names) left empty as asked; column G gets a category read from the sheet's own dropdown, now the eight names above; column D one of TRY, TOMAN, EUR, USD, GBP.
+- Column F (the "By" dropdown: member names) left empty as asked; column G gets a category read from the sheet's own dropdown, now the nine names above; column D one of TRY, TOMAN, EUR, USD, GBP.
 - History: older messages come in through `/backfill` (paste) or `backfill FILE`; anything the inbox or the sheet already has is skipped or held for `/review`; live messages are written whatever their date.
 - Guardrail: new rows only ever go below the last used row, after the destination cells are verified empty; rows the bot wrote are updated or removed only through their provenance note when their message is edited or deleted, each re-checked before deletion; other rows and columns are never touched.
 - Pairing via `/setup`, stored in the sheet; env vars are optional overrides.

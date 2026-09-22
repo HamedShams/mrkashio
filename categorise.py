@@ -1,10 +1,12 @@
-"""Fill in missing categories on rows entered by hand: `python bot.py categorise [--rows 5:152] [--dry-run]`.
+"""Fill in or re-check categories: `python bot.py categorise [--rows 5:152] [--all] [--dry-run]`.
 
 Rows of the transactions tab whose category cell is empty and whose description is not are sent to Claude
 once (plain JSON at the configured effort, validated locally, categories limited to the sheet's own list) and
-nothing but those category cells is written, each re-checked to be still empty right before the write. Lines
-without a description (a note typed across a row, a blank line) are left alone. The one paid call is the
-same kind the sync makes; a dry run prints the proposed categories and writes nothing.
+nothing but those category cells is written, each re-checked to be still empty right before the write. With
+`--all`, every row that has a description is re-checked and only the cells whose category would change are
+written, so a new or redefined category can be applied to the whole history. Lines without a description (a
+note typed across a row, a blank line) are left alone. The one paid call is the same kind the sync makes; a
+dry run prints the proposed categories and writes nothing.
 """
 
 from __future__ import annotations
@@ -45,6 +47,7 @@ class Candidate:
     amount: object
     currency: str
     description: str
+    current: str = ""  # the category the row has now (empty when it has none)
 
 
 @dataclass
@@ -63,12 +66,20 @@ class Plan:
             counts[category] = counts.get(category, 0) + 1
         return dict(sorted(counts.items(), key=lambda item: -item[1]))
 
+    def changes(self) -> dict[int, str]:
+        """The rows whose category would actually change."""
+        current = {c.row: c.current for c in self.candidates}
+        return {row: category for row, category in self.mapping.items() if current.get(row, "") != category}
+
     def describe(self) -> str:
         by_row = {c.row: c for c in self.candidates}
-        lines = [f"{len(self.candidates)} row(s) without a category; Claude answered {len(self.mapping)}."]
-        for row in sorted(self.mapping):
+        rechecking = any(c.current for c in self.candidates)
+        lines = [f"{len(self.candidates)} row(s) {'re-checked' if rechecking else 'without a category'}; Claude answered {len(self.mapping)}; "
+                 f"{len(self.changes())} would change."]
+        for row in sorted(self.changes()):
             c = by_row[row]
-            lines.append(f"  G{row}: {self.mapping[row]:<24} ← {c.date} · {c.amount} {c.currency} · {c.description}")
+            was = f"{c.current} → " if c.current else ""
+            lines.append(f"  G{row}: {was}{self.mapping[row]:<24} ← {c.date} · {c.amount} {c.currency} · {c.description}")
         if self.counts():
             lines.append("Per category: " + ", ".join(f"{name} {n}" for name, n in self.counts().items()))
         if self.unanswered:
@@ -83,8 +94,8 @@ def answer_model(categories: Sequence[str]) -> type[BaseModel]:
     return create_model("CategoryAnswer", rows=(list[row_model], ...))
 
 
-def candidates(store: SheetStore, first_row: int, last_row: int) -> list[Candidate]:
-    """Rows in the range with a description but no category. Notes across a row have no description and are skipped."""
+def candidates(store: SheetStore, first_row: int, last_row: int, everything: bool = False) -> list[Candidate]:
+    """Rows in the range with a description and (unless `everything`) no category. Notes across a row have no description and are skipped."""
     c = store.columns
     first, last = min(c.written, key=c.index), max(c.written, key=c.index)
     offset = {name: c.index(getattr(c, name)) - c.index(first) for name in ("date", "amount", "currency", "description", "category")}
@@ -94,11 +105,11 @@ def candidates(store: SheetStore, first_row: int, last_row: int) -> list[Candida
     for index, row in enumerate(values):
         row = list(row) + [""] * (width - len(row))
         description, category = str(row[offset["description"]]).strip(), str(row[offset["category"]]).strip()
-        if not description or category:
+        if not description or (category and not everything):
             continue
         when = _as_date(row[offset["date"]])
         found.append(Candidate(first_row + index, when.strftime("%d/%m/%Y") if when else str(row[offset["date"]]),
-                               row[offset["amount"]], str(row[offset["currency"]]).strip(), description))
+                               row[offset["amount"]], str(row[offset["currency"]]).strip(), description, category))
     return found
 
 
@@ -148,8 +159,9 @@ def _ask(client: anthropic.Anthropic, settings: Settings, system: str, chunk: Se
     return {entry.row: entry.category for entry in parsed.rows}
 
 
-def apply(store: SheetStore, mapping: dict[int, str]) -> str:
-    """Write the category cells, and only those, after checking that each is still empty. Returns the range written."""
+def apply(store: SheetStore, mapping: dict[int, str], expected: dict[int, str] | None = None) -> str:
+    """Write the category cells, and only those, after checking that each still holds what was read (empty, or the value
+    in `expected` when re-checking). Returns the range written."""
     if not mapping:
         return ""
     column = store.columns.category
@@ -157,8 +169,9 @@ def apply(store: SheetStore, mapping: dict[int, str]) -> str:
     current = _retry(lambda: store.target.get_values(f"{column}{first}:{column}{last}"))
     for row in mapping:
         cell = current[row - first] if row - first < len(current) else []
-        if cell and str(cell[0]).strip():
-            raise RuntimeError(f"refusing to write: {column}{row} already holds {cell[0]!r}; nothing was written")
+        value = str(cell[0]).strip() if cell else ""
+        if value != (expected or {}).get(row, ""):
+            raise RuntimeError(f"refusing to write: {column}{row} holds {value!r}, not what was read a moment ago; nothing was written")
     updates = [{"range": f"{column}{row}", "values": [[category]]} for row, category in sorted(mapping.items())]
     _retry(lambda: store.target.batch_update(updates, value_input_option="RAW"))
     return f"{column}{first}:{column}{last}"

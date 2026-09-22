@@ -16,6 +16,13 @@ def test_clean_categories_drops_placeholders_and_duplicates_and_falls_back():
     assert clean_categories(["Custom category 2"]) == list(DEFAULT_CATEGORIES)
 
 
+def test_default_categories_include_subscriptions_and_leisure_no_longer_claims_them():
+    from extractor import CATEGORY_HINTS
+    assert "Subscriptions" in DEFAULT_CATEGORIES and DEFAULT_CATEGORIES[-1] == "Other" and len(DEFAULT_CATEGORIES) == 9
+    assert "subscription" not in CATEGORY_HINTS["leisure & travel"] and "Cursor" in CATEGORY_HINTS["subscriptions"]
+    assert "phone" not in CATEGORY_HINTS["housing & utilities"] and "WiFi" in CATEGORY_HINTS["housing & utilities"]
+
+
 def test_result_model_limits_category_to_the_sheet_list():
     model = result_model(["Groceries", "Other"])
     schema = TypeAdapter(model).json_schema()
