@@ -121,6 +121,6 @@ def test_review_items_are_the_open_doubts_and_held_imports(settings):
                                                                  (50, STATUS_NEEDS_REVIEW, "no amount given")]
 
 
-def test_stored_keys_recognise_a_live_message_pasted_back(settings):
+def test_stored_texts_recognise_a_live_message_pasted_back(settings):
     store = store_with(settings, ["78", "Alex", "2026-09-19 14:02:37", "", "Migros  450 tl", STATUS_PROCESSED, "", "1", ""])
-    assert ("2026-09-19 14:02", "migros 450 tl") in store.stored_message_keys()
+    assert store.stored_texts() == {"migros 450 tl": [at(2026, 9, 19, 14, 2).replace(second=37)]}

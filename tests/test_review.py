@@ -95,3 +95,34 @@ def test_review_is_a_command(settings):
     from tests.test_bot import first_matching_handler, update_for
     application = bot.build_application(SimpleNamespace(settings=settings))
     assert first_matching_handler(application, update_for("/review keep 1", chat_type=Chat.PRIVATE)).callback is bot.on_review
+
+
+def test_a_long_paste_right_after_backfill_waits_for_the_rest(settings):
+    """Telegram cuts messages at 4096 characters; the first chunk arrives as '/backfill …' and the rest as plain text."""
+    sent, chat_data, jobs = [], {}, []
+    app = app_with(settings, [])
+    app.store = object()
+    long_body = "Sam, [3 Sep 2026 at 09:59:44]:\nCafe 225 TL\n" * 120  # about 5,000 characters
+    message = SimpleNamespace(text="/backfill " + long_body, reply_text=lambda t, **k: _record(sent, t), chat_id=42)
+    chat = SimpleNamespace(id=42, type=Chat.PRIVATE)
+    update = SimpleNamespace(effective_chat=chat, effective_message=message, effective_user=SimpleNamespace(id=1, first_name="Alex"))
+    queue = SimpleNamespace(get_jobs_by_name=lambda name: [], run_once=lambda *a, **k: jobs.append(k))
+    context = SimpleNamespace(application=SimpleNamespace(bot_data={"kashio": app}), chat_data=chat_data, job_queue=queue,
+                              bot=SimpleNamespace(username="kashio_bot", first_name="Kashio"))
+    asyncio.run(bot.on_backfill(update, context))
+    assert chat_data["capture"] == [long_body] and jobs and jobs[0]["when"] == bot.BACKFILL_QUIET_SECONDS
+    assert "Got the first part" in sent[-1]
+    # a short paste after the command is still imported at once (process_backfill is stubbed)
+    imported = []
+    bot_module_process = bot.process_backfill
+    bot.process_backfill = lambda *a: _done(imported.append(a[-1]))
+    try:
+        short = SimpleNamespace(text="/backfill Sam, [3 Sep 2026 at 09:59:44]:\nCafe 225 TL", reply_text=lambda t, **k: _record(sent, t), chat_id=42)
+        asyncio.run(bot.on_backfill(SimpleNamespace(effective_chat=chat, effective_message=short, effective_user=update.effective_user), context))
+    finally:
+        bot.process_backfill = bot_module_process
+    assert imported == ["Sam, [3 Sep 2026 at 09:59:44]:\nCafe 225 TL"]
+
+
+async def _done(_value=None):
+    return None

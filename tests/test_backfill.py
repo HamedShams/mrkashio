@@ -24,15 +24,15 @@ Istanbul card
 
 
 class StubStore:
-    def __init__(self, known=(), keys=(), on_sheet=()):
-        self.known, self.keys, self.on_sheet = set(known), set(keys), list(on_sheet)
+    def __init__(self, known=(), texts=None, on_sheet=()):
+        self.known, self.texts, self.on_sheet = set(known), dict(texts or {}), list(on_sheet)
         self.rows, self.held = [], []
 
     def stored_message_ids(self):
         return set(self.known)
 
-    def stored_message_keys(self):
-        return set(self.keys)
+    def stored_texts(self):
+        return {text: list(times) for text, times in self.texts.items()}
 
     def transaction_index(self):
         return list(self.on_sheet)
@@ -78,13 +78,25 @@ def test_telegram_desktop_json_export_is_parsed(settings):
     assert [(m.message_id, m.sender, m.text) for m in parsed.messages] == [(-5, "Sam", "Migros 1.250")]
 
 
-def test_import_skips_what_the_inbox_has_by_id_or_by_time_and_text(settings):
+def test_import_skips_what_the_inbox_has_by_id_or_by_text_and_time(settings):
     messages = parse(SAMPLE, settings).messages
-    store = StubStore(known=[messages[1].message_id], keys=[("2026-09-03 15:36", "istanbul card 400")])
+    # the live copy of "Istanbul card 400" was stored at 15:35:59; Telegram's copy shows 15:36:34 (rounded, another minute)
+    store = StubStore(known=[messages[1].message_id], texts={"istanbul card 400": [at(2026, 9, 3, 15, 35).replace(second=59)]})
     result = import_messages(store, settings, messages)
     assert (result.found, result.imported, result.before_start, result.duplicates, result.held) == (4, 2, 0, 2, [])
     assert [r[4] for r in store.rows] == ["A101\n2045", "295 TL"] and result.start is None
     assert "Skipped 2 already in the inbox" in result.describe() and "Dismissed" not in result.describe()
+
+
+def test_the_same_text_on_the_same_day_at_another_time_is_held_for_a_person(settings):
+    messages = parse(SAMPLE, settings).messages
+    store = StubStore(texts={"istanbul card 400": [at(2026, 9, 3, 9, 0)]})  # six hours earlier: probably the same, maybe not
+    result = import_messages(store, settings, messages)
+    assert result.imported == 3 and len(store.held) == 1 and store.held[0][4] == "Istanbul card \n400"
+    assert "recorded on this day at 09:00" in store.held[0][5] and "≈ recorded live at 09:00" in result.describe()
+    # on another day the same text is simply a new message
+    store = StubStore(texts={"istanbul card 400": [at(2026, 9, 2, 15, 36)]})
+    assert import_messages(store, settings, messages).imported == 4
 
 
 def test_a_message_repeating_a_sheet_row_of_the_same_day_is_held_not_queued(settings):
@@ -99,7 +111,7 @@ def test_a_message_repeating_a_sheet_row_of_the_same_day_is_held_not_queued(sett
     assert "row 161: 03/09/2026 · UBER to Metro Station · ₺84" in held["UBER to Metro Station\n84 TL"]
     assert "same day, wording, amount and currency" in held["UBER to Metro Station\n84 TL"]
     text = result.describe()
-    assert "Held back 1 that are already in the sheet" in text and "/review keep" in text and "≈ row 161" in text
+    assert "Held back 1 that look already recorded" in text and "/review keep" in text and "≈ row 161" in text
 
 
 def test_the_day_after_midnight_is_checked_against_both_calendar_days(settings):
@@ -122,6 +134,7 @@ def test_same_item_needs_the_same_words_amount_and_currency():
     assert not same_item("Migros - Water 450 TL", migros, "TRY")  # the user's own wording counts, prefixes included
     assert not same_item("Migros", migros, "TRY") and not same_item("450 TL", migros, "TRY")
     assert same_item("Barbershop 604 TL", entry("Barbershop", 604), "TRY")
+    assert same_item("Carre four\n1114", entry("Groceries - Carrefour", 1114), "TRY")  # spacing inside a name does not matter
     assert not same_item("Barbershop 💈 (arash)\n604 TL", entry("Barbershop", 604), "TRY")  # an extra word: not the same wording
     assert same_item("Migros 1.250", entry("Groceries - Migros", 1250), "TRY") and same_item("Havale 1,158.4 TL", entry("Havale", 1158.4), "TRY")
     assert same_item("taxi 350k toman", entry("taxi", 350000, "TOMAN"), "TRY")
@@ -147,3 +160,14 @@ def test_import_can_dismiss_everything_before_a_day_on_request(settings):
     assert result.imported == 3 and result.before_start == 1 and result.start == date(2026, 9, 3)
     text = result.describe()
     assert "Dismissed 1 dated before 03/09/2026" in text and "01/09/2026 21:14 Sam: A101 | 2045" in text
+
+
+def test_the_bots_own_messages_are_left_out_of_an_import(settings):
+    dump = SAMPLE + "\nMr Kashio, [8 Sep 2026 at 21:35:46]:\n✅ Kashio synced 3 expense(s) from 3 message(s) (₺1,596).\n"
+    parsed = parse(dump, settings, ignore_sender="Mr Kashio")
+    assert len(parsed.messages) == 4 and parsed.ignored == 1 and parsed.notes() == ["Left out 1 message(s) written by the bot itself."]
+    assert len(parse(dump, settings).messages) == 5  # without a name nothing is left out
+    export = {"messages": [{"id": 5, "type": "message", "date": "2026-08-01T10:00:00", "from": "Mr Kashio", "text": "✅ report"},
+                           {"id": 6, "type": "message", "date": "2026-08-01T10:00:00", "from": "Sam", "text": "Cafe 385"}]}
+    parsed = parse(json.dumps(export), settings, ignore_sender="Mr Kashio")
+    assert [m.text for m in parsed.messages] == ["Cafe 385"] and parsed.ignored == 1

@@ -27,6 +27,8 @@ Money received (salary, refund, someone paying us back) is not spending. Return 
 
 The description and the amount sometimes arrive as two consecutive messages from the same sender: "UBER", then a few minutes later "10 TL" (or the other way round). Treat the pair as ONE transaction. Put the transaction on the message that holds the description, and for the amount-only message return no transactions and set merged_into to the id of the description message. Only pair messages from the same sender that are close in time with nothing else from that sender in between. A description that never gets an amount, or an amount that never gets a description, is not a transaction: set needs_review to true and explain in note.
 
+An amount-only message that follows a message from the same sender which already had its own amount is a second purchase of the same kind, not a correction and not a merge: "Cafe / 225 TL", then "295 TL" an hour later, is a second "Cafe" row of 295. Give the amount-only message its own transaction with the previous message's description and leave merged_into null. Do this only within a few hours and when nothing else from that sender came in between.
+
 # Corrections
 
 If a message corrects an earlier message in the same batch ("the cafe was 450 not 400", "that A101 was in dollars"), apply the correction to the earlier message's result and return no transactions for the correcting message, with merged_into set to the id of the message it corrects. If the message it corrects is not in this batch, return no transactions, set needs_review to true and describe the correction in note.
@@ -34,6 +36,8 @@ If a message corrects an earlier message in the same batch ("the cafe was 450 no
 # Splitting
 
 One message may contain several transactions. Every title + amount pair is its own row. The amount may sit on the same line, on the next line, or after a dash or colon; blank lines usually separate items. Never merge two items, and never invent an item that has no amount.
+
+An amount inside a message that has no description of its own (a line such as "...305" or "207**") is not a transaction, but it must not vanish either: return the other items normally, set needs_review to true and name the unexplained amount in note, so a human can add it.
 
 # Amounts
 
@@ -66,6 +70,7 @@ Pick exactly one category per transaction from this list, judging by what was pa
 - Keep the author's wording and language. Do not translate ("nach hause" stays "nach hause"; Persian stays Persian).
 - Fix only obvious typos of one or two letters ("cofee" becomes "coffee"). Do not rephrase, expand or embellish, and never add details that are not in the message.
 - Remove emojis, decorative symbols and trailing punctuation. Collapse repeated spaces.
+- A description that is only an emoji still describes the purchase: write the word for what it depicts, in English ("🍆" → "Eggplant", "🍞" → "Bread", "☕" → "Coffee"), and categorise it by that meaning. This is the one case where an emoji is translated instead of removed.
 - Drop a person's first name that only says who provided the service ("Barbershop 💈 (arash)" becomes "Barbershop"). Keep words that describe what was bought ("A101 (oil)" becomes "Groceries - A101 (oil)").
 - Grocery stores get the prefix "Groceries - ". Known stores: A101, Migros, Şok, BİM, CarrefourSA, Macrocenter, Metro, File. Example: "A101" becomes "Groceries - A101".
 - Otherwise keep the original capitalization.
@@ -133,6 +138,22 @@ Result (no amount follows from this sender): no transactions. needs_review: true
 
 Message (id 15, sent 2026-07-29 10:00): "yesterday pharmacy 320 tl"
 Result: {"description": "pharmacy", "amount": 320, "currency": "TRY", "category": "Health & Personal Care", "date": "2026-07-28"}
+
+Message (id 18, sent 2026-08-02 13:20): "🍆
+54 TL"
+Result: {"description": "Eggplant", "amount": 54, "currency": "TRY", "category": "Groceries", "date": null}
+
+Message (id 19, sent 2026-09-03 12:01, sender Sam): "Cafe
+225 TL"
+Message (id 20, sent 2026-09-03 13:23, sender Sam): "295 TL"
+Result for id 19: {"description": "Cafe", "amount": 225, "currency": "TRY", "category": "Eating Out", "date": null}
+Result for id 20: {"description": "Cafe", "amount": 295, "currency": "TRY", "category": "Eating Out", "date": null}; merged_into: null (a second order, its own row)
+
+Message (id 21): "...305
+
+1 kg dana kıyma + 500 gr dana kuşbaşı
+1647"
+Result: one transaction, {"description": "1 kg dana kıyma + 500 gr dana kuşbaşı", "amount": 1647, "currency": "TRY", "category": "Groceries", "date": null}. needs_review: true. note: "amount 305 has no description"
 
 Message (id 17, sent 2026-09-16 17:04):
 Sep 3

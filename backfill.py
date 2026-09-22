@@ -19,8 +19,10 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 
 from config import Settings
-from sheets import STATUS_DUPLICATE, SheetEntry, SheetStore, message_key
+from sheets import STATUS_DUPLICATE, SheetEntry, SheetStore, normalised_text
 from sync import format_amount, rollover_date, split_note
+
+SAME_MESSAGE_SECONDS = 120  # Telegram's copy rounds send times (17:04:59 is shown as 17:05:00); within this, same text means same message
 
 CURRENCY_WORDS = {
     "TRY": ("tl", "try", "lira", "lir", "₺", "لیر", "لیره"),
@@ -67,12 +69,19 @@ class DumpMessage:
 class Parsed:
     messages: list[DumpMessage]
     unparsed: list[str]  # non-empty lines that appeared before any recognisable header
+    ignored: int = 0  # the bot's own messages (reports, replies), left out of the import
 
     def problems(self) -> str | None:
         if not self.unparsed:
             return None
         shown = "; ".join(line[:60] for line in self.unparsed[:3])
         return f"{len(self.unparsed)} line(s) came before the first message header and were ignored: {shown}"
+
+    def notes(self) -> list[str]:
+        lines = [self.problems()] if self.unparsed else []
+        if self.ignored:
+            lines.append(f"Left out {self.ignored} message(s) written by the bot itself.")
+        return lines
 
 
 @dataclass
@@ -89,8 +98,9 @@ class ImportResult:
     def describe(self) -> str:
         lines = [f"Found {self.found} message(s); queued {self.imported} for the next sync."]
         if self.held:
-            lines.append(f"⚠️ Held back {len(self.held)} that are already in the sheet (same day, same wording, same amount and currency). "
-                         "Nothing was queued for them. /review lists them; /review keep <n> queues one anyway, /review done <n> closes it:")
+            lines.append(f"⚠️ Held back {len(self.held)} that look already recorded (a sheet row of the same day with the same wording, amount "
+                         "and currency, or the same text recorded live on that day). Nothing was queued for them. /review lists them; "
+                         "/review keep <n> queues one anyway, /review done <n> closes it:")
             lines.extend(f"  • {item}" for item in self.held[:MAX_LISTED])
             if len(self.held) > MAX_LISTED:
                 lines.append(f"  • … and {len(self.held) - MAX_LISTED} more (see /review)")
@@ -100,37 +110,42 @@ class ImportResult:
             if self.before_start > MAX_LISTED:
                 lines.append(f"  • … and {self.before_start - MAX_LISTED} more")
         if self.duplicates:
-            lines.append(f"Skipped {self.duplicates} already in the inbox (same send time and text, whatever their status).")
+            lines.append(f"Skipped {self.duplicates} already in the inbox (same text within two minutes of the same send time, whatever their status).")
         if self.notes:
             lines.append(f"Skipped {self.notes} private note(s); notes are never stored or sent to Claude.")
         return "\n".join(lines)
 
 
-def parse(content: str, settings: Settings) -> Parsed:
-    """Auto-detect a Telegram Desktop JSON export or a pasted dump."""
+def parse(content: str, settings: Settings, ignore_sender: str | None = None) -> Parsed:
+    """Auto-detect a Telegram Desktop JSON export or a pasted dump. `ignore_sender` is the bot's own display name."""
     stripped = content.strip()
     if stripped.startswith("{"):
         try:
-            return Parsed(parse_export(json.loads(stripped), settings), [])
+            return parse_export(json.loads(stripped), settings, ignore_sender)
         except (json.JSONDecodeError, KeyError, TypeError, ValueError):
             pass
-    return parse_dump(content, settings)
+    return parse_dump(content, settings, ignore_sender)
 
 
-def parse_dump(content: str, settings: Settings) -> Parsed:
+def parse_dump(content: str, settings: Settings, ignore_sender: str | None = None) -> Parsed:
     """Text copied out of a Telegram chat: a header line per message, then the message body."""
     messages: list[DumpMessage] = []
     unparsed: list[str] = []
     header: tuple[str, datetime, datetime | None] | None = None
     body: list[str] = []
+    ignored = 0
 
     def flush() -> None:
+        nonlocal ignored
         if header is None:
             return
         text = "\n".join(body).strip()
         if text:
             sender, sent_at, edited_at = header
-            messages.append(_dump_message(sender, sent_at, edited_at, text))
+            if _same_name(sender, ignore_sender):
+                ignored += 1
+            else:
+                messages.append(_dump_message(sender, sent_at, edited_at, text))
 
     for line in content.splitlines():
         match = HEADER.match(line.strip())
@@ -146,23 +161,31 @@ def parse_dump(content: str, settings: Settings) -> Parsed:
         elif line.strip():
             unparsed.append(line.strip())
     flush()
-    return Parsed(messages, unparsed)
+    return Parsed(messages, unparsed, ignored)
 
 
-def parse_export(export: dict, settings: Settings) -> list[DumpMessage]:
+def parse_export(export: dict, settings: Settings, ignore_sender: str | None = None) -> Parsed:
     """Telegram Desktop → Export chat history → JSON (result.json)."""
     messages: list[DumpMessage] = []
+    ignored = 0
     for entry in export.get("messages", []):
         if entry.get("type") != "message":
             continue
         text = _export_text(entry.get("text"))
         if not text.strip():
             continue
+        if _same_name(str(entry.get("from") or ""), ignore_sender):
+            ignored += 1
+            continue
         sent_at = _export_time(entry.get("date_unixtime"), entry.get("date"), settings)
         edited_at = _export_time(entry.get("edited_unixtime"), entry.get("edited"), settings) if entry.get("edited") else None
         sender = _first_name(entry.get("from") or "unknown")
         messages.append(DumpMessage(-int(entry["id"]), sender, sent_at, edited_at, text))
-    return messages
+    return Parsed(messages, [], ignored)
+
+
+def _same_name(sender: str, ignore_sender: str | None) -> bool:
+    return bool(ignore_sender) and " ".join(sender.split()).casefold() == " ".join(ignore_sender.split()).casefold()
 
 
 def import_messages(
@@ -170,7 +193,7 @@ def import_messages(
 ) -> ImportResult:
     """Queue messages as pending; skip what the inbox has, hold what the sheet seems to have, dismiss anything before `since`."""
     known_ids = store.stored_message_ids()
-    known_keys = store.stored_message_keys()
+    known_texts = store.stored_texts()
     on_sheet = by_day(store.transaction_index())
     rows: list[tuple[int, str, datetime, datetime | None, str, str]] = []
     held: list[tuple[int, str, datetime, datetime | None, str, str]] = []
@@ -187,12 +210,20 @@ def import_messages(
         if since and day < since:
             dismissed.append(f"{message.sent_at:%d/%m/%Y %H:%M} {message.sender}: {_excerpt(message.text)}")
             continue
-        key = message_key(message.sent_at.strftime("%Y-%m-%d %H:%M"), message.text)
-        if message.message_id in known_ids or key in known_keys:
+        text_key = normalised_text(message.text)
+        stored_times = known_texts.get(text_key, [])
+        if message.message_id in known_ids or any(abs((message.sent_at - when).total_seconds()) <= SAME_MESSAGE_SECONDS for when in stored_times):
             duplicates += 1
             continue
         known_ids.add(message.message_id)
-        known_keys.add(key)
+        same_day = [when for when in stored_times if rollover_date(when, settings.day_rollover_hour) == day]
+        known_texts.setdefault(text_key, []).append(message.sent_at)
+        if same_day:  # the same words, the same day, another time: almost surely the same message, but a person decides
+            when = same_day[0]
+            held.append((message.message_id, message.sender, message.sent_at, message.edited_at, message.text,
+                         f"the same text was recorded on this day at {when:%H:%M}; probably the same message. /review keep queues it anyway"))
+            held_lines.append(f"{message.sent_at:%d/%m/%Y %H:%M} {message.sender}: “{_excerpt(message.text)}” ≈ recorded live at {when:%H:%M}")
+            continue
         candidates = on_sheet.get(day, []) + (on_sheet.get(message.sent_at.date(), []) if message.sent_at.date() != day else [])
         match = find_duplicate(message.text, candidates, settings)
         if match is not None:
@@ -233,7 +264,7 @@ def same_item(item: str, entry: SheetEntry, default_currency: str) -> bool:
     "Migros - Water 400 TL" does not repeat "Migros · 400 TRY" and "Migros 400" does not repeat "Migros · 450 TRY".
     """
     ours, theirs = _describing_words(item), _describing_words(entry.description)
-    if not ours or not theirs or set(ours) != set(theirs):
+    if not ours or not theirs or (set(ours) != set(theirs) and "".join(ours) != "".join(theirs)):  # "Carre four" is "Carrefour"
         return False
     if _currency_of(item, default_currency) != entry.currency.strip().upper():
         return False

@@ -43,7 +43,7 @@ import os
 import sys
 import threading
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import anthropic
@@ -51,7 +51,7 @@ from apscheduler.triggers.cron import CronTrigger
 from gspread.exceptions import APIError
 from telegram import Bot, Chat, Message, Update, User
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, RetryAfter, TelegramError
 from telegram.ext import Application, ChatMemberHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from backfill import import_messages, parse
@@ -77,9 +77,11 @@ log = logging.getLogger("kashio")
 
 TELEGRAM_MESSAGE_LIMIT = 4000  # Telegram allows 4096 characters per message
 BACKFILL_QUIET_SECONDS = 20  # a paste split into several messages is imported once nothing new arrives for this long
+LONG_PASTE_CHARS = 3500  # Telegram cuts messages at 4096 characters: a /backfill this long is probably only the first part
 RECONNECT_EVERY_SECONDS = 60  # how often a missing integration is retried
 ANTHROPIC_MAX_RETRIES = 3  # SDK retries on 408/409/429/5xx and connection errors with exponential backoff (0.5 s → 8 s)
-DELETION_PROBE_PAUSE = 0.05  # seconds between Telegram probes, well under the rate limit
+DELETION_PROBE_PAUSE = 0.5  # seconds between Telegram probes; 20 a second hit flood control on 22 Sep 2026
+DELETION_PROBE_DAYS = 45  # only messages this recent are probed: deletions of older notes are rare and each probe is a call
 HINT_EVERY_SECONDS = 3600  # how often the group is reminded that something is not set up
 GROUP_ROLES = ("member", "administrator", "creator")
 ADMIN_ROLES = ("administrator", "creator")
@@ -260,12 +262,19 @@ class Kashio:
         """
         if self.store is None or self.group_id is None:
             return []
-        candidates = await asyncio.to_thread(self.store.messages_with_rows)
+        horizon = datetime.now(self.settings.timezone) - timedelta(days=DELETION_PROBE_DAYS)
+        candidates = [m for m in await asyncio.to_thread(self.store.messages_with_rows) if m.sent_at >= horizon]
         deleted: list[InboxMessage] = []
         unknown = 0
         for message in candidates:
             try:
-                await bot.set_message_reaction(self.group_id, message.message_id, reaction=[])  # only the bot's own reaction
+                try:
+                    await bot.set_message_reaction(self.group_id, message.message_id, reaction=[])  # only the bot's own reaction
+                except RetryAfter as exc:  # Telegram asks for a pause: wait it out and probe this message once more
+                    pause = exc.retry_after.total_seconds() if isinstance(exc.retry_after, timedelta) else float(exc.retry_after)
+                    log.warning("Deletion check: Telegram asks for a %.0f s pause", pause)
+                    await asyncio.sleep(pause + 1)
+                    await bot.set_message_reaction(self.group_id, message.message_id, reaction=[])
             except BadRequest as exc:
                 text = str(exc).lower()
                 if "chat not found" in text:
@@ -645,8 +654,14 @@ async def on_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     parts = message.text.split(maxsplit=1)
     body = parts[1] if len(parts) > 1 else ""
-    if body.strip():
+    if body.strip() and len(message.text) < LONG_PASTE_CHARS:
         await process_backfill(app, context.bot, chat.id, _name(user), body)
+        return
+    if body.strip():  # a long paste right after the command: Telegram has cut it, the rest arrives as further messages
+        context.chat_data["capture"] = [body]
+        _schedule_auto_finish(context, chat.id)
+        await message.reply_text(f"Got the first part. Telegram cuts long pastes into several messages, so I wait {BACKFILL_QUIET_SECONDS} s "
+                                 "for the rest; /done starts the import now, /cancel discards.")
         return
     context.chat_data["capture"] = []
     await message.reply_text(
@@ -721,15 +736,15 @@ async def process_backfill(app: Kashio, bot: Bot, chat_id: int, requested_by: st
     if not app.can_sync:
         await deliver(bot, chat_id, "I can't import yet.\n" + app.status_text(bot.username))
         return
-    parsed = parse(content, app.settings)
+    parsed = parse(content, app.settings, ignore_sender=getattr(bot, "first_name", None))
     if not parsed.messages:
         await deliver(bot, chat_id, "I couldn't recognise any messages. Copy them from the Telegram chat so each starts with a line like:\n"
                                     "Sam, [3 Sep 2026 at 09:59:44]:\nfollowed by the message text. Nothing was imported.")
         return
     result = await asyncio.to_thread(import_messages, app.store, app.settings, parsed.messages)
     text = result.describe()
-    if parsed.problems():
-        text += "\n" + parsed.problems()
+    for line in parsed.notes():
+        text += "\n" + line
     await deliver(bot, chat_id, text)
     if not result.imported:
         await deliver(bot, chat_id, "Nothing new to process, so no sync was run.")
@@ -926,15 +941,20 @@ def cli_backfill(settings: Settings, path: str, since: date | None) -> int:
         return 1
     with open(path, encoding="utf-8") as handle:
         content = handle.read()
-    parsed = parse(content, settings)
+    try:
+        me = asyncio.run(Bot(settings.telegram_bot_token).get_me())  # to leave the bot's own messages out of the import
+        bot_name = me.first_name
+    except Exception:  # noqa: BLE001 - not essential
+        bot_name = None
+    parsed = parse(content, settings, ignore_sender=bot_name)
     if not parsed.messages:
         print("No messages recognised. Expected lines like:  Sam, [3 Sep 2026 at 09:59:44]:  followed by the message text,"
               " or a Telegram Desktop JSON export.")
         return 1
     result = import_messages(app.store, settings, parsed.messages, since)
     print(result.describe())
-    if parsed.problems():
-        print(parsed.problems())
+    for line in parsed.notes():
+        print(line)
     if result.imported:
         calls = -(-result.imported // MAX_MESSAGES_PER_CALL)
         print(f"Next: `python bot.py sync --dry-run` to preview, then `python bot.py sync` ({calls} Claude call(s)).")

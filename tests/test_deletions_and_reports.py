@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from telegram import Chat, Message, PhotoSize, User
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 
 import bot
 import sync
@@ -61,6 +61,33 @@ def test_a_reacted_to_message_still_counts_as_existing(settings):
 
     app = stub_kashio(settings, store=ProbeStore([(10, 73), (11, 78), (12, 61)]), claude=object())
     assert asyncio.run(app.detect_deletions(Reacted(existing={73}, deleted={78}))) == [78]
+
+
+def test_flood_control_is_waited_out_and_old_messages_are_not_probed(settings, monkeypatch):
+    monkeypatch.setattr(bot.asyncio, "sleep", _no_sleep)
+
+    class Flooded(ProbeBot):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.flooded = False
+
+        async def set_message_reaction(self, chat_id, message_id, reaction=None):
+            if message_id == 78 and not self.flooded:
+                self.flooded = True
+                self.probed.append(message_id)
+                raise RetryAfter(3)
+            return await super().set_message_reaction(chat_id, message_id, reaction)
+
+    store = ProbeStore([(10, 73), (11, 78), (12, 61)])
+    store.candidates[2].sent_at = at(2026, 1, 1)  # far older than DELETION_PROBE_DAYS: left alone
+    app = stub_kashio(settings, store=store, claude=object())
+    probe = Flooded(existing={73}, deleted={78})
+    assert asyncio.run(app.detect_deletions(probe)) == [78]
+    assert probe.probed == [73, 78, 78]  # 78 probed again after the pause, 61 never
+
+
+async def _no_sleep(_seconds):
+    return None
 
 
 def test_unexpected_answers_are_not_deletions_and_a_total_wipe_is_refused(settings):

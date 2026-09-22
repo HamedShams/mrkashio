@@ -269,13 +269,17 @@ class SheetStore:
                 continue
         return ids
 
-    def stored_message_keys(self) -> set[tuple[str, str]]:
-        """(send time to the minute, normalised text) of every row, so a pasted copy of a live message is recognised."""
-        keys: set[tuple[str, str]] = set()
+    def stored_texts(self) -> dict[str, list[datetime]]:
+        """Every stored text (normalised) with the send times it was stored under, so a pasted copy of a live message is recognised."""
+        found: dict[str, list[datetime]] = {}
         for values in _retry(self.inbox.get_all_values)[1:]:
             values = list(values) + [""] * (len(INBOX_HEADERS) - len(values))
-            keys.add(message_key(values[2], values[4]))
-        return keys
+            try:
+                sent = self._parse_timestamp(values[2])
+            except ValueError:
+                continue
+            found.setdefault(normalised_text(values[4]), []).append(sent)
+        return found
 
     def latest_rows(self) -> dict[int, InboxMessage]:
         """The newest row of every message, keyed by message id: the current state of each message."""
@@ -559,9 +563,9 @@ class SheetStore:
             log.warning("Could not copy row formatting: %s", exc)
 
 
-def message_key(sent_at: str, text: str) -> tuple[str, str]:
-    """What makes two inbox rows the same message when ids differ (a live message pasted back later)."""
-    return sent_at[:16], " ".join(text.split()).casefold()
+def normalised_text(text: str) -> str:
+    """Whitespace collapsed, case folded: what makes two texts the same message when ids differ (a live message pasted back)."""
+    return " ".join(text.split()).casefold()
 
 
 def currency_format_requests(sheet_id: int, start: int, currencies: Sequence[str], column_index: int = 2) -> list[dict]:
