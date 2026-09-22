@@ -5,9 +5,14 @@ a Telegram client (the "Name, [date]:" dump format) or as a Telegram Desktop JSO
 here into plain messages and queued in the inbox; the normal sync then processes them.
 
 An import never inserts what is already there. A message already in the inbox (same id, or the same send
-time and text as a message the bot recorded live) is skipped. A message that repeats a row already on the
-transactions tab (same day, same wording, same amount and currency) is held as a duplicate and waits for a
-person: /review lists such messages, /review keep queues one anyway, /review done closes it.
+time and text as a message the bot recorded live) is skipped. A message with the same sender and send time
+as a stored one but different text is that message, corrected: it is queued as a revision, and the sync
+updates the rows it produced earlier, exactly as an edit in Telegram would. A message that repeats a row
+already on the transactions tab (same day, same wording, same amount and currency) is held as a duplicate
+and waits for a person: /review lists such messages, /review keep queues one anyway, /review done closes it.
+
+Lines that start with "..." are reported: Telegram sometimes leaves a line (Persian text, typically) out of
+a multi-message copy and shows "..." instead, so the amount under it has lost its description.
 """
 
 from __future__ import annotations
@@ -19,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 
 from config import Settings
-from sheets import STATUS_DUPLICATE, SheetEntry, SheetStore, normalised_text
+from sheets import STATUS_DUPLICATE, STATUS_PENDING, STATUS_PENDING_REVISION, InboxMessage, SheetEntry, SheetStore, normalised_text
 from sync import format_amount, rollover_date, split_note
 
 SAME_MESSAGE_SECONDS = 120  # Telegram's copy rounds send times (17:04:59 is shown as 17:05:00); within this, same text means same message
@@ -94,9 +99,24 @@ class ImportResult:
     dismissed: list[str]  # human-readable lines for the messages dated before the requested start
     notes: int = 0  # messages that were only a private note (NOTE_KEYWORD)
     held: list[str] = field(default_factory=list)  # messages that look already present in the sheet; waiting in /review
+    revised: list[str] = field(default_factory=list)  # stored messages whose text changed in this paste; their rows get updated
+    cut: list[str] = field(default_factory=list)  # messages with a "..." line: something was probably left out of the copy
 
     def describe(self) -> str:
         lines = [f"Found {self.found} message(s); queued {self.imported} for the next sync."]
+        if self.revised:
+            lines.append(f"✏️ {len(self.revised)} message(s) were already stored with a different text; the new text counts as a correction "
+                         "and their rows will be updated at the sync:")
+            lines.extend(f"  • {item}" for item in self.revised[:MAX_LISTED])
+            if len(self.revised) > MAX_LISTED:
+                lines.append(f"  • … and {len(self.revised) - MAX_LISTED} more")
+        if self.cut:
+            lines.append(f"⚠️ {len(self.cut)} message(s) contain a line that starts with \"...\". Telegram sometimes leaves a line out when "
+                         "messages are copied (Persian text, typically), so the amount below it may have lost its description. "
+                         "Check these in the group and paste them again if so:")
+            lines.extend(f"  • {item}" for item in self.cut[:MAX_LISTED])
+            if len(self.cut) > MAX_LISTED:
+                lines.append(f"  • … and {len(self.cut) - MAX_LISTED} more")
         if self.held:
             lines.append(f"⚠️ Held back {len(self.held)} that look already recorded (a sheet row of the same day with the same wording, amount "
                          "and currency, or the same text recorded live on that day). Nothing was queued for them. /review lists them; "
@@ -194,11 +214,16 @@ def import_messages(
     """Queue messages as pending; skip what the inbox has, hold what the sheet seems to have, dismiss anything before `since`."""
     known_ids = store.stored_message_ids()
     known_texts = store.stored_texts()
+    stored = store.latest_rows()
+    by_moment = sorted(stored.values(), key=lambda m: m.sent_at)
     on_sheet = by_day(store.transaction_index())
     rows: list[tuple[int, str, datetime, datetime | None, str, str]] = []
     held: list[tuple[int, str, datetime, datetime | None, str, str]] = []
+    revisions: list[tuple[InboxMessage, str, object, str]] = []
     dismissed: list[str] = []
     held_lines: list[str] = []
+    revised_lines: list[str] = []
+    cut_lines: list[str] = []
     duplicates = notes = 0
     for message in messages:
         kept, had_note = split_note(message.text, settings.note_keyword)
@@ -214,6 +239,27 @@ def import_messages(
         stored_times = known_texts.get(text_key, [])
         if message.message_id in known_ids or any(abs((message.sent_at - when).total_seconds()) <= SAME_MESSAGE_SECONDS for when in stored_times):
             duplicates += 1
+            continue
+        if any(line.strip().startswith(("...", "…")) for line in message.text.splitlines()):
+            cut_lines.append(f"{message.sent_at:%d/%m/%Y %H:%M} {message.sender}: {_excerpt(message.text)}")
+        same_moment = [m for m in by_moment if m.sender == message.sender and abs((m.sent_at - message.sent_at).total_seconds()) <= SAME_MESSAGE_SECONDS]
+        if len(same_moment) == 1:  # the same message, stored with another text: this paste corrects it
+            original = same_moment[0]
+            revisions.append((original, message.text, original.rows_added if original.rows_added else "",
+                              f"corrected by a paste on {datetime.now(message.sent_at.tzinfo):%Y-%m-%d}; its rows will be "
+                              + ("updated" if original.rows_added else "written")))
+            revised_lines.append(f"{message.sent_at:%d/%m/%Y %H:%M} {message.sender}: “{_excerpt(message.text)}” (was “{_excerpt(original.text)}”)")
+            known_texts.setdefault(text_key, []).append(message.sent_at)
+            continue
+        if len(same_moment) > 1:  # Telegram copies several quick messages as one block: same block, or a changed one
+            if normalised_text(" ".join(m.text for m in same_moment)) == text_key:
+                duplicates += 1
+                continue
+            ids = ", ".join(str(m.message_id) for m in same_moment)
+            held.append((message.message_id, message.sender, message.sent_at, message.edited_at, message.text,
+                         f"spans {len(same_moment)} stored messages ({ids}) but its text differs from theirs; fix by hand or /review keep to import it whole"))
+            held_lines.append(f"{message.sent_at:%d/%m/%Y %H:%M} {message.sender}: “{_excerpt(message.text)}” ≈ {len(same_moment)} stored messages, text differs")
+            known_texts.setdefault(text_key, []).append(message.sent_at)
             continue
         known_ids.add(message.message_id)
         same_day = [when for when in stored_times if rollover_date(when, settings.day_rollover_hour) == day]
@@ -237,7 +283,10 @@ def import_messages(
         store.add_messages(rows)
     if held:
         store.add_messages(held, status=STATUS_DUPLICATE)
-    return ImportResult(len(messages), len(rows), len(dismissed), duplicates, since, dismissed, notes, held_lines)
+    if revisions:
+        store.revise_messages(revisions)
+    return ImportResult(len(messages), len(rows) + len(revisions), len(dismissed), duplicates, since, dismissed, notes,
+                        held_lines, revised_lines, cut_lines)
 
 
 def by_day(entries: list[SheetEntry]) -> dict[date, list[SheetEntry]]:

@@ -14,6 +14,7 @@ current state. Nothing in that tab is updated or deleted, so the whole history o
 
 from __future__ import annotations
 
+import copy
 import logging
 import time
 from collections.abc import Callable, Sequence
@@ -67,16 +68,25 @@ CURRENCY_FORMATS = {
 T = TypeVar("T")
 
 
-def _retry(call: Callable[[], T], attempts: int = 3) -> T:
-    """Run a Sheets API call, retrying transient failures with a short backoff."""
+QUOTA_BACKOFF = 20  # seconds per attempt after a 429: the write quota is counted per minute
+
+
+def _retry(call: Callable[[], T], attempts: int = 4) -> T:
+    """Run a Sheets API call, retrying transient failures. A quota error (429) waits long enough for the minute to pass.
+
+    Callers must build the request inside `call`: gspread rewrites the ranges of a batch request in place, so a
+    request object reused across attempts would carry a doubled sheet prefix.
+    """
     for attempt in range(1, attempts + 1):
         try:
             return call()
         except APIError as exc:
             if attempt == attempts:
                 raise
-            log.warning("Sheets API error (attempt %d/%d): %s", attempt, attempts, exc)
-            time.sleep(2**attempt)
+            quota = getattr(exc, "code", None) == 429 or "429" in str(exc) or "Quota exceeded" in str(exc)
+            pause = QUOTA_BACKOFF * attempt if quota else 2**attempt
+            log.warning("Sheets API error (attempt %d/%d, waiting %ds): %s", attempt, attempts, pause, exc)
+            time.sleep(pause)
     raise AssertionError("unreachable")
 
 
@@ -313,9 +323,11 @@ class SheetStore:
         """Messages waiting for a person: Claude's doubts and imports that look like duplicates."""
         return sorted((m for m in self.latest_rows().values() if m.status in REVIEW_STATUSES), key=lambda m: m.row)
 
-    def messages_with_rows(self) -> list[InboxMessage]:
-        """Live Telegram messages whose rows are in the sheet: the ones a deletion could orphan."""
-        return sorted((m for m in self.latest_rows().values() if m.message_id > 0 and m.rows_added > 0 and m.status in WITH_ROWS_STATUSES),
+    def messages_with_rows(self, include_imported: bool = False) -> list[InboxMessage]:
+        """Messages whose rows are in the sheet. Live Telegram messages only by default (the ones a deletion could orphan);
+        with `include_imported`, the negative ids of imported history too."""
+        return sorted((m for m in self.latest_rows().values()
+                       if (m.message_id > 0 or include_imported) and m.rows_added > 0 and m.status in WITH_ROWS_STATUSES),
                       key=lambda m: m.row)
 
     def update_message(self, message_id: int, text: str, edited_at: datetime, retire_reason: str | None = None) -> str | None:
@@ -344,6 +356,17 @@ class SheetStore:
         self._append([[str(message_id), latest.sender, latest.sent_at.strftime(TIMESTAMP), edited_at.strftime(TIMESTAMP), text,
                        status, self._now(), carried, note]])
         return status
+
+    def revise_messages(self, revisions: Sequence[tuple[InboxMessage, str, object, str]]) -> None:
+        """A corrected text for stored messages (from a re-pasted dump): one new row each, like an edit in Telegram."""
+        if not revisions:
+            return
+        now = self._now()
+        self._append([
+            [str(m.message_id), m.sender, m.sent_at.strftime(TIMESTAMP), now, text,
+             STATUS_PENDING_REVISION if m.rows_added > 0 else STATUS_PENDING, now, rows_added, note]
+            for m, text, rows_added, note in revisions
+        ])
 
     def mark_deleted(self, messages: Sequence[InboxMessage]) -> None:
         """Queue messages deleted in Telegram for row removal: one new row each, text and history kept."""
@@ -382,7 +405,7 @@ class SheetStore:
             else:
                 appends.append([key, str(value), now, updated_by])
         if updates:
-            _retry(lambda: self.config.batch_update(updates))
+            _retry(lambda: self.config.batch_update(copy.deepcopy(updates)))
         if appends:
             _retry(lambda: self.config.append_rows(appends, value_input_option="RAW"))
 
@@ -467,6 +490,18 @@ class SheetStore:
         self._write_rows(start, rows)
         return start, end
 
+    def noted_message_ids(self) -> set[int]:
+        """Ids of every message that owns at least one row with a provenance note on the target tab."""
+        column = self.columns.date
+        found: set[int] = set()
+        for row in _retry(lambda: self.target.get_notes(grid_range=f"{column}1:{column}")):
+            if row and str(row[0]).startswith(NOTE_PREFIX):
+                try:
+                    found.add(int(str(row[0])[len(NOTE_PREFIX):]))
+                except ValueError:
+                    continue
+        return found
+
     def rows_for_message(self, message_id: int) -> list[int]:
         """Row numbers on the target tab whose date cell carries this message's note."""
         column = self.columns.date
@@ -511,7 +546,7 @@ class SheetStore:
             {"range": f"{c.description}{start}:{c.description}{end}", "values": [[r.description] for r in rows]},
             {"range": f"{c.category}{start}:{c.category}{end}", "values": [[r.category] for r in rows]},
         ]
-        _retry(lambda: self.target.batch_update(updates, value_input_option="USER_ENTERED"))
+        _retry(lambda: self.target.batch_update(copy.deepcopy(updates), value_input_option="USER_ENTERED"))
         self._apply_currency_formats(start, [r.currency for r in rows])
         try:
             _retry(lambda: self.target.insert_notes({f"{c.date}{start + i}": f"{NOTE_PREFIX}{r.message_id}" for i, r in enumerate(rows)}))

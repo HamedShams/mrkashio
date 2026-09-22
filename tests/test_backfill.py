@@ -24,9 +24,16 @@ Istanbul card
 
 
 class StubStore:
-    def __init__(self, known=(), texts=None, on_sheet=()):
+    def __init__(self, known=(), texts=None, on_sheet=(), stored=()):
         self.known, self.texts, self.on_sheet = set(known), dict(texts or {}), list(on_sheet)
-        self.rows, self.held = [], []
+        self.stored = {m.message_id: m for m in stored}
+        self.rows, self.held, self.revisions = [], [], []
+
+    def latest_rows(self):
+        return dict(self.stored)
+
+    def revise_messages(self, revisions):
+        self.revisions.extend(revisions)
 
     def stored_message_ids(self):
         return set(self.known)
@@ -160,6 +167,45 @@ def test_import_can_dismiss_everything_before_a_day_on_request(settings):
     assert result.imported == 3 and result.before_start == 1 and result.start == date(2026, 9, 3)
     text = result.describe()
     assert "Dismissed 1 dated before 03/09/2026" in text and "01/09/2026 21:14 Sam: A101 | 2045" in text
+
+
+def test_a_repasted_message_with_corrected_text_becomes_a_revision(settings):
+    from sheets import InboxMessage
+    # stored from a first paste with a line Telegram had dropped ("...203"); the corrected copy carries the same time
+    cut = InboxMessage(9, -555, "Sam", at(2026, 9, 3, 15, 36).replace(second=59), None, "...400", "skipped", rows_added=0)
+    fixed = InboxMessage(10, -556, "Alex", at(2026, 9, 3, 9, 59).replace(second=44), None, "UBER to Metro Station\n84 TL", "processed", rows_added=1)
+    messages = parse(SAMPLE, settings).messages
+    messages[1].text = "UBER to Metro Station (Kadıköy)\n84 TL"  # the household corrected the wording in the re-paste
+    store = StubStore(stored=[cut, fixed])
+    result = import_messages(store, settings, messages)
+    assert [(m.message_id, text, status_rows) for m, text, status_rows, _ in store.revisions] == [
+        (-556, "UBER to Metro Station (Kadıköy)\n84 TL", 1), (-555, "Istanbul card \n400", "")]
+    assert result.imported == 4 and len(result.revised) == 2  # two revisions plus two genuinely new messages
+    text = result.describe()
+    assert "2 message(s) were already stored with a different text" in text and "(was “...400”)" in text
+    assert [r[4] for r in store.rows] == ["A101\n2045", "295 TL"]
+
+
+def test_a_block_that_spans_several_stored_messages_is_not_a_revision(settings):
+    """Telegram copies quick consecutive messages as one block; the block equals their texts joined, or is held."""
+    from sheets import InboxMessage
+    a = InboxMessage(3, 22, "Sam", at(2026, 9, 8, 20, 47).replace(second=18), None, "Gratis\n844", "processed", rows_added=1)
+    b = InboxMessage(4, 23, "Sam", at(2026, 9, 8, 20, 47).replace(second=40), None, "A101\n572", "processed", rows_added=1)
+    same = parse_dump("Sam, [8 Sep 2026 at 20:47:18]:\nGratis\n844\n\n\nA101\n572", settings).messages
+    result = import_messages(StubStore(stored=[a, b]), settings, same)
+    assert (result.imported, result.duplicates, result.held, result.revised) == (0, 1, [], [])
+    changed = parse_dump("Sam, [8 Sep 2026 at 20:47:18]:\nGratis\n844\n\n\nA101\n590", settings).messages
+    store = StubStore(stored=[a, b])
+    result = import_messages(store, settings, changed)
+    assert result.imported == 0 and store.revisions == [] and len(store.held) == 1
+    assert "spans 2 stored messages (22, 23)" in store.held[0][5] and "≈ 2 stored messages, text differs" in result.describe()
+
+
+def test_lines_starting_with_dots_are_reported_as_probable_copy_cuts(settings):
+    dump = "Sam, [3 Sep 2026 at 10:00:00]:\n...305\n\n1 kg dana kıyma\n1647\n\nSam, [3 Sep 2026 at 11:00:00]:\nCafe 385"
+    result = import_messages(StubStore(), settings, parse_dump(dump, settings).messages)
+    assert result.imported == 2 and result.cut == ["03/09/2026 10:00 Sam: ...305 | 1 kg dana kıyma | 1647"]
+    assert 'contain a line that starts with "..."' in result.describe() and "paste them again" in result.describe()
 
 
 def test_the_bots_own_messages_are_left_out_of_an_import(settings):

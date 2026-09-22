@@ -1,6 +1,8 @@
 """Deleted-message detection, free work below the threshold, Telegram HTML reports, and caption notes."""
 
 import asyncio
+
+import pytest
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -13,6 +15,11 @@ from extractor import Extraction
 from sheets import STATUS_DELETED, STATUS_PENDING_DELETION, InboxMessage
 from tests.conftest import at
 from tests.test_status_and_media import FakeStore, fake_extract, stub_kashio
+
+
+@pytest.fixture(autouse=True)
+def _no_probe_pause(monkeypatch):
+    monkeypatch.setattr(bot, "DELETION_PROBE_PAUSE", 0)
 
 
 class ProbeBot:

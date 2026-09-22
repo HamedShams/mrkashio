@@ -7,6 +7,8 @@
     python bot.py backfill FILE   queue older messages from a pasted dump or a Telegram Desktop JSON export
     python bot.py init-sheet      build the Summary report tab (add --rewrite to replace an existing one)
     python bot.py categorise      fill in the empty category cells of hand-entered rows (--rows 5:152, --dry-run)
+    python bot.py resync          re-extract messages that already have rows, so the rows follow the current prompt
+                                  rules (--since 2026-07-30, --dry-run); rows are updated in place
 
 Telegram commands:
     /setup     in the group, once, by a group admin: pairs the bot with that group and with you
@@ -80,8 +82,9 @@ BACKFILL_QUIET_SECONDS = 20  # a paste split into several messages is imported o
 LONG_PASTE_CHARS = 3500  # Telegram cuts messages at 4096 characters: a /backfill this long is probably only the first part
 RECONNECT_EVERY_SECONDS = 60  # how often a missing integration is retried
 ANTHROPIC_MAX_RETRIES = 3  # SDK retries on 408/409/429/5xx and connection errors with exponential backoff (0.5 s → 8 s)
-DELETION_PROBE_PAUSE = 0.5  # seconds between Telegram probes; 20 a second hit flood control on 22 Sep 2026
-DELETION_PROBE_DAYS = 45  # only messages this recent are probed: deletions of older notes are rare and each probe is a call
+DELETION_PROBE_PAUSE = 3.1  # seconds between probes: Telegram allows about 20 calls a minute per group (hit on 22 Sep 2026)
+DELETION_PROBE_DAYS = 45  # scheduled and terminal syncs probe messages this recent; deletions of older notes are rare
+MANUAL_PROBE_DAYS = 7  # /sync probes only the last week, so the person typing it is not kept waiting
 HINT_EVERY_SECONDS = 3600  # how often the group is reminded that something is not set up
 GROUP_ROLES = ("member", "administrator", "creator")
 ADMIN_ROLES = ("administrator", "creator")
@@ -254,7 +257,7 @@ class Kashio:
         ):
             await deliver(bot, group, format_summary(report, as_html=True), as_html=True)
 
-    async def detect_deletions(self, bot: Bot) -> list[int]:
+    async def detect_deletions(self, bot: Bot, days: int = DELETION_PROBE_DAYS) -> list[int]:
         """Find messages that were deleted in Telegram after their rows were written, and queue their rows for removal.
 
         Telegram sends no event for deletions. Clearing the bot's reaction on a message is a harmless probe:
@@ -262,7 +265,7 @@ class Kashio:
         """
         if self.store is None or self.group_id is None:
             return []
-        horizon = datetime.now(self.settings.timezone) - timedelta(days=DELETION_PROBE_DAYS)
+        horizon = datetime.now(self.settings.timezone) - timedelta(days=days)
         candidates = [m for m in await asyncio.to_thread(self.store.messages_with_rows) if m.sent_at >= horizon]
         deleted: list[InboxMessage] = []
         unknown = 0
@@ -567,7 +570,7 @@ async def on_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not app.ready:
         await deliver(context.bot, chat.id, "I can't sync yet.\n" + app.status_text(context.bot.username))
         return
-    await app.detect_deletions(context.bot)
+    await app.detect_deletions(context.bot, days=MANUAL_PROBE_DAYS)
     report = await app.sync(TRIGGER_MANUAL, _name(user))
     if report is None:
         await message.reply_text("A sync is already running. Give it a minute.")
@@ -993,6 +996,33 @@ def cli_categorise(settings: Settings, rows: str | None, dry_run: bool) -> int:
     return 0 if not result.unanswered else 1
 
 
+def cli_resync(settings: Settings, since: date | None, dry_run: bool) -> int:
+    """Queue every message that owns rows as a revision and run one sync, so its rows follow the current prompt rules."""
+    app = Kashio(settings)
+    if not app.can_sync:
+        print(app.status_text())
+        return 1
+    noted = app.store.noted_message_ids()
+    candidates = [m for m in app.store.messages_with_rows(include_imported=True) if since is None or m.sent_at.date() >= since]
+    with_rows = [m for m in candidates if m.message_id in noted]
+    if len(with_rows) < len(candidates):
+        print(f"Left alone: {len(candidates) - len(with_rows)} message(s) whose rows carry no provenance note (written before notes existed); "
+              "they cannot be updated in place.")
+    if not with_rows:
+        print("No message with rows" + (f" sent on or after {since:%d/%m/%Y}" if since else "") + ". Nothing to do.")
+        return 0
+    rows = sum(m.rows_added for m in with_rows)
+    print(f"{len(with_rows)} message(s) own {rows} row(s)" + (f" since {since:%d/%m/%Y}" if since else "") + "; each will be re-extracted "
+          f"and its rows updated in place ({-(-len(with_rows) // MAX_MESSAGES_PER_CALL)} Claude call(s)).")
+    if dry_run:
+        for m in with_rows:
+            print(f"  {m.sent_at:%d/%m/%Y %H:%M} {m.sender}: {' | '.join(part.strip() for part in m.text.splitlines() if part.strip())[:70]} ({m.rows_added} row(s))")
+        print("Dry run: nothing queued, nothing written.")
+        return 0
+    app.store.mark_messages([(m, STATUS_PENDING_REVISION, m.rows_added, "queued by resync so its rows follow the current rules") for m in with_rows])
+    return asyncio.run(cli_sync(settings, dry_run=False))
+
+
 def cli_init_sheet(settings: Settings, rewrite: bool) -> int:
     """Create (or rewrite) the Summary report tab and point the category dropdown at its category list."""
     app = Kashio(settings)
@@ -1023,6 +1053,9 @@ def main() -> None:
     cat_parser = commands.add_parser("categorise", help="fill in the empty category cells of rows that have a description; one Claude call")
     cat_parser.add_argument("--rows", metavar="FIRST:LAST", help="row range to look at (default: every row of the tab)")
     cat_parser.add_argument("--dry-run", action="store_true", help="print the proposed categories, write nothing")
+    resync_parser = commands.add_parser("resync", help="re-extract messages that already have rows so the rows follow the current prompt rules")
+    resync_parser.add_argument("--since", type=date.fromisoformat, metavar="YYYY-MM-DD", help="only messages sent on or after this day")
+    resync_parser.add_argument("--dry-run", action="store_true", help="list what would be re-extracted, change nothing")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -1041,6 +1074,8 @@ def main() -> None:
             sys.exit(cli_init_sheet(settings, args.rewrite))
         elif args.command == "categorise":
             sys.exit(cli_categorise(settings, args.rows, args.dry_run))
+        elif args.command == "resync":
+            sys.exit(cli_resync(settings, args.since, args.dry_run))
         else:
             run_bot(settings)
     except ConfigError as exc:

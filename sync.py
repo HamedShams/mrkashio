@@ -9,6 +9,7 @@ from __future__ import annotations
 import html
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
@@ -42,6 +43,8 @@ CURRENCY_SYMBOLS = {"TRY": "₺", "EUR": "€", "USD": "$", "GBP": "£"}
 MAX_REVIEW_ITEMS_IN_REPORT = 12
 MAX_REVIEW_ITEMS_IN_SUMMARY = 5
 NOTE_ONLY_TEXT = "[note]"
+REVISION_PAUSE_SECONDS = 2.0  # between revisions when there are many: each takes a few writes and Google counts writes per minute
+MANY_REVISIONS = 5
 
 
 @dataclass
@@ -161,6 +164,7 @@ def run_sync(
         model=settings.anthropic_model, effort=settings.anthropic_effort,
     )
     report.threshold = settings.scheduled_min_messages if trigger == TRIGGER_SCHEDULE else settings.manual_min_messages
+    done: list[tuple[InboxMessage, str, int, str]] = []
     try:
         pending = store.pending_messages()
         report.pending = len(pending)
@@ -173,7 +177,7 @@ def run_sync(
             report.status = STATUS_SKIPPED_THRESHOLD
         else:
             extraction = Extraction(results=[])
-            marks: list[tuple[InboxMessage, str, int, str]] = []  # appended to the inbox log once the sheet is updated
+            marks: list[tuple[InboxMessage, str, int, str]] = []  # proposed for the new rows; recorded once they are written
             if ask_claude:
                 report.categories = clean_categories(store.category_options())
                 log.info("Categories in force: %s", ", ".join(report.categories))
@@ -193,26 +197,42 @@ def run_sync(
                 if report.rows:
                     start, end = store.append_transactions(report.rows)
                     report.sheet_range = f"{settings.sheet_tab}!{settings.columns.date}{start}:{settings.columns.category}{end}"
+                store.mark_messages(marks)  # the new rows are in: say so at once, so a failure further down cannot lose it
+                marks = []
+                slow = len(report.revisions) + len(report.retractions) + len(report.deletions) > MANY_REVISIONS
                 for message, rows in report.revisions:
+                    if slow:
+                        time.sleep(REVISION_PAUSE_SECONDS)
+                    if message.rows_added and not store.rows_for_message(message.message_id):
+                        # rows written before provenance notes existed cannot be found: never append a second copy
+                        hold = "its earlier rows carry no provenance note, so they cannot be updated; fix them by hand"
+                        report.held.append(ReviewItem(message.message_id, message.sender, message.sent_at, message.text, hold))
+                        done.append((message, STATUS_NEEDS_REVIEW, message.rows_added, f"rows left unchanged: {hold}"))
+                        continue
                     outcome = store.replace_transactions(message.message_id, rows)
                     report.rows_updated += outcome.updated
                     report.rows_deleted += outcome.deleted
-                    marks.append((message, STATUS_PROCESSED if rows else STATUS_SKIPPED, len(rows),
-                                  f"re-synced after an edit: {outcome.updated} updated, {outcome.deleted} removed, {outcome.appended} added"))
+                    done.append((message, STATUS_PROCESSED if rows else STATUS_SKIPPED, len(rows),
+                                 f"re-synced after an edit: {outcome.updated} updated, {outcome.deleted} removed, {outcome.appended} added"))
                 for message in report.retractions:
                     outcome = store.replace_transactions(message.message_id, [])
                     report.rows_deleted += outcome.deleted
-                    marks.append((message, STATUS_SKIPPED, 0, f"retracted after an edit: {outcome.deleted} row(s) removed"))
+                    done.append((message, STATUS_SKIPPED, 0, f"retracted after an edit: {outcome.deleted} row(s) removed"))
                 for message in report.deletions:
                     outcome = store.replace_transactions(message.message_id, [])
                     report.rows_deleted += outcome.deleted
-                    marks.append((message, STATUS_DELETED, 0, f"deleted in Telegram: {outcome.deleted} row(s) removed from the sheet"))
-                store.mark_messages(marks)
+                    done.append((message, STATUS_DELETED, 0, f"deleted in Telegram: {outcome.deleted} row(s) removed from the sheet"))
+                store.mark_messages(done)
+                done = []
                 report.status = STATUS_OK
     except Exception as exc:  # noqa: BLE001 - the report must be delivered whatever failed
         log.exception("Sync failed")
         report.status = STATUS_FAILED
         report.error = f"{type(exc).__name__}: {exc}"
+        try:  # whatever was already applied to the sheet is recorded, so a rerun does not redo or duplicate it
+            store.mark_messages(done)
+        except Exception:  # noqa: BLE001
+            log.exception("Could not record the marks of the work done before the failure")
 
     if not dry_run:
         try:

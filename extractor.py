@@ -31,12 +31,21 @@ from sheets import InboxMessage
 log = logging.getLogger(__name__)
 
 PROMPT_PATH = Path(__file__).with_name("prompt.md")
-MAX_MESSAGES_PER_CALL = 150
-MAX_OUTPUT_TOKENS = 32000  # streamed, so a long batch plus its reasoning never hits an HTTP timeout
+MAX_MESSAGES_PER_CALL = 60  # keeps one answer well inside the output budget even when every message lists several items
+MAX_OUTPUT_TOKENS = 64000  # streamed, so a long batch plus its reasoning never hits an HTTP timeout
 JSON_FENCE = re.compile(r"^```(?:json)?\s*|\s*```$")
 DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 A_LETTER = re.compile(r"[^\W\d_]")  # any letter in any script
-AMOUNT_LIKE = re.compile(r"(?<![\w.,])\d[\d.,]*\d(?![\w.,])|(?<![\w.,])\d{2,}(?![\w.,])")  # numbers with 2+ digits, incl. 1,158.4
+CURRENCY_WORDS = r"(?:tl|try|₺|lira|lir|€|eur|euros?|\$|usd|dollars?|£|gbp|pounds?|toman|tuman|لیر|لیره|تومان|تومن|یورو|دلار|پوند)"
+# What the household writes as an amount: a number alone on its line (with an optional currency word, "++" or a remark in
+# parentheses), or a number followed by a currency word. Postal codes, coordinates and dates inside prose do not count.
+AMOUNT_LIKE = re.compile(
+    r"^[ \t]*(?:\+\+\s*)?[€$£₺]?\s*\d[\d.,]*\s*(?:k|bin|m)?\s*" + CURRENCY_WORDS + r"?\s*(?:\(.*\))?[ \t]*$"
+    r"|(?<![\w.,])\d[\d.,]*\s*(?:k|bin|m)?\s*" + CURRENCY_WORDS + r"(?![\w])",
+    re.IGNORECASE | re.MULTILINE,
+)
+ARITHMETIC = re.compile(r"\d[\d.,]*(?:\s*[-+*/×x=]\s*\d[\d.,]*)+")  # "2192-1200 = 992": one amount, not three
+MONEY_BACK = "++"  # an amount written "++ 971" came back to the household and is stored negative
 MAX_PLAUSIBLE_AMOUNT = 1e12
 
 # Currencies the spreadsheet accepts in the currency column. TOMAN is Iranian toman, kept as the household writes it.
@@ -220,7 +229,7 @@ def audit(
     suspicious: dict[int, str] = {}
     seen: set[int] = set()
     for result in results:
-        why = _problem_with(result, expected, seen)
+        why = _problem_with(result, expected, seen, (texts or {}).get(result.message_id, ""))
         if why:
             problems.append(why)
             continue
@@ -236,13 +245,13 @@ def looks_truncated(result: MessageResult, text: str) -> str | None:
     """A message that lists many amounts but came back with far fewer transactions, and no reason why."""
     if result.skip_reason or result.merged_into is not None:
         return None
-    amounts = len(AMOUNT_LIKE.findall(text))
+    amounts = len(AMOUNT_LIKE.findall(ARITHMETIC.sub("0", text)))
     if amounts >= 3 and len(result.transactions) * 2 < amounts:
         return f"only {len(result.transactions)} transaction(s) for a text that lists about {amounts} amounts"
     return None
 
 
-def _problem_with(result: MessageResult, expected: set[int], seen: set[int]) -> str | None:
+def _problem_with(result: MessageResult, expected: set[int], seen: set[int], text: str = "") -> str | None:
     if result.message_id not in expected:
         return f"a result for unknown message id {result.message_id}"
     if result.message_id in seen:
@@ -252,8 +261,10 @@ def _problem_with(result: MessageResult, expected: set[int], seen: set[int]) -> 
     for transaction in result.transactions:
         if not A_LETTER.search(transaction.description):
             return f"message {result.message_id}: unreadable description {transaction.description!r}"
-        if not 0 < transaction.amount < MAX_PLAUSIBLE_AMOUNT:
+        if not 0 < abs(transaction.amount) < MAX_PLAUSIBLE_AMOUNT:
             return f"message {result.message_id}: implausible amount {transaction.amount}"
+        if transaction.amount < 0 and MONEY_BACK not in text:
+            return f"message {result.message_id}: negative amount {transaction.amount} without a '{MONEY_BACK}' marker in the message"
         if transaction.date is not None and not DATE_PATTERN.fullmatch(transaction.date):
             return f"message {result.message_id}: malformed date {transaction.date!r}"
     return None

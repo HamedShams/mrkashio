@@ -57,7 +57,8 @@ def test_the_output_example_in_the_prompt_fits_the_schema_and_the_schema_is_appe
     parsed = result_model(list(DEFAULT_CATEGORIES)).model_validate_json(example)
     assert [r.message_id for r in parsed.results] == [1, 12] and parsed.results[1].merged_into == 11
     assert "# Output\n" in prompt and "day headings" in prompt and '"date": "2026-09-03"' in prompt
-    assert "second purchase of the same kind" in prompt and '"description": "Eggplant"' in prompt and "amount 305 has no description" in prompt
+    assert "second purchase of the same kind" in prompt and '"description": "Eggplant 🍆"' in prompt and "amount 305 has no description" in prompt
+    assert '"amount": -971' in prompt and "Trendyol (Lamp + Nespresso) 2192-1200" in prompt and "havale to Erkan" in prompt
     from extractor import output_instructions
     tail = output_instructions(result_model(["Groceries", "Other"]))
     assert tail.startswith("\n\n# Output schema\n\n{") and '"enum": ["Groceries", "Other"]' in tail
@@ -92,6 +93,19 @@ def test_audit_rejects_damaged_answers_and_keeps_good_ones():
     ), expected={50, 51, 52, 53})
     assert [r.message_id for r in good] == [50] and suspicious == {}
     assert len(problems) == 5 and any("malformed date" in p for p in problems) and any("unknown message id 99" in p for p in problems)
+
+
+def test_money_back_amounts_are_negative_only_with_the_marker():
+    refund = result(60, [tx("💸💰 Lamp cancelled and this amount refunded", -971)])
+    good, problems, _ = audit(parsed(refund), {60}, {60: "💸💰 Lamp cancelled and this amount refunded\n++ 971 TL"})
+    assert [r.message_id for r in good] == [60] and problems == []
+    good, problems, _ = audit(parsed(refund), {60}, {60: "Lamp cancelled and refunded 971 TL"})
+    assert good == [] and "negative amount -971.0 without a '++' marker" in problems[0]
+
+
+def test_arithmetic_under_an_item_counts_as_one_amount():
+    text = "Trendyol (Lamp + Nespresso)\n2192-1200\n= 992 TL"
+    assert audit(parsed(result(61, [tx("Trendyol (Lamp + Nespresso) 2192-1200", 992)])), {61}, {61: text})[2] == {}
 
 
 def test_audit_flags_an_answer_that_is_cut_short():

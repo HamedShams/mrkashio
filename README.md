@@ -90,6 +90,9 @@ An import never inserts what is already there, so you can paste any range you ar
 - A message that repeats a row already on the transactions tab, **same day, same wording, same amount and same currency**, is held as a duplicate: it is not queued, the reply lists it with the sheet row it repeats, and it waits in `/review`. Wording is compared without amounts, currency words, digits, symbols and case, and without the "Groceries - " prefix the bot adds, so "Migros 450 tl" and "Migros 450" both repeat a row "Groceries - Migros · ₺450" of the same day, while "Migros - Water 400 TL" and "Migros 400 TL" are two different purchases and both go through. A message listing several items (blank line between them) is held when any one of its items repeats a row.
 - Everything else is queued as pending.
 
+- A message with the **same sender and send time as a stored one but a different text** is that message, corrected: it is queued as a revision and the sync updates the rows it produced earlier, exactly as an edit in Telegram would. So if a copy came out wrong, fix the text in your paste and paste it again. (Telegram copies quick consecutive messages as one block; a block that spans several stored messages is skipped when it equals their texts and held for `/review` when it differs.)
+- Lines that start with `...` are reported back: Telegram sometimes leaves a line out when several messages are copied at once (Persian text, typically) and shows `...` instead, so the amount below it has lost its description. Check those messages in the group and paste them again.
+
 `/review` lists what is held; `/review keep 2` queues item 2 for the next sync anyway (it was not a duplicate after all), `/review done 2` (or `done all`) closes it. Nothing is dismissed by date unless you ask: `python bot.py backfill FILE --from 2026-07-29` drops everything before that day. Imported messages are processed 150 per Claude call.
 
 The recognised paste format is what Telegram produces when you copy messages; a missing comma or colon, a 12-hour clock, and the Desktop variant (`Name, [01.09.2026 21:14]`) are all accepted:
@@ -173,6 +176,7 @@ python bot.py sync            # one real sync from the terminal
 python bot.py backfill FILE   # queue older messages from a paste (.txt) or a Telegram Desktop export (.json)
 python bot.py init-sheet      # build the Summary report tab; --rewrite replaces an existing one, keeping its exchange rates
 python bot.py categorise --rows 5:152 --dry-run   # propose categories for hand-entered rows that have none; drop --dry-run to write them
+python bot.py resync --since 2026-07-30           # re-extract messages that already have rows so the rows follow the current prompt rules
 python bot.py                 # run the bot locally (stop it before deploying: two pollers on one token conflict)
 ```
 
@@ -190,6 +194,28 @@ Cell B3 on that tab is a dropdown of the supported currencies, prefilled from `D
 ## Categorising rows you entered by hand
 
 Rows that existed before the bot usually have no category, so the Summary shows them on one line instead of in the shares. `python bot.py categorise --rows 5:152 --dry-run` sends every row in that range that has a description but no category to Claude in one call (plain JSON at the configured effort, categories limited to the sheet's own list), prints the proposed category per row and the per-category counts, and writes nothing. Without `--dry-run` it writes those category cells and nothing else: each cell is re-checked to be still empty right before the write, rows without a description (a note typed across a row, a blank line) are never touched, and every other column stays as it is. Rows Claude does not answer are named so you can run it again.
+
+## Money coming back: the `++` trick
+
+Not every line in the group is money leaving. Put `++` in front of an amount and the bot files it as money that came back, stored as a **negative** row, so every total on the Summary tab subtracts it by itself. Two everyday uses:
+
+```
+💶 💰 PROFIT from Time-Deposit Investment
+++ 3,780 TL
+```
+The bank paid interest? It shrinks this month's spending instead of vanishing into a note.
+
+```
+💸💰 Lamp cancelled and this amount refunded
+++ 971 TL
+```
+Something cancelled and refunded? The refund lands in the category of what was bought, and the month is square again.
+
+No `++`, no negative number: money that merely arrives (a salary, a friend paying you back) is still flagged for your decision rather than filed.
+
+## Descriptions stay yours
+
+What you write is what lands in the description column: parentheses, remarks, names and emojis included ("Trendyol 🛒 (incl 🖥️ monitor)" stays exactly that; a lone "🍆" becomes "Eggplant 🍆"). A two-line description is joined into one, words after the amount are appended ("290 euro (1€=200t)" keeps its note), a little arithmetic under an item ("2192-1200 / = 992 TL") is one row of 992 with the arithmetic kept in the text, and grocery stores get a "Groceries - " prefix. When the prompt rules change, `python bot.py resync` re-extracts messages that already have rows and updates those rows in place.
 
 ## Private notes
 
@@ -263,6 +289,12 @@ The tab is a log. The bot never edits or deletes a row there: storing a message,
 | `duplicate` | An imported message that repeats a row already on the sheet (same day, wording, amount and currency). Not queued; waits in `/review`. |
 | `resolved` | Closed by a person with `/review done`. |
 
+## Roadmap
+
+Ideas that are not built yet. Open an issue if you want one sooner, or have another.
+
+- **Voice messages.** Say the expense out loud in the group; the bot transcribes the voice note and files it like text. Today voice notes are acknowledged and never processed.
+
 ## Cost
 
 With Claude Sonnet 5 at $2 per million input tokens and $10 per million output tokens, a household logging about 150 expenses a month costs roughly **$0.10–0.25 a month** in API usage at two syncs a month, and about the same at four. The prompt and schema are about 4,500 tokens per call; output grows with the number of expenses, not with the number of syncs. Measured: ten messages in one scheduled run cost $0.037 at effort `high`; the same work at `low` is cheaper still. A retry after a damaged answer adds one call. Each run's token counts, calls and estimated cost are written to `Bot_Runs`.
@@ -276,7 +308,7 @@ Only `TELEGRAM_BOT_TOKEN` is needed to start the bot. Add the rest in any order 
 - Bots cannot read chat history: messages sent before the bot joined are not seen. Use `backfill` with a Telegram Desktop export for those.
 - Telegram does not notify bots about deleted messages. To retract a note before a sync, edit it to say "ignore" or "cancelled".
 - Edits follow through, carefully. Editing a pending message replaces its text. Editing a message that was skipped or flagged makes it pending again. Editing a message that already produced sheet rows re-syncs it at the next sync: its rows are updated in place, extra rows removed, missing rows added. Editing it into `#note` (or “cancelled”) removes its rows. The bot finds its own rows through a small note it leaves on each date cell (“kashio:<message id>”), so it never touches rows it did not write. If the new answer looks incomplete (Claude unsure, or far fewer items than before or than the text lists), the rows are left exactly as they were and you are told; edit the message again to retry.
-- Deletions follow through too. Telegram sends bots no event for a deleted message, so before each sync the bot asks Telegram to clear its own (non-existent) reaction on every message that has rows in the sheet; a deleted message answers "not found", and its rows are removed at that sync. Existing messages are unaffected whether or not people have reacted to them (a bot can only change its own reaction, so theirs are never touched), nothing visible happens in the group, only messages from the last 45 days are probed (two probes a second, pausing when Telegram asks), and the inbox keeps the message's text and history with the status `deleted` so you can trace it later. Deletions and note-edits are applied even when the scheduled minimum is not met, since they cost no Claude call.
+- Deletions follow through too. Telegram sends bots no event for a deleted message, so before each sync the bot asks Telegram to clear its own (non-existent) reaction on every message that has rows in the sheet; a deleted message answers "not found", and its rows are removed at that sync. Existing messages are unaffected whether or not people have reacted to them (a bot can only change its own reaction, so theirs are never touched), nothing visible happens in the group, only recent messages are probed (the last 45 days on scheduled syncs, the last week on `/sync`, one probe every three seconds because Telegram allows about twenty calls a minute per group), and the inbox keeps the message's text and history with the status `deleted` so you can trace it later. Deletions and note-edits are applied even when the scheduled minimum is not met, since they cost no Claude call.
 - If Telegram upgrades your group to a supergroup, its id changes; update `TELEGRAM_CHAT_ID`.
 - Two people writing a few notes a day stay far below Google Sheets API quotas.
 

@@ -116,6 +116,9 @@ class FakeStore:
         self.replaced = getattr(self, "replaced", []) + [(message_id, list(rows))]
         return Replacement(updated=min(1, len(rows)), deleted=0 if rows else 1, appended=max(0, len(rows) - 1))
 
+    def rows_for_message(self, message_id):
+        return [] if message_id in getattr(self, "without_notes", ()) else [160]
+
     def mark_messages(self, marks):
         self.marks.extend(marks)
 
@@ -191,6 +194,19 @@ def test_edited_messages_are_re_synced_and_retractions_remove_rows(settings, mon
     assert statuses == {2: "processed", 3: "skipped"} and "re-synced after an edit" in store.marks[0][3]
     summary = sync.format_summary(report)
     assert "updated 1" in summary and "Removed 1 row(s)" in summary
+
+
+def test_a_revision_of_rows_without_provenance_is_held_not_duplicated(settings, monkeypatch):
+    from sheets import STATUS_PENDING_REVISION, InboxMessage
+    pending = [InboxMessage(2, 22, "Alex", at(2026, 9, 8, 20, 47), at(2026, 9, 22), "Gratis 844", STATUS_PENDING_REVISION, rows_added=1)]
+    store = FakeStore(pending)
+    store.without_notes = {22}
+    monkeypatch.setattr(sync, "extract", fake_extract([{"message_id": 22, "transactions": [
+        {"description": "Gratis", "amount": 844, "currency": "TRY", "category": "Other", "date": None}],
+        "merged_into": None, "skip_reason": None, "needs_review": False, "note": None}]))
+    report = sync.run_sync(settings, store, object(), "prompt", trigger=sync.TRIGGER_MANUAL, requested_by="Alex")
+    assert report.status == sync.STATUS_OK and not hasattr(store, "replaced") and store.written == []
+    assert len(report.held) == 1 and "no provenance note" in report.held[0].note and store.marks[0][1] == "needs_review"
 
 
 def test_a_doubtful_re_extraction_never_deletes_rows(settings, monkeypatch):

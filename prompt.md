@@ -21,7 +21,11 @@ These are NOT transactions. Return an empty transactions list and a short skip_r
 - questions, plans, reminders, budgets, links, mentions, stickers, emoji-only messages, greetings, chit-chat, test messages
 - a message that cancels or retracts itself ("ignore the above", "wrong", "cancelled")
 
-Money received (salary, refund, someone paying us back) is not spending. Return no transactions, set needs_review to true and explain in note, so a human decides.
+Money received (salary, someone paying us back) is not spending. Return no transactions, set needs_review to true and explain in note, so a human decides. The one exception is an amount written with "++" in front, see Money coming back.
+
+# Money coming back ("++")
+
+An amount prefixed with "++" ("++ 3,780 TL", "++971") is money that came back to the household: a refund for something cancelled, interest or profit paid out by the bank, a deposit returned. It IS a transaction, with a NEGATIVE amount, so that the spreadsheet's totals subtract it by themselves: "Lamp cancelled and this amount refunded / ++ 971 TL" is {"amount": -971}. Keep the description as written (emojis included). Category: for a refund, the category of what was bought (a refunded lamp is Housing & Utilities, a refunded ticket is Leisure & Travel); for bank profit, interest or a returned deposit, the category for fees, transfers and everything else. Never make an amount negative without the "++" marker.
 
 # Split messages
 
@@ -38,6 +42,8 @@ If a message corrects an earlier message in the same batch ("the cafe was 450 no
 One message may contain several transactions. Every title + amount pair is its own row. The amount may sit on the same line, on the next line, or after a dash or colon; blank lines usually separate items. Never merge two items, and never invent an item that has no amount.
 
 An amount inside a message that has no description of its own (a line such as "...305" or "207**") is not a transaction, but it must not vanish either: return the other items normally, set needs_review to true and name the unexplained amount in note, so a human can add it.
+
+A little arithmetic under an item is one amount, not several: "Trendyol (Lamp + Nespresso) / 2192-1200 / = 992 TL" is ONE transaction of 992 (the result after "="), and the arithmetic stays in the description: "Trendyol (Lamp + Nespresso) 2192-1200". Without an "=", the amount is the result of the expression.
 
 # Amounts
 
@@ -67,13 +73,16 @@ Pick exactly one category per transaction from this list, judging by what was pa
 
 # Description
 
-- Keep the author's wording and language. Do not translate ("nach hause" stays "nach hause"; Persian stays Persian).
-- Fix only obvious typos of one or two letters ("cofee" becomes "coffee"). Do not rephrase, expand or embellish, and never add details that are not in the message.
-- Remove emojis, decorative symbols and trailing punctuation. Collapse repeated spaces.
-- A description that is only an emoji still describes the purchase: write the word for what it depicts, in English ("🍆" → "Eggplant", "🍞" → "Bread", "☕" → "Coffee"), and categorise it by that meaning. This is the one case where an emoji is translated instead of removed.
-- Drop a person's first name that only says who provided the service ("Barbershop 💈 (arash)" becomes "Barbershop"). Keep words that describe what was bought ("A101 (oil)" becomes "Groceries - A101 (oil)").
-- Grocery stores get the prefix "Groceries - ". Known stores: A101, Migros, Şok, BİM, CarrefourSA, Macrocenter, Metro, File. Example: "A101" becomes "Groceries - A101".
-- Otherwise keep the original capitalization.
+The description is the author's own words, kept faithfully. The only things taken out are the amount and its currency words.
+
+- Keep the wording, language and capitalization. Do not translate ("nach hause" stays "nach hause"; Persian stays Persian), do not rephrase, shorten, expand or embellish, and never add details that are not in the message.
+- Keep everything the author wrote around the item: parentheses, names, remarks ("WiFi Internet Bill (havale to Erkan)" stays exactly that; "Barbershop 💈 (arash)" stays "Barbershop 💈 (arash)").
+- Keep emojis where they are ("Trendyol 🛒 (incl 🖥️ monitor)" stays "Trendyol 🛒 (incl 🖥️ monitor)"; "Pizza 🍕" stays "Pizza 🍕"). Remove only a trailing colon, dash or full stop, and collapse repeated spaces.
+- A description that is only emojis still describes the purchase: write the English word for what it depicts, then the emoji(s) after it ("🍆" → "Eggplant 🍆", "🍞🥐" → "Bread and croissant 🍞🥐"), and categorise it by that meaning.
+- A description written over several lines before its amount is one description, the lines joined with a space: "Cinema Ticket IMAX 🎫 / Nolan's Odyssey 🥹 / 642 TL" → "Cinema Ticket IMAX 🎫 Nolan's Odyssey 🥹".
+- Words that follow the amount on its line belong to the description too, appended at the end: "بلیط تهران به استانبول / 290 euro (1€=200t)" → "بلیط تهران به استانبول (1€=200t)"; "1,745 TRY (including a discounted bottle of Vodka)" keeps its remark.
+- Fix only obvious typos of one or two letters ("cofee" becomes "coffee").
+- Grocery stores get the prefix "Groceries - ". Known stores: A101, Migros, Şok, BİM, CarrefourSA, Macrocenter, Metro, File. Example: "A101" becomes "Groceries - A101"; "A101 (oil)" becomes "Groceries - A101 (oil)".
 
 # Date
 
@@ -107,7 +116,7 @@ Result: no transactions. skip_reason: "no expense in message"
 
 Message (id 6): "Barbershop 💈 (arash)
 604 TL"
-Result: {"description": "Barbershop", "amount": 604, "currency": "TRY", "category": "Health & Personal Care", "date": null}
+Result: {"description": "Barbershop 💈 (arash)", "amount": 604, "currency": "TRY", "category": "Health & Personal Care", "date": null}
 
 Message (id 7): "istanbul card charge
 414 TL"
@@ -141,7 +150,21 @@ Result: {"description": "pharmacy", "amount": 320, "currency": "TRY", "category"
 
 Message (id 18, sent 2026-08-02 13:20): "🍆
 54 TL"
-Result: {"description": "Eggplant", "amount": 54, "currency": "TRY", "category": "Groceries", "date": null}
+Result: {"description": "Eggplant 🍆", "amount": 54, "currency": "TRY", "category": "Groceries", "date": null}
+
+Message (id 22): "Trendyol (Lamp + Nespresso)
+2192-1200
+= 992 TL"
+Result: {"description": "Trendyol (Lamp + Nespresso) 2192-1200", "amount": 992, "currency": "TRY", "category": "Shopping", "date": null}
+
+Message (id 23): "💶 💰
+PROFIT from Time-Deposit Investment
+++ 3,780 TL"
+Result: {"description": "💶 💰 PROFIT from Time-Deposit Investment", "amount": -3780, "currency": "TRY", "category": "Other", "date": null}
+
+Message (id 24): "💸💰 Lamp cancelled and this amount refunded
+++ 971 TL"
+Result: {"description": "💸💰 Lamp cancelled and this amount refunded", "amount": -971, "currency": "TRY", "category": "Housing & Utilities", "date": null}
 
 Message (id 19, sent 2026-09-03 12:01, sender Sam): "Cafe
 225 TL"
