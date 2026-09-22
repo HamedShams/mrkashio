@@ -167,6 +167,8 @@ In Telegram:
 | `/sync` (or `@botname /sync`) | group or private chat | Processes everything pending now. In the group you get the one-line summary; in the private chat the full report. |
 | `/backfill` | private chat | Start pasting older messages. The import starts 20 s after the last part, or at once on `/done`; `/cancel` discards. Members of the paired group only. |
 | `/review` | group or private chat | What waits for a person: imports held as possible duplicates and messages Claude was unsure about, numbered. `/review keep 2` queues item 2 for the next sync anyway; `/review done 2` (or `done all`) closes it. |
+| `/report` | group or private chat | Spending by month, the Summary tab's "By month" table as a message, in the default currency or the one you name in any spelling: `/report €`, `/report euro`, `/report usd`, `/report US Dollar`, `/report lira`, `/report tl`. Computed in code from the sheet with the Summary tab's exchange rates: two reads, no writes, no model. |
+| `@botname` | group | Mentioning the bot, alone or before a command (`@botname /report €`), answers like `/start` or runs that command. A mention followed by a note with a number in it is stored as an expense like any other message. |
 | `/status` | anywhere | What is connected and what still needs setting up. |
 | `/start`, `/help` | anywhere | Who the bot is talking to, the same status, and this list. |
 

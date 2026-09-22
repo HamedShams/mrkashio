@@ -13,13 +13,18 @@ across a row, a blank line) are ignored by every formula.
 
 from __future__ import annotations
 
+import html
 import logging
+from dataclasses import dataclass
+from datetime import date
 
 from gspread.exceptions import WorksheetNotFound
 
 from config import Settings
 from extractor import CURRENCIES, clean_categories
 from sheets import SheetStore, _retry
+
+CURRENCY_SIGNS = {"TRY": "₺", "EUR": "€", "USD": "$", "GBP": "£"}
 
 log = logging.getLogger(__name__)
 
@@ -107,6 +112,85 @@ def default_rates(settings: Settings) -> dict[str, object]:
 
 def _tab(name: str) -> str:
     return "'" + name.replace("'", "''") + "'"
+
+
+# ------------------------------------------------------------ /report: the "By month" table in code, no model, two reads
+
+
+@dataclass
+class MonthTotal:
+    month: date  # first day of the month
+    total: float  # in the requested currency
+    count: int  # rows with a numeric amount, whatever their currency (as the tab counts them)
+
+
+def read_rate_values(store: SheetStore, settings: Settings) -> dict[str, float]:
+    """The Exchange rates table as numbers (formulas evaluated by the sheet). Empty when the Summary tab does not exist."""
+    try:
+        sheet = store.spreadsheet.worksheet(settings.summary_tab)
+    except WorksheetNotFound:
+        return {}
+    rates: dict[str, float] = {}
+    for row in _retry(lambda: sheet.get_values(f"A{FIRST_RATE_ROW}:B{LAST_RATE_ROW}", value_render_option="UNFORMATTED_VALUE")):
+        if len(row) >= 2 and str(row[0]).strip().upper() in CURRENCIES and isinstance(row[1], (int, float)) and row[1] > 0:
+            rates[str(row[0]).strip().upper()] = float(row[1])
+    return rates
+
+
+def monthly_totals(store: SheetStore, settings: Settings, currency: str) -> tuple[list[MonthTotal], list[str]]:
+    """Spending per month in `currency`, computed exactly as the Summary tab does: amount × rate(row currency) / rate(target).
+
+    Two reads (the transactions tab, the rates table) and plain arithmetic. Returns the months in order and notes about
+    what could not be converted.
+    """
+    rates = read_rate_values(store, settings)
+    if not rates:
+        rates = {settings.default_currency: 1.0}
+    notes: list[str] = []
+    if currency not in rates:
+        notes.append(f"no exchange rate for {currency} in the Summary tab's Exchange rates table; only {settings.default_currency} amounts can be shown")
+        return [], notes
+    totals: dict[date, MonthTotal] = {}
+    skipped: dict[str, int] = {}
+    for entry in store.transaction_index():
+        if not isinstance(entry.amount, (int, float)) or isinstance(entry.amount, bool):
+            continue  # a note typed across the row, an amount typed as text: the tab ignores these too
+        code = (entry.currency or settings.default_currency).strip().upper()
+        month = entry.date.replace(day=1)
+        slot = totals.setdefault(month, MonthTotal(month, 0.0, 0))
+        slot.count += 1
+        if code not in rates:
+            skipped[code] = skipped.get(code, 0) + 1
+            continue
+        slot.total += float(entry.amount) * rates[code] / rates[currency]
+    for code, n in sorted(skipped.items()):
+        notes.append(f"{n} row(s) in {code} left out: no rate for it in the Exchange rates table")
+    return [totals[m] for m in sorted(totals)], notes
+
+
+def format_money(value: float, currency: str) -> str:
+    number = f"{value:,.1f}"
+    sign = CURRENCY_SIGNS.get(currency)
+    return f"{sign}{number}" if sign else f"{number} {currency}"
+
+
+def format_monthly_report(months: list[MonthTotal], currency: str, notes: list[str], as_html: bool = False) -> str:
+    """The "By month" table of the Summary tab as a Telegram message."""
+    def esc(text: str) -> str:
+        return html.escape(text, quote=False) if as_html else text
+
+    head = f"📊 Spending by month, in {currency}"
+    lines = [f"<b>{esc(head)}</b>" if as_html else head]
+    if not months:
+        lines.append("No rows with a date and a numeric amount yet.")
+    for m in months:
+        lines.append(f"• {m.month:%b %Y} · {esc(format_money(m.total, currency))} · {m.count} row(s)")
+    if months:
+        lines.append(f"• Total · {esc(format_money(sum(m.total for m in months), currency))} · {sum(m.count for m in months)} row(s)")
+    lines.extend(f"⚠️ {esc(note)}" for note in notes)
+    others = [c for c in CURRENCIES if c != currency]
+    lines.append(esc(f"Same numbers as the Summary tab. Another currency: /report {others[0].lower()}, /report €, /report $ …"))
+    return "\n".join(lines)
 
 
 def _write_cells(sheet, settings: Settings, categories: list[str], rates: dict[str, object] | None = None) -> None:

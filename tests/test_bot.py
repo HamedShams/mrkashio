@@ -33,9 +33,10 @@ def first_matching_handler(application, update):
 
 def test_sync_variants_route_to_the_sync_handler(settings: Settings):
     application = bot.build_application(SimpleNamespace(settings=settings))
-    for text in ("/sync", "/sync@kashio_bot", "@kashio_bot /sync", "@kashio_bot  /sync please"):
+    for text in ("/sync", "/sync@kashio_bot"):
         handler = first_matching_handler(application, update_for(text))
         assert handler is not None and handler.callback is bot.on_sync, text
+    # "@kashio_bot /sync" carries a mention entity and goes through the mention router (tests/test_report.py)
 
 
 def test_plain_group_text_routes_to_ingest_and_edits_to_the_edit_handler(settings: Settings):

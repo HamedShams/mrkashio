@@ -18,8 +18,14 @@ Telegram commands:
                pause, or immediately on /done (/cancel discards)
     /review    what waits for a person: imports held as possible duplicates and Claude's doubts;
                /review keep <n> queues an item for the next sync anyway, /review done <n> (or all) closes it
+    /report    spending by month in the default currency, or in the one named (/report €, /report usd, /report lira);
+               computed from the sheet with the Summary tab's exchange rates, no model involved
     /status    what is connected and what still needs setting up
     /start     who am I talking to, and the commands
+
+Mentioning the bot in the group (@botname, alone or before a command) gets the same answer as /start, or runs the
+command named after the mention. A mention followed by something that has a number in it is treated as an expense
+note and stored like any other message.
 
 Deleted messages: Telegram sends bots no event for a deletion, so before each sync the bot asks Telegram to
 clear its (non-existent) reaction on every message that has rows in the sheet; a deleted message answers
@@ -53,16 +59,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import anthropic
 from apscheduler.triggers.cron import CronTrigger
 from gspread.exceptions import APIError
-from telegram import Bot, Chat, Message, Update, User
+from telegram import Bot, Chat, Message, MessageEntity, Update, User
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, RetryAfter, TelegramError
 from telegram.ext import Application, ChatMemberHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from backfill import import_messages, parse
 from categorise import apply as apply_categories, candidates as category_candidates, plan as plan_categories
-from summary import build_summary
+from summary import build_summary, format_monthly_report, monthly_totals
 from config import ConfigError, Settings
-from extractor import MAX_MESSAGES_PER_CALL, clean_categories, load_prompt
+from extractor import MAX_MESSAGES_PER_CALL, clean_categories, load_prompt, parse_currency
 from sheets import STATUS_PENDING, STATUS_PENDING_REVISION, STATUS_RESOLVED, STATUS_SKIPPED, InboxMessage, SheetStore
 from sync import (
     STATUS_FAILED,
@@ -96,6 +102,7 @@ HELP = (
     "/backfill — paste older messages (private chat); import starts after a short pause or on /done\n"
     "/review — what waits for a look: imports held as possible duplicates, Claude's doubts; "
     "/review keep <n> queues one anyway, /review done <n> closes it\n"
+    "/report — spending by month in the default currency; /report €, /report usd, /report lira for another\n"
     "/setup — in the group, once, to pair me with it\n"
     "/status — what is connected and what is still missing\n"
     "/start — this message"
@@ -592,7 +599,82 @@ async def on_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await app.notify(context.bot, report, already_informed=frozenset({chat.id}))
 
 
-async def on_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def household_only(app: Kashio, bot: Bot, chat: Chat, message: Message, user: User | None) -> bool:
+    """Commands that read or change the sheet: the paired group, or a member of it in a private chat."""
+    if chat.type == Chat.PRIVATE:
+        if not await app.is_household_member(bot, user):
+            await message.reply_text("I only work for members of my paired group." if app.group_id else
+                                     "I'm not paired with a group yet: a group admin has to type /setup in the group first.")
+            return False
+        return True
+    return chat.id == app.group_id
+
+
+async def on_report(update: Update, context: ContextTypes.DEFAULT_TYPE, words: list[str] | None = None) -> None:
+    """Spending by month, computed from the sheet in code: `/report`, `/report €`, `/report usd`, `/report lira`."""
+    app = kashio_of(context)
+    chat, message, user = update.effective_chat, update.effective_message, update.effective_user
+    if chat is None or message is None or not message.text:
+        return
+    app.connect()
+    if not await household_only(app, context.bot, chat, message, user):
+        return
+    if app.store is None:
+        await deliver(context.bot, chat.id, "I can't read the sheet right now.\n" + app.status_text(context.bot.username))
+        return
+    words = message.text.split()[1:] if words is None else words
+    currency = app.settings.default_currency
+    if words:
+        currency = parse_currency(" ".join(words))
+        if currency is None:
+            await message.reply_text(f"I don't know the currency {' '.join(words)!r}. Try TRY, EUR, USD, GBP or TOMAN, or ₺, €, $, £.")
+            return
+    months, notes = await asyncio.to_thread(monthly_totals, app.store, app.settings, currency)
+    await deliver(context.bot, chat.id, format_monthly_report(months, currency, notes, as_html=True), as_html=True)
+
+
+class MentionsBot(filters.MessageFilter):
+    """A group message that mentions this bot (@botname), wherever in the text."""
+
+    def filter(self, message: Message) -> bool:
+        bot = message.get_bot()
+        username = getattr(bot, "username", None)
+        if not username or not message.text:
+            return False
+        return any(e.type == MessageEntity.MENTION and message.text[e.offset : e.offset + e.length].casefold() == f"@{username}".casefold()
+                   for e in message.entities or ())
+
+
+async def on_mention(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """"@botname" in the group: alone or before a command it is a question to the bot; before an expense note it is noise."""
+    message = update.effective_message
+    if message is None or not message.text:
+        return
+    mention = f"@{context.bot.username}"
+    rest = re.sub(re.escape(mention), " ", message.text, flags=re.IGNORECASE).split()
+    at = next((i for i, w in enumerate(rest) if w.startswith("/")), None)  # the command may follow a few words
+    command = rest[at].lower().split("@")[0] if at is not None else ""
+    words = rest[at + 1:] if at is not None else rest
+    if command in ("/sync",):
+        await on_sync(update, context)
+    elif command in ("/status",):
+        await on_status(update, context)
+    elif command in ("/review",):
+        await on_review(update, context, words)
+    elif command in ("/report",):
+        await on_report(update, context, words)
+    elif command in ("/backfill",):
+        await on_backfill(update, context)
+    elif not command and words and any(ch.isdigit() for ch in "".join(words).translate(_ASCII_DIGITS)):
+        await on_group_message(update, context)  # an expense note that happens to mention the bot
+    else:
+        await on_start(update, context)
+
+
+_ASCII_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+
+async def on_review(update: Update, context: ContextTypes.DEFAULT_TYPE, words: list[str] | None = None) -> None:
     """List what waits for a person, or act on the last list: `/review`, `/review keep 2 3`, `/review done 1` or `done all`."""
     app = kashio_of(context)
     chat, message, user = update.effective_chat, update.effective_message, update.effective_user
@@ -609,7 +691,7 @@ async def on_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if app.store is None:
         await deliver(context.bot, chat.id, "I can't read the inbox right now.\n" + app.status_text(context.bot.username))
         return
-    words = message.text.split()[1:]
+    words = message.text.split()[1:] if words is None else words
     action = words[0].lower() if words else ""
     if action in ("keep", "done"):
         listed = context.chat_data.get("review") or []
@@ -824,12 +906,13 @@ def build_application(app: Kashio) -> Application:
     application.add_handler(CommandHandler("sync", on_sync, filters=filters.UpdateType.MESSAGE))
     application.add_handler(CommandHandler("backfill", on_backfill))
     application.add_handler(CommandHandler("review", on_review))
+    application.add_handler(CommandHandler("report", on_report))
     application.add_handler(CommandHandler("done", on_done))
     application.add_handler(CommandHandler("cancel", on_cancel))
-    # "@botname /sync" is not a Telegram command (commands start with "/"), but people type it; treat it as /sync.
-    application.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.Regex(r"(?i)^@\w+\s*/sync\b"), on_sync))
     text = (filters.TEXT | filters.CAPTION) & ~filters.COMMAND
     groups_new = filters.ChatType.GROUPS & filters.UpdateType.MESSAGE
+    # "@botname", alone or before a command, is addressed to the bot and must not be stored as an expense note
+    application.add_handler(MessageHandler(groups_new & filters.TEXT & MentionsBot(), on_mention))
     application.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.UpdateType.EDITED_MESSAGE & text, on_group_edit))
     application.add_handler(MessageHandler(groups_new & text, on_group_message))
     application.add_handler(MessageHandler(groups_new & ~filters.TEXT & ~filters.CAPTION & ~filters.StatusUpdate.ALL, on_group_media))

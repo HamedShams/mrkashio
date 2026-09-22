@@ -52,6 +52,27 @@ MAX_PLAUSIBLE_AMOUNT = 1e12
 Currency = Literal["TRY", "TOMAN", "EUR", "USD", "GBP"]
 CURRENCIES: tuple[str, ...] = get_args(Currency)
 
+# How people write each currency, for commands that take one (/report €, /report lira). Plain lookup, no model involved.
+CURRENCY_ALIASES: dict[str, tuple[str, ...]] = {
+    "TRY": ("try", "tl", "₺", "lira", "liras", "lir", "turkish lira", "türk lirası", "turk lirasi", "لیر", "لیره"),
+    "EUR": ("eur", "€", "euro", "euros", "یورو"),
+    "USD": ("usd", "$", "us$", "dollar", "dollars", "us dollar", "us dollars", "dolar", "دلار"),
+    "GBP": ("gbp", "£", "pound", "pounds", "sterling", "pound sterling", "پوند"),
+    "TOMAN": ("toman", "tomans", "tuman", "تومان", "تومن"),
+}
+
+
+def parse_currency(text: str) -> str | None:
+    """"€", "euro", "EURO", "eur", "US Dollar", "dollars", "lira", "tl" → the currency code, or None when unknown."""
+    key = " ".join(text.replace(".", " ").split()).casefold()
+    if not key:
+        return None
+    for code, aliases in CURRENCY_ALIASES.items():
+        if key == code.casefold() or key in aliases or key.replace(" ", "") in {a.replace(" ", "") for a in aliases}:
+            return code
+    return None
+
+
 # Categories come from the spreadsheet's own dropdown on the category column (SheetStore.category_options), so
 # the sheet stays the single source of truth. This list is used only when the sheet defines none.
 DEFAULT_CATEGORIES: tuple[str, ...] = (
