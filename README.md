@@ -93,7 +93,7 @@ An import never inserts what is already there, so you can paste any range you ar
 - A message with the **same sender and send time as a stored one but a different text** is that message, corrected: it is queued as a revision and the sync updates the rows it produced earlier, exactly as an edit in Telegram would. So if a copy came out wrong, fix the text in your paste and paste it again. (Telegram copies quick consecutive messages as one block; a block that spans several stored messages is skipped when it equals their texts and held for `/review` when it differs.)
 - Lines that start with `...` are reported back: Telegram sometimes leaves a line out when several messages are copied at once (Persian text, typically) and shows `...` instead, so the amount below it has lost its description. Check those messages in the group and paste them again.
 
-`/review` lists what is held; `/review keep 2` queues item 2 for the next sync anyway (it was not a duplicate after all), `/review done 2` (or `done all`) closes it. Nothing is dismissed by date unless you ask: `python bot.py backfill FILE --from 2026-07-29` drops everything before that day. Imported messages are processed 150 per Claude call.
+`/review` lists what is held; `/review keep 2` queues item 2 for the next sync anyway (it was not a duplicate after all), `/review done 2` (or `done all`) closes it. Nothing is dismissed by date unless you ask: `python bot.py backfill FILE --from 2026-07-29` drops everything before that day. Imported messages are processed 60 per Claude call.
 
 The recognised paste format is what Telegram produces when you copy messages; a missing comma or colon, a 12-hour clock, and the Desktop variant (`Name, [01.09.2026 21:14]`) are all accepted:
 

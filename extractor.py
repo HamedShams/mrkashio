@@ -64,12 +64,12 @@ DEFAULT_CATEGORIES: tuple[str, ...] = (
 CATEGORY_HINTS: dict[str, str] = {
     # the nine defaults
     "groceries": "supermarkets, markets, bakeries, water and other food for home (A101, Migros, Şok, BİM)",
-    "eating out": "restaurants, cafes, coffee, bars, takeaway, a food order (the food itself; a separate delivery fee is Transport)",
-    "transport": "moving people or things: taxi, Uber, bus, metro, Istanbulkart, fuel, parking, tolls, courier, shipping and delivery fees (Lieferung, kargo)",
-    "housing & utilities": "rent, deposit, building fees (aidat), electricity, water, gas and the home internet (WiFi) bill, home supplies, furniture, repairs; mobile lines are Subscriptions",
+    "eating out": "restaurants, cafes and coffee chains (a Starbucks receipt is Eating Out even when it includes coffee capsules), bars, takeaway, a food order (the food itself; a separate delivery fee is Transport)",
+    "transport": "moving people or things: taxi, Uber, bus, metro, Istanbulkart, fuel, parking, tolls and exit fees, airline baggage and overweight fees, courier, shipping and delivery fees (Lieferung, kargo)",
+    "housing & utilities": "rent, deposit, building fees (aidat), the place the household lives in while settling somewhere (an Airbnb or short-term flat and its extensions), electricity, water, gas and the home internet (WiFi) bill, home supplies, furniture, repairs; mobile lines are Subscriptions",
     "health & personal care": "pharmacy, doctor, dentist, hospital, tests, health insurance, barber, hairdresser, cosmetics, hygiene, gym",
     "shopping": "clothes, shoes, electronics, gifts, malls and general retail not covered elsewhere",
-    "leisure & travel": "going out and going away: cinema, concerts, events, hobbies, games, hotels, flights, tours, trips; never a recurring service",
+    "leisure & travel": "going out and going away: cinema, concerts, events, hobbies, games, holiday hotels, flights, tours, trips; never a recurring service, and not the flat or Airbnb the household lives in",
     "subscriptions": "recurring paid services that are not a home utility: mobile data packages and SIM top-ups (Turkcell), app and software subscriptions (Cursor, ChatGPT, Apple One, Spotify, Netflix), memberships such as Uber One",
     "other": "money transfers to people (havale, Überweisung), bank and government charges, documents, services, anything that fits nowhere else",
     # finer names some sheets use

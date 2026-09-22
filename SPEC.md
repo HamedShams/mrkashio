@@ -108,7 +108,7 @@ response = client.messages.parse(
 )
 ```
 
-Chunks of at most 150 messages per call. Token usage from `response.usage` goes into the run log.
+Chunks of at most 60 messages per call (a 64k output budget). Token usage from `response.usage` goes into the run log.
 
 ---
 
@@ -372,7 +372,7 @@ Dependencies: `python-telegram-bot[job-queue]` (Telegram + scheduler), `gspread`
 
 **Verified live by 19 Sep 2026:** the scheduled trigger (15 Sep), the photo acknowledgement, manual `/sync` runs, an edit re-synced in place, a deleted message's row removed, the Summary tab built over live data, the plain-JSON extractor at `high` on the batch that used to fail (10 of 10 messages, 24 items, one call), and a week of production use.
 
-**Not exercised live:** `/setup`, `/backfill` and `/status` typed in Telegram, the note acknowledgement, a Telegram delivery failure, the guardrail's refusal path, and the health endpoint under Railway.
+**Exercised live by 22 Sep 2026 as well:** `/backfill` (pasted, in several parts and with the command), `/review` and `/review done all`, `/status`, the note acknowledgement, imports corrected by a re-paste, `resync` and `categorise --all`, a Telegram delivery failure (an unescaped `<n>` in the `/review` list; the reply now falls back to plain text). **Not exercised live:** `/setup` typed in Telegram, the guardrail's refusal path, and the health endpoint under Railway.
 
 ## 11. Deploy to-do
 

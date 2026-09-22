@@ -63,6 +63,28 @@ def test_review_lists_numbered_items_and_remembers_them(settings):
     assert chat_data["review"] == ITEMS
 
 
+def test_review_list_is_valid_telegram_html(settings):
+    """Telegram rejects any '<' that is not a tag; a '<n>' placeholder once made /review answer nothing at all."""
+    import re
+    sent = []
+    run(app_with(settings, ITEMS), "/review", {}, sent)
+    stripped = re.sub(r"</?b>", "", sent[0])
+    assert "<" not in stripped and ">" not in stripped and "/review done 2" in sent[0]
+
+
+def test_html_rejected_by_telegram_is_resent_as_plain_text(settings):
+    from telegram.error import BadRequest
+    calls = []
+
+    async def send_message(chat_id, text, parse_mode=None):
+        calls.append((text, parse_mode))
+        if parse_mode is not None:
+            raise BadRequest("Can't parse entities: unsupported start tag \"n\" at byte offset 12")
+
+    ok = asyncio.run(bot.deliver(SimpleNamespace(send_message=send_message), 42, "<b>Head</b>\nuse &lt;n&gt; here", as_html=True))
+    assert ok and calls[-1] == ("Head\nuse <n> here", None)
+
+
 def test_keep_queues_the_chosen_items_and_done_closes_them(settings):
     sent, chat_data = [], {}
     app = app_with(settings, ITEMS)

@@ -43,6 +43,7 @@ import html
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -324,14 +325,24 @@ def _as_int(value: str | None) -> int | None:
 
 
 async def deliver(bot: Bot, chat_id: int, text: str, as_html: bool = False) -> bool:
-    """Send a message without letting a Telegram failure break the sync that produced it."""
+    """Send a message without letting a Telegram failure break the sync that produced it.
+
+    If Telegram rejects the HTML (an unescaped "<" somewhere), the same text goes out as plain text with the
+    tags stripped rather than not at all.
+    """
     try:
         while text:
             cut = TELEGRAM_MESSAGE_LIMIT
             if as_html and len(text) > cut:  # never split inside a tag or an entity
                 cut = max(text.rfind("\n", 0, cut), 1)
             chunk, text = text[:cut], text[cut:]
-            await bot.send_message(chat_id, chunk, parse_mode=ParseMode.HTML if as_html else None)
+            try:
+                await bot.send_message(chat_id, chunk, parse_mode=ParseMode.HTML if as_html else None)
+            except BadRequest as exc:
+                if not as_html or "parse" not in str(exc).lower():
+                    raise
+                log.warning("Telegram rejected the HTML (%s); sending it as plain text", exc)
+                await bot.send_message(chat_id, html.unescape(re.sub(r"</?b>", "", chunk)))
         return True
     except TelegramError as exc:
         hint = " Open a private chat with the bot and press Start first." if "initiate" in str(exc) or "not found" in str(exc).lower() else ""
@@ -637,7 +648,7 @@ async def on_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         excerpt = " | ".join(part.strip() for part in item.text.splitlines() if part.strip())[:60]
         label = "possible duplicate" if item.status == "duplicate" else "needs review"
         lines.append(html.escape(f"{number}. {item.sender} · {item.sent_at:%d %b %H:%M} · “{excerpt}” — {label}: {item.note}", quote=False))
-    lines += ["", "/review done <n> closes an item (or /review done all); /review keep <n> queues it for the next sync anyway."]
+    lines += ["", "/review done 2 closes item 2 (or /review done all); /review keep 2 queues it for the next sync anyway."]
     await deliver(context.bot, chat.id, "\n".join(lines), as_html=True)
 
 
