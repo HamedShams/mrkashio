@@ -30,7 +30,7 @@ def test_imports_skip_note_only_messages_and_trim_mixed_ones(settings):
     result = import_messages(store, settings, messages)
     assert result.notes == 1 and result.imported == 1
     assert store.rows[0][4] == "A101 300"  # the note part never reaches the inbox
-    assert "Skipped 1 private note(s)" in result.describe()
+    assert "Skipped 1 private notes" in result.describe()
 
 
 def test_default_keyword_is_hash_note(settings):

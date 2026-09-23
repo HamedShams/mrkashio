@@ -80,6 +80,13 @@ def test_apply_pairs_amount_messages_skips_noise_and_flags_doubt(settings):
     assert (report.skipped, report.merged, len(report.review)) == (1, 1, 1)
 
 
+def test_money_back_marker_makes_the_row_negative_even_if_the_model_forgot(settings):
+    pending = [InboxMessage(2, 60, "Alex", at(2026, 8, 19, 2), None, "💸💰 Lamp cancelled and refunded\n++ 971 TL\n\nCoffee\n300 TL", "pending")]
+    report = report_for()
+    _apply(Extraction(parsed(result(60, [tx("💸💰 Lamp cancelled and refunded", 971), tx("Coffee", 300)])), 1, 1), pending, settings, report)
+    assert [r.amount for r in report.rows] == [-971.0, 300.0]
+
+
 def test_late_posted_history_is_written_with_its_own_dates(settings):
     pending = [InboxMessage(2, 52, "Alex", at(2026, 9, 16, 17), None, "Sep 3\n------\nUBER ONE 250 TL", "pending")]
     report = report_for()
@@ -89,7 +96,7 @@ def test_late_posted_history_is_written_with_its_own_dates(settings):
 
 def test_summaries_read_well_in_every_state():
     ok = report_for(); ok.status = STATUS_OK; ok.processed = 3; ok.calls = 1
-    assert format_summary(ok).startswith("✅ Kashio wrote nothing from 3 message(s).")
+    assert format_summary(ok).startswith("✅ Kashio wrote nothing from 3 messages.")
     quiet_ok = report_for(); quiet_ok.status = STATUS_OK
     assert format_summary(quiet_ok).startswith("✅ Kashio made no Claude call this time.")
     quiet = report_for(TRIGGER_SCHEDULE); quiet.status = STATUS_SKIPPED_THRESHOLD; quiet.pending, quiet.threshold = 3, 5

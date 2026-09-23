@@ -68,7 +68,7 @@ def test_all_mode_rechecks_every_row_and_writes_only_what_changes(settings):
     result = plan(client, settings, found, ["Groceries", "Eating Out", "Leisure & Travel"])
     assert result.changes() == {5: "Leisure & Travel", 7: "Groceries"}  # row 8 already says Eating Out
     text = result.describe()
-    assert "3 row(s) re-checked" in text and "2 would change" in text and "G8" not in text
+    assert "3 rows re-checked" in text and "2 would change" in text and "G8" not in text
     store = store_with(settings, ROWS, categories={8: "Eating Out"})
     assert apply(store, result.changes(), {c.row: c.current for c in found}) == "G5:G7"
     # a re-check that would overwrite a cell someone changed meanwhile is refused

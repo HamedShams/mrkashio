@@ -84,14 +84,9 @@ On 19 Sep 2026 a ten-message batch at `high` came back with results for only two
 
 ### Your traffic, priced
 
-Assumptions from your numbers: 50 transactions and 4 noise messages per 10 days, so per month **150 transactions in about 120 messages, plus 12 noise messages, 132 messages total**. Token estimates: system prompt plus schema about 1,700 tokens per call; about 45 input tokens per message; about 35 output tokens per message plus 30 per transaction; thinking about 20 tokens per message at `medium`, 50 at `high`, 120 at `xhigh`.
+Measured, not estimated (22 Sep 2026, effort `high`): the system prompt plus schema is about 7,300 input tokens per call; a sync of 46 pasted messages cost $0.21, one of 15 messages $0.13, the full re-extraction of 77 messages $0.37 in two calls, and a two-message sync $0.02. Output tokens grow with the number of expenses; input is dominated by the fixed prompt, so every extra call costs a few cents on its own.
 
-| Schedule | Calls / month | Input tokens | Output tokens incl. thinking | `medium` | `high` | `xhigh` | Pessimistic (×3 of high) |
-|---|---|---|---|---|---|---|---|
-| **Twice a month (1st, 15th) — default** | 2 | ~9,300 | ~11,800 – 25,000 | ~$0.14 | **~$0.18** | ~$0.30 | ~$0.55 |
-| Weekly (Monday) | 4 | ~12,700 | ~11,800 – 25,000 | ~$0.14 | ~$0.18 | ~$0.30 | ~$0.55 |
-
-Per run: about 7 cents twice a month, or about 3.5 cents weekly. A `/sync` with nothing pending makes no API call. Roughly **$2 a year**. Weekly costs almost the same as twice-monthly because output tokens scale with your transactions, not with the number of runs. No prompt caching and no Batches API: both would save fractions of a cent per call in exchange for code.
+For a household logging about 150 expenses a month (roughly 200 messages in the group) that is **near $0.4 a month** at two syncs a month, a bit more with manual `/sync` runs in between. `categorise --all` over 300 rows costs about $0.17. A `/sync` with nothing pending, `/report` and `/review` make no API call.
 
 Safety net: set a monthly spend limit of $5 in the Anthropic console (Settings → Limits).
 

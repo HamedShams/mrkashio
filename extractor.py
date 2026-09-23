@@ -62,6 +62,21 @@ CURRENCY_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 
+MONEY_BACK_AMOUNT = re.compile(r"\+\+\s*[€$£₺]?\s*(\d[\d.,]*)")
+
+
+def money_back_amounts(text: str) -> set[float]:
+    """The amounts a message writes with "++" in front: money that came back, to be stored negative."""
+    found: set[float] = set()
+    for digits in MONEY_BACK_AMOUNT.findall(text.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))):
+        for reading in {digits.replace(",", ""), digits.replace(".", "").replace(",", "."), digits.replace(",", "").replace(".", "")}:
+            try:
+                found.add(float(reading))
+            except ValueError:
+                continue
+    return found
+
+
 def parse_currency(text: str) -> str | None:
     """"€", "euro", "EURO", "eur", "US Dollar", "dollars", "lira", "tl" → the currency code, or None when unknown."""
     key = " ".join(text.replace(".", " ").split()).casefold()

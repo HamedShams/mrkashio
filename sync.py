@@ -16,7 +16,7 @@ from datetime import date, datetime, timedelta
 import anthropic
 
 from config import Settings
-from extractor import Extraction, clean_categories, extract
+from extractor import Extraction, clean_categories, extract, money_back_amounts
 from sheets import (
     STATUS_DELETED,
     STATUS_MERGED,
@@ -217,11 +217,11 @@ def run_sync(
                 for message in report.retractions:
                     outcome = store.replace_transactions(message.message_id, [])
                     report.rows_deleted += outcome.deleted
-                    done.append((message, STATUS_SKIPPED, 0, f"retracted after an edit: {outcome.deleted} row(s) removed"))
+                    done.append((message, STATUS_SKIPPED, 0, f"retracted after an edit: {outcome.deleted} rows removed"))
                 for message in report.deletions:
                     outcome = store.replace_transactions(message.message_id, [])
                     report.rows_deleted += outcome.deleted
-                    done.append((message, STATUS_DELETED, 0, f"deleted in Telegram: {outcome.deleted} row(s) removed from the sheet"))
+                    done.append((message, STATUS_DELETED, 0, f"deleted in Telegram: {outcome.deleted} rows removed from the sheet"))
                 store.mark_messages(done)
                 done = []
                 report.status = STATUS_OK
@@ -256,10 +256,12 @@ def _apply(
         message = by_id.get(result.message_id)
         if message is None:
             continue  # audited away already; belt and braces
+        back = money_back_amounts(message.text)  # "++ 971" is money coming back: negative, whatever the model returned
         rows = [
             TransactionRow(
                 date=parse_override_date(t.date) or rollover_date(message.sent_at, settings.day_rollover_hour),
-                amount=t.amount, currency=t.currency, description=sanitize_description(t.description),
+                amount=-abs(t.amount) if abs(t.amount) in back else t.amount,
+                currency=t.currency, description=sanitize_description(t.description),
                 category=t.category, message_id=message.message_id,
             )
             for t in result.transactions
@@ -303,7 +305,7 @@ def _hold_reason(message: InboxMessage, rows: list[TransactionRow], result, shor
     if result.needs_review and len(rows) < message.rows_added:
         return f"Claude was unsure ({result.note or 'needs a look'}) and returned fewer items ({len(rows)}) than the {message.rows_added} rows already written"
     if message.rows_added >= 2 and len(rows) * 2 < message.rows_added and not result.skip_reason:
-        return f"the new answer has {len(rows)} item(s) for a message that had {message.rows_added} rows"
+        return f"the new answer has {len(rows)} items for a message that had {message.rows_added} rows"
     return None
 
 
@@ -335,9 +337,9 @@ def _excerpt(item: ReviewItem, as_html: bool = False) -> str:
 
 def _below_threshold_line(report: RunReport) -> str:
     if report.trigger == TRIGGER_SCHEDULE:
-        return (f"⏭ {report.pending - report.removed_messages} pending message(s), below the minimum of {report.threshold} "
+        return (f"⏭ {report.pending - report.removed_messages} pending messages, below the minimum of {report.threshold} "
                 f"for a scheduled sync. Nothing was sent to Claude.")
-    return f"Nothing new to process: {report.pending - report.removed_messages} pending message(s), minimum is {report.threshold}."
+    return f"Nothing new to process: {report.pending - report.removed_messages} pending messages, minimum is {report.threshold}."
 
 
 def format_summary(report: RunReport, as_html: bool = False) -> str:
@@ -350,37 +352,37 @@ def format_summary(report: RunReport, as_html: bool = False) -> str:
     prefix = "🧪 Dry run, nothing written." if report.status == STATUS_DRY_RUN else "✅ Kashio"
     written = len(report.rows) + report.rows_updated
     if written:
-        lines.append(f"{prefix} wrote {len(report.rows)} new row(s)" + (f" ({format_totals(report)})" if report.rows else "")
-                     + (f" and updated {report.rows_updated}" if report.rows_updated else "") + f" from {report.processed} message(s).")
+        lines.append(f"{prefix} wrote {len(report.rows)} new rows" + (f" ({format_totals(report)})" if report.rows else "")
+                     + (f" and updated {report.rows_updated}" if report.rows_updated else "") + f" from {report.processed} messages.")
     elif report.calls:
-        lines.append(f"{prefix} wrote nothing from {report.processed} message(s).")
+        lines.append(f"{prefix} wrote nothing from {report.processed} messages.")
     else:
         lines.append(f"{prefix} made no Claude call this time.")
     if report.rows_deleted:
         what = []
         if report.deletions:
-            what.append(f"{len(report.deletions)} message(s) deleted in Telegram")
+            what.append(f"{len(report.deletions)} messages deleted in Telegram")
         if report.retractions:
             what.append(f"{len(report.retractions)} retracted by an edit")
-        lines.append(f"🗑 Removed {report.rows_deleted} row(s) ({', '.join(what) or 'edited messages'}).")
+        lines.append(f"🗑 Removed {report.rows_deleted} rows ({', '.join(what) or 'edited messages'}).")
     if not report.calls and report.pending - report.removed_messages:
         lines.append(_below_threshold_line(report))
     if report.skipped:
-        lines.append(f"⏭ Skipped {report.skipped} message(s) that were not expenses.")
+        lines.append(f"⏭ Skipped {report.skipped} messages that were not expenses.")
     if report.merged:
-        lines.append(f"↩️ {report.merged} message(s) merged into another (an amount or a correction).")
+        lines.append(f"↩️ {report.merged} messages merged into another (an amount or a correction).")
     if report.review:
-        lines.append(f"⚠️ {len(report.review)} message(s) need a look:")
+        lines.append(f"⚠️ {len(report.review)} messages need a look:")
         for item in report.review[:MAX_REVIEW_ITEMS_IN_SUMMARY]:
             lines.append(f"  • {_excerpt(item, as_html)} — {_t(item.note, as_html)}")
         if len(report.review) > MAX_REVIEW_ITEMS_IN_SUMMARY:
             lines.append(f"  • … and {len(report.review) - MAX_REVIEW_ITEMS_IN_SUMMARY} more, see the report")
     if report.held:
-        lines.append(f"✋ {len(report.held)} edited message(s) left unchanged in the sheet, because the new answer looked incomplete:")
+        lines.append(f"✋ {len(report.held)} edited messages left unchanged in the sheet, because the new answer looked incomplete:")
         for item in report.held[:MAX_REVIEW_ITEMS_IN_SUMMARY]:
             lines.append(f"  • {_excerpt(item, as_html)} — {_t(item.note, as_html)}. Edit it again to retry.")
     if report.unanswered:
-        lines.append(f"🔁 {len(report.unanswered)} message(s) got no usable answer from Claude and stay pending; "
+        lines.append(f"🔁 {len(report.unanswered)} messages got no usable answer from Claude and stay pending; "
                      "they will be retried at the next sync.")
     return "\n".join(lines)
 
@@ -410,7 +412,7 @@ def format_report(report: RunReport, include_rows: bool = False, as_html: bool =
     lines.append(f"• Skipped: {report.skipped} · merged: {report.merged} · needs review: {len(report.review)} · "
                  f"held: {len(report.held)} · unanswered: {len(report.unanswered)}")
     if report.calls or report.input_tokens:
-        lines.append(f"• Claude: {report.calls} call(s), {report.input_tokens:,} in / {report.output_tokens:,} out · "
+        lines.append(f"• Claude: {report.calls} calls, {report.input_tokens:,} in / {report.output_tokens:,} out · "
                      f"cost ${report.cost_usd:.4f} ({report.model}, effort {report.effort})")
     if report.problems:
         lines += ["", bold("🚫 Rejected answers:")]
@@ -435,7 +437,7 @@ def format_report(report: RunReport, include_rows: bool = False, as_html: bool =
             lines.append(f"• {row.date:%d/%m/%Y} · {format_amount(row.amount, row.currency)} · {row.currency} · "
                          f"{_t(row.description, as_html)} · {_t(row.category, as_html)}")
         for message, rows in report.revisions:
-            lines.append(f"• message {message.message_id} re-synced → {len(rows)} row(s):")
+            lines.append(f"• message {message.message_id} re-synced → {len(rows)} rows:")
             for row in rows:
                 lines.append(f"    {row.date:%d/%m/%Y} · {format_amount(row.amount, row.currency)} · {_t(row.description, as_html)} · {_t(row.category, as_html)}")
     if report.error:

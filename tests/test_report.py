@@ -15,7 +15,7 @@ import summary
 
 def test_currency_aliases_cover_symbols_words_and_languages():
     assert parse_currency("€") == parse_currency("euro") == parse_currency("EURO") == parse_currency("eur") == "EUR"
-    assert parse_currency("TRY") == parse_currency("TL") == parse_currency("Lira") == parse_currency("Lir") == parse_currency(" tl ") == "TRY"
+    assert parse_currency("TRY") == parse_currency("TL") == parse_currency("LIRA") == parse_currency("Lir") == parse_currency(" tl ") == "TRY"
     assert parse_currency("$") == parse_currency("USD") == parse_currency("US Dollar") == parse_currency("dollars") == parse_currency("دلار") == "USD"
     assert parse_currency("£") == parse_currency("pounds") == "GBP" and parse_currency("تومان") == parse_currency("Toman") == "TOMAN"
     assert parse_currency("xyz") is None and parse_currency("") is None
@@ -47,7 +47,7 @@ def test_monthly_totals_follow_the_tab_arithmetic_and_report_what_cannot_convert
     assert [(m.month, m.count) for m in months] == [(date(2026, 6, 1), 3), (date(2026, 7, 1), 3)]
     assert months[0].total == 58_029_000 * 0.000005 / 0.02 + 1021 * 1.1 / 0.02 + 95  # 14,507.25 + 56,155 + 95
     assert months[1].total == 1000 - 500  # the GBP row is counted but not converted
-    assert notes == ["1 row(s) in GBP left out: no rate for it in the Exchange rates table"]
+    assert notes == ["1 rows in GBP left out: no rate for it in the Exchange rates table"]
     in_eur, _ = monthly_totals(StubStore(ENTRIES), settings, "EUR")
     assert round(in_eur[1].total, 4) == round(500 * 0.02 / 1.1, 4)
     none, notes = monthly_totals(StubStore(ENTRIES), settings, "GBP")
@@ -57,22 +57,11 @@ def test_monthly_totals_follow_the_tab_arithmetic_and_report_what_cannot_convert
 def test_report_text_matches_the_tab_format():
     months = [MonthTotal(date(2026, 6, 1), 221832.94, 36), MonthTotal(date(2026, 7, 1), 330199.4, 122)]
     text = format_monthly_report(months, "TRY", [], as_html=True)
-    assert text.startswith("<b>📊 Spending by month, in TRY</b>\n• Jun 2026 · ₺221,832.9 · 36 row(s)\n• Jul 2026 · ₺330,199.4 · 122 row(s)\n• Total · ₺552,032.3 · 158 row(s)")
+    assert text.startswith("<b>📊 Spending by month, in TRY</b>\n• Jun 2026 · ₺221,832.9 · 36 rows\n• Jul 2026 · ₺330,199.4 · 122 rows\n• Total · ₺552,032.3 · 158 rows")
     assert "/report €" in text and "<" not in text.replace("<b>", "").replace("</b>", "")
     assert "3,969.0 EUR" not in format_monthly_report([MonthTotal(date(2026, 6, 1), 3969.0, 36)], "EUR", [], False)  # € sign, not a suffix
     assert "€3,969.0" in format_monthly_report([MonthTotal(date(2026, 6, 1), 3969.0, 36)], "EUR", [], False)
     assert "TOMAN" in format_monthly_report([MonthTotal(date(2026, 6, 1), 1, 1)], "TOMAN", [], False)
-
-
-def group_update(text: str, username: str = "kashio_bot"):
-    from tests.test_bot import update_for
-    update = update_for(text)
-    # update_for builds entities for a leading command only; add the mention entity the way Telegram does
-    mention = f"@{username}"
-    if mention in text:
-        entities = list(update.message.entities) + [MessageEntity(type=MessageEntity.MENTION, offset=text.index(mention), length=len(mention))]
-        message = update.message.__class__(**{**update.message.to_dict(), "entities": [e.to_dict() for e in entities]}) if False else None
-    return update
 
 
 def test_mentions_route_to_the_right_handler(settings, monkeypatch):

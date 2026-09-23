@@ -112,9 +112,9 @@ def test_deletion_removes_rows_even_below_the_scheduled_threshold(settings, monk
     report = sync.run_sync(settings, store, object(), "prompt", trigger=sync.TRIGGER_SCHEDULE, requested_by="schedule")
     assert report.status == sync.STATUS_OK and report.calls == 0
     assert store.replaced == [(78, [])] and report.rows_deleted == 1
-    assert store.marks == [(pending[0], STATUS_DELETED, 0, "deleted in Telegram: 1 row(s) removed from the sheet")]
+    assert store.marks == [(pending[0], STATUS_DELETED, 0, "deleted in Telegram: 1 rows removed from the sheet")]
     summary = sync.format_summary(report)
-    assert "made no Claude call" in summary and "Removed 1 row(s) (1 message(s) deleted in Telegram)" in summary
+    assert "made no Claude call" in summary and "Removed 1 rows (1 messages deleted in Telegram)" in summary
 
 
 def test_text_messages_still_wait_for_the_threshold_while_deletions_go_through(settings, monkeypatch):
@@ -124,7 +124,7 @@ def test_text_messages_still_wait_for_the_threshold_while_deletions_go_through(s
     monkeypatch.setattr(sync, "extract", lambda *a, **k: (_ for _ in ()).throw(AssertionError("below threshold: no call")))
     report = sync.run_sync(settings, store, object(), "prompt", trigger=sync.TRIGGER_SCHEDULE, requested_by="schedule")
     assert report.status == sync.STATUS_OK and report.rows_deleted == 1 and [m[0].message_id for m in store.marks] == [78]
-    assert "1 pending message(s), below the minimum of 5" in sync.format_summary(report)
+    assert "1 pending messages, below the minimum of 5" in sync.format_summary(report)
 
 
 def test_html_report_is_bold_bulleted_and_escaped(settings):

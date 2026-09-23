@@ -164,7 +164,7 @@ def monthly_totals(store: SheetStore, settings: Settings, currency: str) -> tupl
             continue
         slot.total += float(entry.amount) * rates[code] / rates[currency]
     for code, n in sorted(skipped.items()):
-        notes.append(f"{n} row(s) in {code} left out: no rate for it in the Exchange rates table")
+        notes.append(f"{n} rows in {code} left out: no rate for it in the Exchange rates table")
     return [totals[m] for m in sorted(totals)], notes
 
 
@@ -184,9 +184,9 @@ def format_monthly_report(months: list[MonthTotal], currency: str, notes: list[s
     if not months:
         lines.append("No rows with a date and a numeric amount yet.")
     for m in months:
-        lines.append(f"• {m.month:%b %Y} · {esc(format_money(m.total, currency))} · {m.count} row(s)")
+        lines.append(f"• {m.month:%b %Y} · {esc(format_money(m.total, currency))} · {m.count} rows")
     if months:
-        lines.append(f"• Total · {esc(format_money(sum(m.total for m in months), currency))} · {sum(m.count for m in months)} row(s)")
+        lines.append(f"• Total · {esc(format_money(sum(m.total for m in months), currency))} · {sum(m.count for m in months)} rows")
     lines.extend(f"⚠️ {esc(note)}" for note in notes)
     others = [c for c in CURRENCIES if c != currency]
     lines.append(esc(f"Same numbers as the Summary tab. Another currency: /report {others[0].lower()}, /report €, /report $ …"))

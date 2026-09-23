@@ -80,12 +80,12 @@ class Parsed:
         if not self.unparsed:
             return None
         shown = "; ".join(line[:60] for line in self.unparsed[:3])
-        return f"{len(self.unparsed)} line(s) came before the first message header and were ignored: {shown}"
+        return f"{len(self.unparsed)} lines came before the first message header and were ignored: {shown}"
 
     def notes(self) -> list[str]:
         lines = [self.problems()] if self.unparsed else []
         if self.ignored:
-            lines.append(f"Left out {self.ignored} message(s) written by the bot itself.")
+            lines.append(f"Left out {self.ignored} messages written by the bot itself.")
         return lines
 
 
@@ -103,15 +103,15 @@ class ImportResult:
     cut: list[str] = field(default_factory=list)  # messages with a "..." line: something was probably left out of the copy
 
     def describe(self) -> str:
-        lines = [f"Found {self.found} message(s); queued {self.imported} for the next sync."]
+        lines = [f"Found {self.found} messages; queued {self.imported} for the next sync."]
         if self.revised:
-            lines.append(f"✏️ {len(self.revised)} message(s) were already stored with a different text; the new text counts as a correction "
+            lines.append(f"✏️ {len(self.revised)} messages were already stored with a different text; the new text counts as a correction "
                          "and their rows will be updated at the sync:")
             lines.extend(f"  • {item}" for item in self.revised[:MAX_LISTED])
             if len(self.revised) > MAX_LISTED:
                 lines.append(f"  • … and {len(self.revised) - MAX_LISTED} more")
         if self.cut:
-            lines.append(f"⚠️ {len(self.cut)} message(s) contain a line that starts with \"...\". Telegram sometimes leaves a line out when "
+            lines.append(f"⚠️ {len(self.cut)} messages contain a line that starts with \"...\". Telegram sometimes leaves a line out when "
                          "messages are copied (Persian text, typically), so the amount below it may have lost its description. "
                          "Check these in the group and paste them again if so:")
             lines.extend(f"  • {item}" for item in self.cut[:MAX_LISTED])
@@ -132,7 +132,7 @@ class ImportResult:
         if self.duplicates:
             lines.append(f"Skipped {self.duplicates} already in the inbox (same text within two minutes of the same send time, whatever their status).")
         if self.notes:
-            lines.append(f"Skipped {self.notes} private note(s); notes are never stored or sent to Claude.")
+            lines.append(f"Skipped {self.notes} private notes; notes are never stored or sent to Claude.")
         return "\n".join(lines)
 
 

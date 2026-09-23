@@ -74,7 +74,7 @@ class Plan:
     def describe(self) -> str:
         by_row = {c.row: c for c in self.candidates}
         rechecking = any(c.current for c in self.candidates)
-        lines = [f"{len(self.candidates)} row(s) {'re-checked' if rechecking else 'without a category'}; Claude answered {len(self.mapping)}; "
+        lines = [f"{len(self.candidates)} rows {'re-checked' if rechecking else 'without a category'}; Claude answered {len(self.mapping)}; "
                  f"{len(self.changes())} would change."]
         for row in sorted(self.changes()):
             c = by_row[row]
@@ -83,7 +83,7 @@ class Plan:
         if self.counts():
             lines.append("Per category: " + ", ".join(f"{name} {n}" for name, n in self.counts().items()))
         if self.unanswered:
-            lines.append(f"No usable answer for row(s) {', '.join(map(str, self.unanswered))}; run again for them.")
+            lines.append(f"No usable answer for rows {', '.join(map(str, self.unanswered))}; run again for them.")
         for problem in self.problems:
             lines.append(f"Problem: {problem}")
         return "\n".join(lines)
@@ -128,7 +128,7 @@ def plan(client: anthropic.Anthropic, settings: Settings, rows: Sequence[Candida
         answered = _ask(client, settings, system, chunk, model, result)
         missing = expected - set(answered)
         if missing:
-            log.warning("%d row(s) came back without a usable category; asking once more", len(missing))
+            log.warning("%d rows came back without a usable category; asking once more", len(missing))
             answered |= _ask(client, settings, system, [c for c in chunk if c.row in missing], model, result)
         result.mapping.update({row: category for row, category in answered.items() if row in expected})
         result.unanswered.extend(sorted(expected - set(result.mapping)))

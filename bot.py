@@ -98,14 +98,18 @@ GROUP_ROLES = ("member", "administrator", "creator")
 ADMIN_ROLES = ("administrator", "creator")
 HELP = (
     "Commands:\n"
-    "/sync — process everything pending now\n"
-    "/backfill — paste older messages (private chat); import starts after a short pause or on /done\n"
-    "/review — what waits for a look: imports held as possible duplicates, Claude's doubts; "
-    "/review keep <n> queues one anyway, /review done <n> closes it\n"
-    "/report — spending by month in the default currency; /report €, /report usd, /report lira for another\n"
-    "/setup — in the group, once, to pair me with it\n"
-    "/status — what is connected and what is still missing\n"
-    "/start — this message"
+    "• /start — this message\n"
+    "• /setup — send this in the group once, to pair me with it\n"
+    "• /status — which integrations are connected and which are still missing\n"
+    "\n"
+    "• /sync — process every expense note posted in the group since the last sync\n"
+    "• /review — list what I flagged for you: possible duplicates from an import, doubts of the model. "
+    "Then /review keep 2 files item 2 anyway, /review done 2 (or done all) closes it\n"
+    "• /backfill — in a private chat with me: paste older expense notes; the import starts 20 s after your last paste, "
+    "or right away when you send /done\n"
+    "\n"
+    "• /report — spending by month in the default currency; name another one to convert, e.g. /report €, /report EUR, "
+    "/report $, /report £"
 )
 NOTE_REASON = "private note ({keyword}); its content was not stored and not sent to Claude"
 MEDIA_REASON = "{kind}: not an expense note; the file was not downloaded, uploaded or sent to Claude"
@@ -716,16 +720,16 @@ async def on_review(update: Update, context: ContextTypes.DEFAULT_TYPE, words: l
         await asyncio.to_thread(app.store.mark_messages, marks)
         context.chat_data["review"] = [item for item in listed if item not in items]
         if action == "keep":
-            await message.reply_text(f"Queued {len(items)} message(s) for the next sync; /sync runs it now.")
+            await message.reply_text(f"Queued {len(items)} messages for the next sync; /sync runs it now.")
         else:
-            await message.reply_text(f"Closed {len(items)} item(s).")
+            await message.reply_text(f"Closed {len(items)} items.")
         return
     items = await asyncio.to_thread(app.store.review_items)
     context.chat_data["review"] = items
     if not items:
         await message.reply_text("Nothing waits for a look.")
         return
-    lines = [f"<b>🔎 {len(items)} item(s) waiting for a look</b>"]
+    lines = [f"<b>🔎 {len(items)} items waiting for a look</b>"]
     for number, item in enumerate(items, start=1):
         excerpt = " | ".join(part.strip() for part in item.text.splitlines() if part.strip())[:60]
         label = "possible duplicate" if item.status == "duplicate" else "needs review"
@@ -784,7 +788,7 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     capture.append(message.text)
     _schedule_auto_finish(context, message.chat_id)
-    await message.reply_text(f"Got it ({len(capture)} part(s)). Importing in {BACKFILL_QUIET_SECONDS} s unless more arrives; /done starts now, /cancel discards.")
+    await message.reply_text(f"Got it ({len(capture)} parts). Importing in {BACKFILL_QUIET_SECONDS} s unless more arrives; /done starts now, /cancel discards.")
 
 
 def _schedule_auto_finish(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
@@ -1005,11 +1009,11 @@ def check(settings: Settings) -> int:
     try:
         next_run = cron_trigger(settings).get_next_fire_time(None, datetime.now(settings.timezone))
         report("Schedule", f"{settings.sync_cron!r} ({settings.timezone.key}), next run {next_run:%Y-%m-%d %H:%M}, "
-                           f"minimum {settings.scheduled_min_messages} message(s); /sync needs {settings.manual_min_messages}")
+                           f"minimum {settings.scheduled_min_messages} messages; /sync needs {settings.manual_min_messages}")
     except ConfigError as exc:
         report("Schedule", str(exc), ok=False)
 
-    print("All good." if failures == 0 else f"{failures} problem(s) to fix.")
+    print("All good." if failures == 0 else f"{failures} problems to fix.")
     return 0 if failures == 0 else 1
 
 
@@ -1055,7 +1059,7 @@ def cli_backfill(settings: Settings, path: str, since: date | None) -> int:
         print(line)
     if result.imported:
         calls = -(-result.imported // MAX_MESSAGES_PER_CALL)
-        print(f"Next: `python bot.py sync --dry-run` to preview, then `python bot.py sync` ({calls} Claude call(s)).")
+        print(f"Next: `python bot.py sync --dry-run` to preview, then `python bot.py sync` ({calls} Claude calls).")
     return 0
 
 
@@ -1078,18 +1082,18 @@ def cli_categorise(settings: Settings, rows: str | None, dry_run: bool, everythi
         print(f"Every row in {first}:{last} with a description already has a category. Nothing to do.")
         return 0
     categories = clean_categories(app.store.category_options())
-    print(f"{len(found)} row(s) in {first}:{last} {'to re-check' if everything else 'have a description but no category'}. "
+    print(f"{len(found)} rows in {first}:{last} {'to re-check' if everything else 'have a description but no category'}. "
           f"Categories: {', '.join(categories)}")
     result = plan_categories(app.claude, settings, found, categories)
     print(result.describe())
     cost = (result.input_tokens * settings.price_input_per_million + result.output_tokens * settings.price_output_per_million) / 1_000_000
-    print(f"Claude: {result.calls} call(s), {result.input_tokens:,} in / {result.output_tokens:,} out, about ${cost:.4f} (effort {settings.anthropic_effort})")
+    print(f"Claude: {result.calls} calls, {result.input_tokens:,} in / {result.output_tokens:,} out, about ${cost:.4f} (effort {settings.anthropic_effort})")
     if dry_run:
         print("Dry run: nothing written. Run again without --dry-run to write these category cells.")
         return 0
     changes = result.changes()
     written = apply_categories(app.store, changes, {c.row: c.current for c in found})
-    print(f"Wrote {len(changes)} category cell(s) within {settings.sheet_tab!r}!{written or '-'}; no other cell was touched.")
+    print(f"Wrote {len(changes)} category cells within {settings.sheet_tab!r}!{written or '-'}; no other cell was touched.")
     return 0 if not result.unanswered else 1
 
 
@@ -1103,17 +1107,17 @@ def cli_resync(settings: Settings, since: date | None, dry_run: bool) -> int:
     candidates = [m for m in app.store.messages_with_rows(include_imported=True) if since is None or m.sent_at.date() >= since]
     with_rows = [m for m in candidates if m.message_id in noted]
     if len(with_rows) < len(candidates):
-        print(f"Left alone: {len(candidates) - len(with_rows)} message(s) whose rows carry no provenance note (written before notes existed); "
+        print(f"Left alone: {len(candidates) - len(with_rows)} messages whose rows carry no provenance note (written before notes existed); "
               "they cannot be updated in place.")
     if not with_rows:
         print("No message with rows" + (f" sent on or after {since:%d/%m/%Y}" if since else "") + ". Nothing to do.")
         return 0
     rows = sum(m.rows_added for m in with_rows)
-    print(f"{len(with_rows)} message(s) own {rows} row(s)" + (f" since {since:%d/%m/%Y}" if since else "") + "; each will be re-extracted "
-          f"and its rows updated in place ({-(-len(with_rows) // MAX_MESSAGES_PER_CALL)} Claude call(s)).")
+    print(f"{len(with_rows)} messages own {rows} rows" + (f" since {since:%d/%m/%Y}" if since else "") + "; each will be re-extracted "
+          f"and its rows updated in place ({-(-len(with_rows) // MAX_MESSAGES_PER_CALL)} Claude calls).")
     if dry_run:
         for m in with_rows:
-            print(f"  {m.sent_at:%d/%m/%Y %H:%M} {m.sender}: {' | '.join(part.strip() for part in m.text.splitlines() if part.strip())[:70]} ({m.rows_added} row(s))")
+            print(f"  {m.sent_at:%d/%m/%Y %H:%M} {m.sender}: {' | '.join(part.strip() for part in m.text.splitlines() if part.strip())[:70]} ({m.rows_added} rows)")
         print("Dry run: nothing queued, nothing written.")
         return 0
     app.store.mark_messages([(m, STATUS_PENDING_REVISION, m.rows_added, "queued by resync so its rows follow the current rules") for m in with_rows])

@@ -72,7 +72,7 @@ def test_header_variants_are_tolerated(settings):
 def test_lines_before_the_first_header_are_reported_not_lost_silently(settings):
     parsed = parse_dump("some stray line\nAlex Doe, [3 Sep 2026 at 09:59:44]:\nCafe 225 TL", settings)
     assert len(parsed.messages) == 1 and parsed.unparsed == ["some stray line"]
-    assert "1 line(s)" in parsed.problems()
+    assert "1 lines" in parsed.problems()
     assert parse("nothing that looks like a header", settings).messages == []
 
 
@@ -182,7 +182,7 @@ def test_a_repasted_message_with_corrected_text_becomes_a_revision(settings):
         (-556, "UBER to Metro Station (Kadıköy)\n84 TL", 1), (-555, "Istanbul card \n400", "")]
     assert result.imported == 4 and len(result.revised) == 2  # two revisions plus two genuinely new messages
     text = result.describe()
-    assert "2 message(s) were already stored with a different text" in text and "(was “...400”)" in text
+    assert "2 messages were already stored with a different text" in text and "(was “...400”)" in text
     assert [r[4] for r in store.rows] == ["A101\n2045", "295 TL"]
 
 
@@ -209,9 +209,9 @@ def test_lines_starting_with_dots_are_reported_as_probable_copy_cuts(settings):
 
 
 def test_the_bots_own_messages_are_left_out_of_an_import(settings):
-    dump = SAMPLE + "\nMr Kashio, [8 Sep 2026 at 21:35:46]:\n✅ Kashio synced 3 expense(s) from 3 message(s) (₺1,596).\n"
+    dump = SAMPLE + "\nMr Kashio, [8 Sep 2026 at 21:35:46]:\n✅ Kashio synced 3 expense(s) from 3 messages (₺1,596).\n"
     parsed = parse(dump, settings, ignore_sender="Mr Kashio")
-    assert len(parsed.messages) == 4 and parsed.ignored == 1 and parsed.notes() == ["Left out 1 message(s) written by the bot itself."]
+    assert len(parsed.messages) == 4 and parsed.ignored == 1 and parsed.notes() == ["Left out 1 messages written by the bot itself."]
     assert len(parse(dump, settings).messages) == 5  # without a name nothing is left out
     export = {"messages": [{"id": 5, "type": "message", "date": "2026-08-01T10:00:00", "from": "Mr Kashio", "text": "✅ report"},
                            {"id": 6, "type": "message", "date": "2026-08-01T10:00:00", "from": "Sam", "text": "Cafe 385"}]}
