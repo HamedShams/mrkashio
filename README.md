@@ -2,35 +2,40 @@
 
 A Telegram bot that turns the expense notes a household posts in a group chat into clean rows in a Google Sheet, using one Claude call per sync.
 
-You keep writing what you already write: `A101 851 TL`, `Cafe 385`, `Uber 452`. Kashio stores every message the moment it arrives, and twice a month (or when you type `/sync`) it sends the whole batch to Claude, which decides which messages are expenses, splits messages that contain several, reads amounts and currencies, fixes small typos, assigns a category, and returns structured rows. Kashio appends them under your last row and reports back in Telegram.
+MrKashio is your friendly cashier. Drop expenses into your Telegram group as you normally would — `Cafe 30 USD`, `Uber 15€`, `A101 Grocery shopping 851 TRY` — and find them neatly categorised in your Google Sheet. Kashio stores every msg the moment it arrives, and twice a month (or whenever you type `/sync` command) it sends the whole batch to Claude, which decides which messages are expenses, splits messages that contain several, reads amounts and currencies, fixes typos, assigns a category, and appends structured rows on your sheet and reports back in Telegram.
+
+![The Summary tab of the Google Sheet, fed by Kashio](docs/img1_google_sheet.png)
 
 ## How it works
 
 ```
 Telegram group
-      │  every message, stored as it arrives (free, no AI)
+      │  every text message, stored as it arrives (free, no AI)
       ▼
-Kashio (Python, always on) ──▶ Bot_Inbox tab
+Kashio (Python, always on) ──▶ Google Sheet · Bot_Inbox tab
       │
       │  SYNC_CRON (1st and 15th) or /sync
       ▼
-one Claude call: messages ──▶ rows
+Claude (Sonnet 5, one call per sync): messages ──▶ rows
       │
+      ▼
+Google Sheet
       ├──▶ Transactions tab
       │      date · amount · currency · description · category
-      └──▶ Bot_Runs tab + a report in Telegram
+      └──▶ Bot_Runs tab, plus a report in Telegram
 ```
 
-- **Ingest is free.** Storing a message writes one row to a hidden inbox tab in your spreadsheet. No AI is involved.
-- **Claude is called in exactly one place**, the sync. A scheduled sync only runs when at least `SCHEDULED_MIN_MESSAGES` messages are pending (default 5); `/sync` runs whenever at least `MANUAL_MIN_MESSAGES` is pending (default 1) and otherwise replies "nothing new".
-- **Code decides the deterministic parts**: the date comes from the message timestamp (notes sent before `DAY_ROLLOVER_HOUR` count for the previous day), rows go under the last used row, formatting is copied from the row above, an amount written with `++` is stored negative, and a message is never inserted twice.
-- **Every run is recorded twice**: a row in the hidden `Bot_Runs` tab (tokens, cost, rows added, errors) and the same report as a Telegram message, so you have it even when the spreadsheet is unreachable.
-- **Messy input is expected.** A description and its amount split across two consecutive messages ("UBER", then "10 TL") are paired into one transaction; an amount-only message after a complete one is a second purchase of the same kind. Turkish, German, English and Persian currency words (TL, ₺, لیر, تومان, euro, dollar…) and Persian digits are understood. Lists grouped under day headings ("Sep 3", "AUG.22") get each heading's date. Corrections to an earlier message in the same batch are applied.
-- **Nothing is guessed.** Messages Claude cannot resolve (no amount, unknown currency, an amount with no description, a correction to an older message) are flagged `needs_review` in the inbox and listed in the report.
-- **Every answer is checked.** Claude answers in plain JSON that the bot validates against its own schema (categories limited to your sheet's list), then audits: a result for a message that was never sent, an unreadable description, a malformed date, a negative amount without a `++` marker, a missing message, or far fewer items than the text visibly lists. If anything is off, the batch is asked once more; whatever still has no usable answer stays pending, and an answer that still looks cut short is flagged rather than trusted.
+- **Ingest is free and text-only.** Every text message (or photo caption) in the group is written as one row to a hidden inbox tab of your spreadsheet the moment it arrives. No AI is involved, and photos, voice messages and files are never downloaded, uploaded or sent anywhere: a photo without a caption is only acknowledged as “[photo]”.
+- **Claude is called in exactly one place: the sync.** A scheduled sync runs when at least `SCHEDULED_MIN_MESSAGES` messages are pending (default 5); `/sync` runs whenever at least `MANUAL_MIN_MESSAGES` is pending (default 1) and otherwise replies "nothing new".
+- **Code decides the deterministic parts.** The date comes from the message timestamp (notes sent in the small hours count for the previous day), rows go under the last used row, formatting is copied from the row above, an amount written with `++` is stored negative, and a message is never inserted twice.
+- **Messy input is expected.** A description and its amount split across two messages ("UBER", then "10 TL") are paired into one transaction; an amount-only message after a complete one is a second purchase of the same kind; lists grouped under day headings ("Sep 3", "AUG.22") get each heading's date; corrections to an earlier message in the same batch are applied. Turkish, German, English and Persian currency words (TL, ₺, لیر, تومان, euro, dollar…) and Persian digits are understood.
+- **Nothing is guessed.** Messages Claude cannot resolve (no amount, unknown currency, an amount with no description, a correction to an older message) are flagged `needs_review` in the inbox and listed in the report for you.
+- **Every answer is checked.** Claude answers in plain JSON that the bot validates against its own schema (categories limited to your sheet's list) and then audits: a result for a message that was never sent, an unreadable description, a malformed date, a negative amount without a `++` marker, a missing message, or far fewer items than the text visibly lists. If anything is off, the batch is asked once more; whatever still has no usable answer stays pending, and an answer that still looks cut short is flagged rather than trusted.
 - **It never touches rows it did not write.** New rows go below the last used row, after a check that the destination cells are empty. Rows the bot wrote carry a small provenance note, and only those are ever updated or removed, when their Telegram message is edited or deleted.
+- **Every run is recorded twice.** A row in the hidden `Bot_Runs` tab (tokens, cost, rows added, errors) and the same report as a Telegram message, so you have it even when the spreadsheet is unreachable.
 - **It tells you what is missing.** The bot starts with nothing but a Telegram token. Whatever else is absent or broken (the Google key, a spreadsheet that is not shared, the Anthropic key, the group pairing) is reported in plain words by `/status`, `/start` and any command that cannot run, with the fix. No model is involved in that.
-- **Photos, voice messages and files are never touched.** Only text is read. A photo without a caption is acknowledged in the inbox as “[photo]” and never downloaded, uploaded or sent to Claude; a caption is treated as the message text.
+
+![Sample expense notes in the Telegram group](docs/img2_telegram_group_samplelogs.png)
 
 ## Project layout
 
@@ -127,24 +132,19 @@ All settings are environment variables. Defaults in **bold**.
 | `TELEGRAM_ADMIN_CHAT_ID` | Optional. Your private chat with the bot for full reports, which is your own Telegram user id; overrides `/setup`. Press Start in that chat once. |
 | `ANTHROPIC_API_KEY` | Needed to sync. Until set, the bot records messages and reports the missing key. |
 | `ANTHROPIC_MODEL` | **`claude-sonnet-5`** |
-| `ANTHROPIC_EFFORT` | Thinking effort, `low`…`max`, used for every call including the retry. **`high`** |
-| `ANTHROPIC_PRICE_INPUT_PER_MILLION`, `ANTHROPIC_PRICE_OUTPUT_PER_MILLION` | USD prices used to estimate cost in the run log. **2.0 / 10.0** |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | The whole key file as one line (single-quoted in a `.env` file). Or `GOOGLE_SERVICE_ACCOUNT_FILE`, a path to the file, for local runs. Needed to store anything; the bot reports it when missing. |
 | `GOOGLE_SHEET_ID` | Optional. The id from the spreadsheet URL (`/d/<id>/edit`). When empty, the bot finds the spreadsheet shared with the service account through the Google Drive API, which must then be enabled in the same Cloud project (the one containing `SHEET_TAB` wins if several are shared). |
 | `SHEET_TAB` | Tab that receives transactions; created with a header row if missing. **`Transactions_Trip#2`** |
 | `INBOX_TAB`, `RUNS_TAB`, `CONFIG_TAB` | Hidden tabs the bot creates: raw messages, run log, pairing. **`Bot_Inbox`, `Bot_Runs`, `Bot_Config`** |
 | `SUMMARY_TAB` | Report tab built by `init-sheet`. **`Summary`** |
-| `SYNC_CRON` | Crontab schedule in `TIMEZONE`. **`0 9 1,15 * *`** (09:00 on the 1st and 15th). Weekly Mondays: `0 9 * * 1` |
-| `TIMEZONE` | **`Europe/Istanbul`** |
+| `SYNC_CRON` | Crontab schedule, in the `TIMEZONE` of the household (default Europe/Istanbul). **`0 9 1,15 * *`** (09:00 on the 1st and 15th). Weekly Mondays: `0 9 * * 1` |
 | `SCHEDULED_MIN_MESSAGES` | Minimum pending messages for a scheduled sync to call Claude. **5** |
 | `MANUAL_MIN_MESSAGES` | Minimum pending messages for `/sync` to call Claude. **1** |
-| `DAY_ROLLOVER_HOUR` | Messages before this hour count for the previous day. **4** |
 | `DEFAULT_CURRENCY` | Used when no currency is written, and by `/report` when none is named. **`TRY`** |
 | `POST_SUMMARY` | Post a one-line summary in the group after each sync. **`true`** |
 | `NOTE_KEYWORD` | Word that turns the rest of a message into a private note, never stored or sent to Claude. **`#note`** |
 | `DECIMAL_SEPARATOR` | How the household writes numbers: `.` for 1,154.5 or `,` for 1.154,5. Plain 1154 works either way. **`.`** |
 | `COLUMN_DATE`, `COLUMN_AMOUNT`, `COLUMN_CURRENCY`, `COLUMN_DESCRIPTION`, `COLUMN_CATEGORY` | Column letters on the transactions tab. Other columns are never touched. **B, C, D, E, G** |
-| `PORT` | Set by Railway. The `/health` endpoint listens here. **8080** |
 
 ### Categories and currencies
 
@@ -304,7 +304,7 @@ The tab is a log. The bot never edits or deletes a row there: storing a message,
 
 ## Cost (LLM Token Usage)
 
-With Claude Sonnet-5-high at $2 per million input tokens and $10 per million output tokens, a household logging about 150 expenses a month (and so, say, roughly 200 messages sent in the group) costs near **$0.4 a month** in API usage at two syncs a month, or a bit more with manual `/sync` runs in between. The prompt and schema are about 7,300 tokens per call; output grows with the number of expenses. A retry after a damaged answer adds one call. Each run's token counts, calls and estimated cost are written to the `Bot_Runs` tab of the Google Sheet.
+With Claude Sonnet-5-high at $2 per million input tokens and $10 per million output tokens, a household logging about 150 expenses a month (and so, say, roughly 200 messages sent in the group) costs near **$0.4 a month** in API usage at two syncs a month, or a bit more with manual `/sync` runs in between. The prompt and schema are about 7K tokens per call; output grows with the number of expenses. A retry after a damaged answer adds one call. Each run's token counts, calls and estimated cost are written to the `Bot_Runs` tab of the Google Sheet.
 
 ## Limits worth knowing
 
